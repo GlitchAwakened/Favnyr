@@ -1,9 +1,8 @@
 # Favnyr
 <p align="center">
-<img width="60%" alt="ScreenShotFavnyr01" src="https://github.com/user-attachments/assets/3273ca25-039d-49d6-ae0a-dd8ca8bc04ed" />
+<img width="60%" alt="ScreenShotFavnyr01" src="https://github.com/user-attachments/assets/086c3a57-9f72-401f-837b-40887c60919c" />
 <img width="35%" alt="ScreenShotFavnyr02" src="https://github.com/user-attachments/assets/af98a3b6-db60-4c7c-a174-9dc182140856" />
 </p>
-
 
 A portable file browser for Windows and Linux. Single executable, no installer, no administrator rights, no telemetry.
 
