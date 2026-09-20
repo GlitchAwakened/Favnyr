@@ -1465,9 +1465,12 @@ mod tests {
     /// materialised by following it, which is what opens the cycle. Unix
     /// recreates the link and never walks through it.
     ///
-    /// The junction is built with the system tool: `symlink_dir` needs a
-    /// privilege that a plain account does not have — precisely the case that
-    /// makes Favnyr fall back to materialising.
+    /// The junction is built with the system tool, because `symlink_dir` needs
+    /// a privilege that depends on the account: an administrator or a machine
+    /// in developer mode has it, a plain account does not. Both outcomes are
+    /// correct and the test asserts whichever one applies — with the
+    /// privilege the link is recreated and the cycle never opens; without it
+    /// the copy materialises the target and must catch itself.
     #[cfg(windows)]
     #[test]
     fn copy_refuses_a_directory_link_that_loops_back() {
@@ -1489,6 +1492,12 @@ mod tests {
             return; // junctions unavailable (filesystem without reparse points)
         }
 
+        // Which branch of the copy this account reaches. The probe is the very
+        // call the copy makes, so it cannot disagree with it.
+        let probe = dir.join("probe");
+        let recreates_links = std::os::windows::fs::symlink_dir(&src, &probe).is_ok();
+        std::fs::remove_dir(&probe).ok(); // a directory link, never its target
+
         let mut skipped: Vec<String> = Vec::new();
         let status = copy_tree_progress(
             &src,
@@ -1500,17 +1509,41 @@ mod tests {
         .unwrap();
 
         assert_eq!(status, OpStatus::Done);
-        assert_eq!(skipped, ["back"], "the looping link is the only casualty");
         assert_eq!(
             std::fs::read(dir.join("dst").join("a.bin")).unwrap().len(),
             10,
             "everything outside the loop is still copied"
         );
-        // The strict variant has no way to report, so it refuses outright
-        // rather than walking forever.
-        assert!(copy_path(&src, &dir.join("dst2")).is_err());
 
-        std::fs::remove_dir(&loop_link).ok(); // the link itself, never its target
+        let copied_link = dir.join("dst").join("sub").join("back");
+        if recreates_links {
+            // The link is put back as a link, so nothing is ever walked
+            // through and nothing is lost.
+            assert!(skipped.is_empty(), "a recreated link costs nothing");
+            assert!(
+                std::fs::symlink_metadata(&copied_link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "the link is recreated, not materialised"
+            );
+            assert!(copy_path(&src, &dir.join("dst2")).is_ok());
+        } else {
+            assert_eq!(skipped, ["back"], "the looping link is the only casualty");
+            // The strict variant has no way to report, so it refuses outright
+            // rather than walking forever.
+            assert!(copy_path(&src, &dir.join("dst2")).is_err());
+        }
+
+        // Every reparse point is removed as a link before the tree goes, so a
+        // deletion can never reach through one to the source.
+        for link in [
+            loop_link,
+            copied_link,
+            dir.join("dst2").join("sub").join("back"),
+        ] {
+            std::fs::remove_dir(&link).ok();
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
