@@ -24,6 +24,13 @@ pub enum PlaceKind {
     Folder,
     /// Local mounted volume (drive, partition, removable device).
     Drive,
+    /// Local volume the machine can see but has not mounted. It carries no
+    /// path yet — only the device that would be mounted.
+    Volume,
+    /// Encrypted volume, still locked. It holds no mountable filesystem until
+    /// it is unlocked, and unlocking is not something Favnyr offers: that
+    /// would mean holding a passphrase.
+    LockedVolume,
     /// Network location: mapped drive (`Z:` → `\\srv\part`), NFS/CIFS/SSHFS/GVFS
     /// mount (Linux), or WSL distribution (`\\wsl$\…`, Windows).
     Network,
@@ -40,8 +47,12 @@ pub struct Place {
     /// Raw displayable name (volume name / folder name). The GUI may
     /// replace it with an i18n label for `Home`/`Trash`.
     pub name: String,
-    /// Removable device (USB, CD…) → offers "Safely Remove".
+    /// Removable device (USB, CD…) → offers to release it.
     pub removable: bool,
+    /// Can the device be physically unplugged while the machine runs? Decides
+    /// whether releasing it is announced as "you may unplug it" or merely as
+    /// "released" — see [`is_hotplug_device`].
+    pub hotplug: bool,
     /// Eject/disconnect target: `/dev/sdX1` (Linux), drive letter `X:`
     /// (local or mapped-network Windows drive), otherwise empty (WSL, GVFS…).
     pub device: String,
@@ -70,6 +81,7 @@ impl Place {
             path,
             name,
             removable: false,
+            hotplug: false,
             device: String::new(),
             // A shortcut and the trash sit on a volume that is listed on its
             // own line: repeating its capacity here would state the same fact
@@ -123,10 +135,8 @@ pub fn drives_signature() -> u64 {
         if let Ok(s) = std::fs::read_to_string("/proc/self/mountinfo") {
             s.hash(&mut h);
         }
-        // GVFS (user network shares, outside mountinfo): entry names.
-        if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR")
-            && let Ok(rd) = std::fs::read_dir(format!("{rt}/gvfs"))
-        {
+        // GVFS (user mounts, outside mountinfo): entry names.
+        if let Ok(rd) = std::fs::read_dir(gvfs_root()) {
             let mut entries: Vec<String> = rd
                 .flatten()
                 .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -183,6 +193,9 @@ pub fn drives() -> Vec<Place> {
                 // Removable → ejectable. udisks heuristic: mount under
                 // /run/media|/media. (Network is never "removable".)
                 removable: !is_net && is_removable_mount(&mount),
+                // Whether the cable can be pulled — a different question from
+                // the one above, and the one the release message answers.
+                hotplug: !is_net && is_hotplug_device(&d.name().to_string_lossy()),
                 // Eject device: `/dev/sdX1` (= `Disk::name()` on Linux).
                 device: if is_net {
                     String::new()
@@ -323,6 +336,110 @@ pub fn net_connect_prompt(resource: &str) -> bool {
     {
         let _ = resource;
         false
+    }
+}
+
+/// Buses whose devices can be unplugged while the machine is running.
+#[cfg(target_os = "linux")]
+const HOTPLUG_BUSES: &[&str] = &["/usb", "/mmc", "/firewire", "/pcmcia"];
+
+/// Can this device be physically unplugged?
+///
+/// NOT "is it a stick rather than a disk". Measured on real hardware, the
+/// rotational flag classifies the opposite way — an internal SSD reports 0
+/// while a USB drive can report 1 — and the removable-media flag also marks an
+/// optical drive. What a message needs to answer is whether the user may pull
+/// the cable, and that is a property of the BUS, not of the storage medium.
+///
+/// This is the criterion the system itself applies: udisks separates
+/// `power-off-drive` from `power-off-drive-system` on the same basis, so
+/// following it keeps Favnyr and the system from contradicting each other.
+///
+/// Read from sysfs, where a device's real path traverses its bus: a plain
+/// symlink resolution, no subprocess and no dependency. `false` on any other
+/// platform, and whenever the device cannot be resolved.
+pub fn is_hotplug_device(device: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(name) = Path::new(device).file_name() else {
+            return false;
+        };
+        let Ok(resolved) = std::fs::canonicalize(Path::new("/sys/class/block").join(name)) else {
+            return false;
+        };
+        path_traverses_hotplug_bus(&resolved.to_string_lossy())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = device;
+        false
+    }
+}
+
+/// Rule behind [`is_hotplug_device`], isolated from the filesystem.
+#[cfg(target_os = "linux")]
+fn path_traverses_hotplug_bus(resolved: &str) -> bool {
+    HOTPLUG_BUSES.iter().any(|bus| resolved.contains(bus))
+}
+
+/// Cheap fingerprint of the block-device topology: the names the kernel
+/// publishes under `/sys/class/block`.
+///
+/// Complementary to [`drives_signature`], which follows MOUNTS. Plugging a disk
+/// in changes this one and not that one, and a volume that never gets mounted
+/// would otherwise announce itself nowhere. It is a directory listing and
+/// nothing else, so it costs microseconds and can be polled freely.
+pub fn block_signature() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        use std::hash::{Hash, Hasher};
+        let Ok(entries) = std::fs::read_dir("/sys/class/block") else {
+            return 0;
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        names.hash(&mut hasher);
+        hasher.finish()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+/// Volumes the machine can see but has NOT mounted.
+///
+/// [`drives()`] reports mounted filesystems, which is why a disk stays
+/// invisible until something else mounts it. This answers the other question —
+/// what *could* be mounted — and is deliberately kept out of `drives()`: it
+/// costs a subprocess, so the caller decides when to pay, and
+/// [`block_signature`] tells it when the answer could have changed.
+///
+/// Empty on any failure: a machine without the tool keeps exactly the
+/// behaviour it had before.
+pub fn unmounted_volumes() -> Vec<Place> {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(text) = block_inventory() else {
+            return Vec::new();
+        };
+        let rows = parse_block_rows(&text);
+        let mut out: Vec<Place> = rows
+            .iter()
+            .filter_map(|row| volume_kind(row, &rows).map(|kind| volume_place(row, kind)))
+            .collect();
+        // Kernel order is not guaranteed; the device name keeps the sidebar
+        // stable between two scans.
+        out.sort_by(|a, b| a.device.cmp(&b.device));
+        out
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
     }
 }
 
@@ -716,6 +833,15 @@ mod windrives {
             } else {
                 volume_capacity(&root_w)
             };
+            // Ejectable if removable/CD, OR if it's a "fixed" disk but on
+            // an external bus (USB/1394/SD/MMC): Windows classifies many
+            // USB flash drives/SSDs as DRIVE_FIXED, hence the bus check.
+            // Computed once — the bus check is an IOCTL, and two fields read it.
+            let ejectable = match dtype {
+                DRIVE_REMOVABLE | DRIVE_CDROM => true,
+                DRIVE_FIXED => bus_ejectable(letter),
+                _ => false, // network, ramdisk
+            };
             out.push(Place {
                 kind: if is_net {
                     PlaceKind::Network
@@ -726,14 +852,11 @@ mod windrives {
                 name,
                 total_bytes,
                 free_bytes,
-                // Ejectable if removable/CD, OR if it's a "fixed" disk but on
-                // an external bus (USB/1394/SD/MMC): Windows classifies many
-                // USB flash drives/SSDs as DRIVE_FIXED, hence the bus check.
-                removable: match dtype {
-                    DRIVE_REMOVABLE | DRIVE_CDROM => true,
-                    DRIVE_FIXED => bus_ejectable(letter),
-                    _ => false, // network, ramdisk
-                },
+                removable: ejectable,
+                // An optical drive is the one case that parts company with the
+                // line above: its disc pops out, but the drive itself stays
+                // bolted in — so releasing it is not an invitation to unplug.
+                hotplug: ejectable && dtype != DRIVE_CDROM,
                 // Eject/disconnect target: the letter (`P:`).
                 device: letter_str,
             });
@@ -849,6 +972,7 @@ mod windrives {
                     path: PathBuf::from(format!(r"\\wsl$\{distro}")),
                     name: distro,
                     removable: false,
+                    hotplug: false,
                     device: String::new(),
                     // Reached through a network path: same reasoning as a share.
                     total_bytes: 0,
@@ -1037,8 +1161,7 @@ fn is_removable_mount(mount: &Path) -> bool {
 /// is listed instead.
 #[cfg(target_os = "linux")]
 fn gvfs_mounts() -> Vec<Place> {
-    let uid = unsafe { libc_getuid() };
-    let root = PathBuf::from(format!("/run/user/{uid}/gvfs"));
+    let root = gvfs_root();
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&root) {
         for e in rd.flatten() {
@@ -1052,6 +1175,7 @@ fn gvfs_mounts() -> Vec<Place> {
                 path,
                 name: gvfs_pretty_name(&raw),
                 removable: false,
+                hotplug: false,
                 device: String::new(),
                 // Never measured: asking a share for its size is a round trip
                 // that can stall for seconds, and the answer would be the
@@ -1086,6 +1210,206 @@ fn gvfs_pretty_name(raw: &str) -> String {
             format!("{sv} ({proto})")
         }
         _ => raw.to_string(),
+    }
+}
+
+/// Filesystems that name a volume nobody browses: system bookkeeping, or a
+/// container whose real volumes appear on their own rows once assembled.
+#[cfg(target_os = "linux")]
+const HIDDEN_VOLUME_FS: &[&str] = &[
+    "swap",
+    "LVM2_member",
+    "linux_raid_member",
+    "isw_raid_member",
+    "ddf_raid_member",
+    "squashfs",
+];
+
+/// Filesystem a locked encrypted container reports. It holds nothing mountable
+/// until unlocked, so it is classified apart rather than hidden.
+#[cfg(target_os = "linux")]
+const ENCRYPTED_FS: &str = "crypto_LUKS";
+
+/// One row of the block inventory, reduced to the fields the sidebar needs.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct BlockRow {
+    name: String,
+    /// Kernel name of the device this one sits on, empty for a whole disk.
+    parent: String,
+    /// `disk`, `part`, `loop`, `dm`…
+    kind: String,
+    fs_type: String,
+    mountpoint: String,
+    removable: bool,
+    size: u64,
+    label: String,
+    /// Partition type as named by the table, e.g. the firmware partition.
+    part_type: String,
+}
+
+/// Reads the block inventory.
+///
+/// Byte sizes and a fixed locale on purpose: the human-readable size is
+/// localised down to its decimal mark, and would not parse the same on two
+/// machines.
+#[cfg(target_os = "linux")]
+fn block_inventory() -> Option<String> {
+    let output = std::process::Command::new("lsblk")
+        .env("LC_ALL", "C")
+        .args([
+            "-b",
+            "-P",
+            "-o",
+            "NAME,PKNAME,TYPE,FSTYPE,MOUNTPOINT,RM,SIZE,LABEL,PARTTYPENAME",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+/// Splits one `KEY="value"` line. Values are quoted, and an embedded quote is
+/// backslash-escaped — a label is free text, so that case is real.
+#[cfg(target_os = "linux")]
+fn parse_pairs(line: &str) -> Vec<(String, String)> {
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
+        let key_start = i;
+        while i < bytes.len() && bytes[i] != b'=' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let key = line[key_start..i].to_string();
+        i += 1;
+        if i >= bytes.len() || bytes[i] != b'"' {
+            break;
+        }
+        i += 1;
+        let value_start = i;
+        while i < bytes.len() && bytes[i] != b'"' {
+            // Skip whatever the backslash protects, quote included.
+            i += if bytes[i] == b'\\' { 2 } else { 1 };
+        }
+        let value = line[value_start..i.min(bytes.len())].replace("\\\"", "\"");
+        out.push((key, value));
+        i += 1;
+    }
+    out
+}
+
+/// Turns the inventory text into rows, ignoring anything unparsable.
+#[cfg(target_os = "linux")]
+fn parse_block_rows(text: &str) -> Vec<BlockRow> {
+    let mut rows = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let mut row = BlockRow::default();
+        for (key, value) in parse_pairs(line) {
+            match key.as_str() {
+                "NAME" => row.name = value,
+                "PKNAME" => row.parent = value,
+                "TYPE" => row.kind = value,
+                "FSTYPE" => row.fs_type = value,
+                "MOUNTPOINT" => row.mountpoint = value,
+                "RM" => row.removable = value == "1",
+                "SIZE" => row.size = value.parse().unwrap_or(0),
+                "LABEL" => row.label = value,
+                "PARTTYPENAME" => row.part_type = value,
+                _ => {}
+            }
+        }
+        if !row.name.is_empty() {
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+/// How this row should appear in the sidebar, if at all. The whole policy
+/// lives here so the two families cannot drift apart.
+#[cfg(target_os = "linux")]
+fn volume_kind(row: &BlockRow, all: &[BlockRow]) -> Option<PlaceKind> {
+    // Already mounted: it is `drives()` that reports it, with its capacity.
+    if !row.mountpoint.is_empty() {
+        return None;
+    }
+    let has_child = || all.iter().any(|other| other.parent == row.name);
+    // An encrypted container. Once unlocked it grows a child holding the real
+    // filesystem, and THAT child is the volume — the container itself then has
+    // nothing left to offer. Still locked, it is worth showing: knowing the
+    // disk is there is most of what the user was missing.
+    if row.fs_type == ENCRYPTED_FS {
+        return (!has_child()).then_some(PlaceKind::LockedVolume);
+    }
+    // Nothing to mount without a recognised filesystem.
+    if row.fs_type.is_empty() || HIDDEN_VOLUME_FS.contains(&row.fs_type.as_str()) {
+        return None;
+    }
+    // The firmware partition is not a place anyone browses.
+    if row.part_type.contains("EFI") {
+        return None;
+    }
+    match row.kind.as_str() {
+        // A partition, or the volume exposed by an unlocked container.
+        "part" | "crypt" => Some(PlaceKind::Volume),
+        // A whole device carrying a filesystem — a stick written without a
+        // partition table. Once it IS partitioned, its partitions are the
+        // volumes and the disk itself is not one.
+        "disk" => (!has_child()).then_some(PlaceKind::Volume),
+        _ => None,
+    }
+}
+
+/// Builds the sidebar entry for a volume that is not mounted.
+#[cfg(target_os = "linux")]
+fn volume_place(row: &BlockRow, kind: PlaceKind) -> Place {
+    Place {
+        kind,
+        // No path: nothing is mounted yet. Like the Windows trash, the entry is
+        // addressed by what it is rather than by where it lives.
+        path: PathBuf::new(),
+        name: if row.label.is_empty() {
+            row.name.clone()
+        } else {
+            row.label.clone()
+        },
+        removable: row.removable,
+        hotplug: is_hotplug_device(&row.name),
+        device: format!("/dev/{}", row.name),
+        total_bytes: row.size,
+        // Only a mounted filesystem can say how much of it is left.
+        free_bytes: 0,
+    }
+}
+
+/// Directory where GVFS exposes its mounts.
+///
+/// The session variable is authoritative when it is set; the conventional path
+/// is the fallback. Both the listing and the change signature go through here
+/// so they always look at the same place: they used to resolve it differently,
+/// and a session without that variable left the signature blind to a mount
+/// appearing — the sidebar then never refreshed on its own.
+#[cfg(target_os = "linux")]
+fn gvfs_root() -> PathBuf {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty());
+    gvfs_root_in(runtime.as_deref().map(Path::new), unsafe { libc_getuid() })
+}
+
+/// Resolution rule of [`gvfs_root`], isolated from the environment.
+#[cfg(target_os = "linux")]
+fn gvfs_root_in(runtime: Option<&Path>, uid: u32) -> PathBuf {
+    match runtime {
+        Some(dir) => dir.join("gvfs"),
+        None => PathBuf::from(format!("/run/user/{uid}/gvfs")),
     }
 }
 
@@ -1210,6 +1534,213 @@ mod tests {
         );
         // Unknown format → returned as-is.
         assert_eq!(gvfs_pretty_name("weird-thing"), "weird-thing");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_gvfs_root_follows_the_session_when_it_declares_one() {
+        assert_eq!(
+            gvfs_root_in(Some(Path::new("/run/user/4242")), 7),
+            PathBuf::from("/run/user/4242/gvfs")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_gvfs_root_falls_back_to_the_conventional_path() {
+        assert_eq!(gvfs_root_in(None, 7), PathBuf::from("/run/user/7/gvfs"));
+    }
+
+    /// Inventory row with only the fields a test cares about.
+    #[cfg(target_os = "linux")]
+    fn row(name: &str, kind: &str, fs: &str, mount: &str) -> BlockRow {
+        BlockRow {
+            name: name.to_string(),
+            kind: kind.to_string(),
+            fs_type: fs.to_string(),
+            mountpoint: mount.to_string(),
+            ..BlockRow::default()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_quoted_pair_line_is_split_into_its_fields() {
+        let pairs = parse_pairs(r#"NAME="sda1" TYPE="part" SIZE="1024" LABEL="Volume01""#);
+        assert_eq!(
+            pairs,
+            vec![
+                ("NAME".to_string(), "sda1".to_string()),
+                ("TYPE".to_string(), "part".to_string()),
+                ("SIZE".to_string(), "1024".to_string()),
+                ("LABEL".to_string(), "Volume01".to_string()),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_label_may_carry_an_escaped_quote() {
+        let pairs = parse_pairs(r#"NAME="sda1" LABEL="a\"b" TYPE="part""#);
+        assert_eq!(pairs[1].1, r#"a"b"#);
+        // The row after the escape is still read: the scan did not lose its place.
+        assert_eq!(pairs[2], ("TYPE".to_string(), "part".to_string()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_row_is_built_with_its_size_in_bytes() {
+        let rows = parse_block_rows(
+            r#"NAME="sda1" PKNAME="sda" TYPE="part" FSTYPE="ext4" MOUNTPOINT="" RM="1" SIZE="2048" LABEL="Volume01" PARTTYPENAME="Linux filesystem""#,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].size, 2048);
+        assert!(rows[0].removable);
+        assert_eq!(rows[0].parent, "sda");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unmounted_partition_with_a_filesystem_is_offered() {
+        let rows = vec![row("sda1", "part", "ext4", "")];
+        assert_eq!(volume_kind(&rows[0], &rows), Some(PlaceKind::Volume));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_already_mounted_partition_is_left_to_the_mount_scan() {
+        let rows = vec![row("sda1", "part", "ext4", "/mnt/somewhere")];
+        assert_eq!(volume_kind(&rows[0], &rows), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_partition_without_a_filesystem_is_not_offered() {
+        let rows = vec![row("sda1", "part", "", "")];
+        assert_eq!(volume_kind(&rows[0], &rows), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bookkeeping_filesystems_are_not_offered() {
+        for fs in ["swap", "LVM2_member", "linux_raid_member", "squashfs"] {
+            let rows = vec![row("sda1", "part", fs, "")];
+            assert_eq!(volume_kind(&rows[0], &rows), None, "{fs} should be hidden");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_firmware_partition_is_not_offered() {
+        let mut efi = row("sda1", "part", "vfat", "");
+        efi.part_type = "EFI System".to_string();
+        let rows = vec![efi];
+        assert_eq!(volume_kind(&rows[0], &rows), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_whole_disk_carrying_a_filesystem_is_offered() {
+        let rows = vec![row("sdb", "disk", "vfat", "")];
+        assert_eq!(volume_kind(&rows[0], &rows), Some(PlaceKind::Volume));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_partitioned_disk_yields_its_partitions_not_itself() {
+        let mut child = row("sdb1", "part", "ext4", "");
+        child.parent = "sdb".to_string();
+        let rows = vec![row("sdb", "disk", "vfat", ""), child];
+        assert_eq!(volume_kind(&rows[0], &rows), None);
+        assert_eq!(volume_kind(&rows[1], &rows), Some(PlaceKind::Volume));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_volume_is_named_by_its_label_and_falls_back_to_its_device() {
+        let mut labelled = row("sda1", "part", "ext4", "");
+        labelled.label = "Volume01".to_string();
+        assert_eq!(volume_place(&labelled, PlaceKind::Volume).name, "Volume01");
+        assert_eq!(
+            volume_place(&row("sda1", "part", "ext4", ""), PlaceKind::Volume).name,
+            "sda1"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_volume_carries_its_device_and_no_path() {
+        let place = volume_place(&row("sda1", "part", "ext4", ""), PlaceKind::Volume);
+        assert_eq!(place.kind, PlaceKind::Volume);
+        assert_eq!(place.device, "/dev/sda1");
+        assert_eq!(place.path, PathBuf::new());
+        // No gauge is possible before the kernel has the filesystem.
+        assert_eq!(place.free_bytes, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_locked_encrypted_container_is_shown_as_locked() {
+        let rows = vec![row("sda1", "part", "crypto_LUKS", "")];
+        assert_eq!(volume_kind(&rows[0], &rows), Some(PlaceKind::LockedVolume));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unlocked_container_steps_aside_for_the_volume_it_exposes() {
+        let mut opened = row("dm-0", "crypt", "ext4", "");
+        opened.parent = "sda1".to_string();
+        let rows = vec![row("sda1", "part", "crypto_LUKS", ""), opened];
+        // The container has nothing left to offer once it has been opened…
+        assert_eq!(volume_kind(&rows[0], &rows), None);
+        // …and what it exposes is an ordinary volume, mountable like any other.
+        assert_eq!(volume_kind(&rows[1], &rows), Some(PlaceKind::Volume));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unlocked_container_whose_volume_is_mounted_shows_neither() {
+        let mut opened = row("dm-0", "crypt", "ext4", "/mnt/somewhere");
+        opened.parent = "sda1".to_string();
+        let rows = vec![row("sda1", "part", "crypto_LUKS", ""), opened];
+        assert_eq!(volume_kind(&rows[0], &rows), None);
+        assert_eq!(volume_kind(&rows[1], &rows), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hotplug_bus_is_recognised_in_a_resolved_device_path() {
+        // Shapes taken from a real sysfs resolution.
+        assert!(path_traverses_hotplug_bus(
+            "/sys/devices/pci0000:00/0000:00:14.0/usb4/4-1/4-1:1.0/host8/target8:0:0/8:0:0:0/block/sdi"
+        ));
+        assert!(path_traverses_hotplug_bus(
+            "/sys/devices/platform/soc/mmc_host/mmc0/mmc0:0001/block/mmcblk0"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_internal_bus_is_not_a_hotplug_one() {
+        // The same disk family, wired to the motherboard: releasing it must not
+        // claim the cable can be pulled.
+        assert!(!path_traverses_hotplug_bus(
+            "/sys/devices/pci0000:00/0000:00:17.0/ata6/host5/target5:0:0/5:0:0:0/block/sdd"
+        ));
+        assert!(!path_traverses_hotplug_bus(
+            "/sys/devices/pci0000:00/0000:00:1d.0/nvme/nvme0/nvme0n1"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_locked_container_keeps_its_size_and_its_device() {
+        let mut locked = row("sda1", "part", "crypto_LUKS", "");
+        locked.size = 4096;
+        let place = volume_place(&locked, PlaceKind::LockedVolume);
+        assert_eq!(place.kind, PlaceKind::LockedVolume);
+        assert_eq!(place.device, "/dev/sda1");
+        assert_eq!(place.total_bytes, 4096);
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! the logic shared between the Slint GUI and any future utilities
 //! (tests, benchmarks) lives here.
 
+pub mod annotations;
 pub mod columns;
 pub mod config;
 pub mod eject;
@@ -13,6 +14,7 @@ pub mod fs;
 pub mod i18n;
 pub mod layout;
 pub mod logging;
+pub mod mount;
 pub mod openers;
 pub mod paths;
 pub mod places;

@@ -12,7 +12,7 @@ use std::path::Path;
 /// Diagnostic of a lock likely preventing a file operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathLock {
-    /// Readable, deduplicated names (`Visual Studio Code (Code.exe)`, etc.).
+    /// Readable, deduplicated names (`Text Editor (editor.exe)`, etc.).
     pub processes: Vec<String>,
     /// The diagnostic was deliberately stopped before exhausting all
     /// possible files or processes. The UI can then add an ellipsis

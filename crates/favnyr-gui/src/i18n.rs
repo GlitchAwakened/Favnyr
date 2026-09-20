@@ -139,6 +139,7 @@ pub fn strings_for(lang: Lang) -> Strings {
         col_age: g("col_age"),
         col_ext: g("col_ext"),
         ext_filter_label: g("ext_filter_label"),
+        ext_filter_placeholder: g("ext_filter_placeholder"),
         col_resolution: g("col_resolution"),
         col_depth: g("col_depth"),
         fav_title: g("fav_title"),
@@ -175,7 +176,6 @@ pub fn strings_for(lang: Lang) -> Strings {
         nav_prev: g("nav_prev"),
         nav_next: g("nav_next"),
         nav_parent: g("nav_parent"),
-        nav_home: g("nav_home"),
         nav_refresh: g("nav_refresh"),
         view_mode_tooltip: g("view_mode_tooltip"),
         show_hidden_tooltip: g("show_hidden_tooltip"),
@@ -199,6 +199,14 @@ pub fn strings_for(lang: Lang) -> Strings {
         settings_ws_warn_hint: g("settings_ws_warn_hint"),
         settings_compact_preview_label: g("settings_compact_preview_label"),
         settings_compact_preview_hint: g("settings_compact_preview_hint"),
+        settings_annotations_title: g("settings_annotations_title"),
+        settings_annotations_hint: g("settings_annotations_hint"),
+        settings_annotations_clean: g("settings_annotations_clean"),
+        annotations_cleanup_title: g("annotations_cleanup_title"),
+        annotations_cleanup_all: g("annotations_cleanup_all"),
+        annotations_cleanup_none: g("annotations_cleanup_none"),
+        annotations_cleanup_empty: g("annotations_cleanup_empty"),
+        settings_annotations_cleaned: g("settings_annotations_cleaned"),
         tab_unavailable: g("tab_unavailable"),
         tab_unavailable_hint: g("tab_unavailable_hint"),
         tab_duplicate: g("tab_duplicate"),
@@ -207,9 +215,12 @@ pub fn strings_for(lang: Lang) -> Strings {
         panel_prefix: g("panel_prefix"),
         panel_new_tooltip: g("panel_new_tooltip"),
         panel_close_tooltip: g("panel_close_tooltip"),
+        panel_move_tooltip: g("panel_move_tooltip"),
         panel_split_view: g("panel_split_view"),
         split_side_by_side: g("split_side_by_side"),
         split_stacked: g("split_stacked"),
+        equalize_all: g("equalize_all"),
+        equalize_restore: g("equalize_restore"),
         ctx_open: g("ctx_open"),
         ctx_open_new_tab: g("ctx_open_new_tab"),
         ctx_open_with: g("ctx_open_with"),
@@ -222,6 +233,11 @@ pub fn strings_for(lang: Lang) -> Strings {
         create_shortcut_target: g("create_shortcut_target"),
         create_browse: g("create_browse"),
         ctx_create_link: g("ctx_create_link"),
+        ctx_mark: g("ctx_mark"),
+        ctx_comment: g("ctx_comment"),
+        comment_title: g("comment_title"),
+        comment_placeholder: g("comment_placeholder"),
+        comment_clear: g("comment_clear"),
         create_symlink_tab: g("create_symlink_tab"),
         create_confirm: g("create_confirm"),
         create_placeholder: g("create_placeholder"),
@@ -270,6 +286,7 @@ pub fn strings_for(lang: Lang) -> Strings {
         rename_new_placeholder: g("rename_new_placeholder"),
         rename_confirm: g("rename_confirm"),
         rename_force_replace: g("rename_force_replace"),
+        rename_select_name: g("rename_select_name"),
         btn_cancel: g("btn_cancel"),
         paste_conflict_title: g("paste_conflict_title"),
         paste_conflict_hint: g("paste_conflict_hint"),
@@ -327,6 +344,8 @@ pub fn strings_for(lang: Lang) -> Strings {
         net_disconnected: g("net_disconnected"),
         net_eject_failed: g("net_eject_failed"),
         net_eject: g("net_eject"),
+        net_release: g("net_release"),
+        net_released: g("net_released"),
         net_disconnect: g("net_disconnect"),
         sidebar_home: g("sidebar_home"),
         sidebar_trash: g("sidebar_trash"),
@@ -337,10 +356,14 @@ pub fn strings_for(lang: Lang) -> Strings {
         net_delete_body: g("net_delete_body"),
         permanent_delete_body: g("permanent_delete_body"),
         net_delete_confirm: g("net_delete_confirm"),
+        open_many_title: g("open_many_title"),
+        open_many_confirm: g("open_many_confirm"),
         drop_move: g("drop_move"),
         drop_copy: g("drop_copy"),
         drop_link: g("drop_link"),
         drop_favorite: g("drop_favorite"),
+        drop_swap: g("drop_swap"),
+        drop_detach: g("drop_detach"),
         ws_reset: g("ws_reset"),
         ws_new_name: g("ws_new_name"),
         ws_toast_reset: g("ws_toast_reset"),
@@ -373,6 +396,8 @@ pub fn strings_for(lang: Lang) -> Strings {
         ow_launch: g("ow_launch"),
         ow_default_ext: g("ow_default_ext"),
         ow_used_ext: g("ow_used_ext"),
+        ow_default_ext_placeholder: g("ow_default_ext_placeholder"),
+        ow_used_ext_placeholder: g("ow_used_ext_placeholder"),
         ow_set_default: g("ow_set_default"),
         ow_run_as_admin: g("ow_run_as_admin"),
         ow_default_ext_hint: g("ow_default_ext_hint"),
@@ -457,14 +482,14 @@ pub fn footer_text(lang: Lang, total: usize, selected: usize, hidden: usize) -> 
             1 => tr(lang, "footer_hidden_singular"),
             n => tr(lang, "footer_hidden_plural").replace("{n}", &n.to_string()),
         };
-        s = format!("{s}  ·  {h}");
+        s = format!("{s}{}{h}", tr(lang, "separator_dot"));
     }
     if selected > 0 {
         let sel = match selected {
             1 => tr(lang, "footer_selected_singular"),
             n => tr(lang, "footer_selected_plural").replace("{n}", &n.to_string()),
         };
-        s = format!("{s}  ·  {sel}");
+        s = format!("{s}{}{sel}", tr(lang, "separator_dot"));
     }
     s
 }
@@ -487,18 +512,102 @@ pub fn shortcut_conflict_message(lang: Lang, other: &str) -> String {
 }
 
 /// "Notice" toast message when access to a folder is denied.
+/// Size wording for `lang`, ready for [`favnyr_core::fs::format_size`]. The
+/// core crate holds no translations, so the vocabulary is resolved here and
+/// handed down — decimal mark included, since a language that writes `Ko` also
+/// writes `1,0`.
+///
+/// Memoized like [`catalog`]: this is called once per listed row, so resolving
+/// six keys through the map every time would show on a large folder.
+pub fn size_units(lang: Lang) -> favnyr_core::fs::SizeUnits<'static> {
+    type Units = favnyr_core::fs::SizeUnits<'static>;
+    fn build(lang: Lang) -> Units {
+        let c = catalog(lang);
+        let g = |k: &'static str| -> &'static str { c.get(k).map(|s| s.as_str()).unwrap_or(k) };
+        favnyr_core::fs::SizeUnits {
+            steps: [
+                g("unit_byte"),
+                g("unit_kb"),
+                g("unit_mb"),
+                g("unit_gb"),
+                g("unit_tb"),
+            ],
+            decimal: g("decimal_separator").chars().next().unwrap_or('.'),
+        }
+    }
+    static EN: OnceLock<Units> = OnceLock::new();
+    static FR: OnceLock<Units> = OnceLock::new();
+    static ES: OnceLock<Units> = OnceLock::new();
+    static DE: OnceLock<Units> = OnceLock::new();
+    static IT: OnceLock<Units> = OnceLock::new();
+    let cell = match lang {
+        Lang::En => &EN,
+        Lang::Fr => &FR,
+        Lang::Es => &ES,
+        Lang::De => &DE,
+        Lang::It => &IT,
+    };
+    *cell.get_or_init(|| build(lang))
+}
+
+/// Age-column wording for `lang`, ready for [`favnyr_core::fs::format_age`].
+/// Memoized for the same reason as [`size_units`].
+pub fn age_units(lang: Lang) -> favnyr_core::fs::AgeUnits<'static> {
+    type Units = favnyr_core::fs::AgeUnits<'static>;
+    fn build(lang: Lang) -> Units {
+        let c = catalog(lang);
+        let g = |k: &'static str| -> &'static str { c.get(k).map(|s| s.as_str()).unwrap_or(k) };
+        favnyr_core::fs::AgeUnits {
+            minute: g("age_minute"),
+            day: g("age_day"),
+            month: g("age_month"),
+            year: g("age_year"),
+            now: g("age_now"),
+        }
+    }
+    static EN: OnceLock<Units> = OnceLock::new();
+    static FR: OnceLock<Units> = OnceLock::new();
+    static ES: OnceLock<Units> = OnceLock::new();
+    static DE: OnceLock<Units> = OnceLock::new();
+    static IT: OnceLock<Units> = OnceLock::new();
+    let cell = match lang {
+        Lang::En => &EN,
+        Lang::Fr => &FR,
+        Lang::Es => &ES,
+        Lang::De => &DE,
+        Lang::It => &IT,
+    };
+    *cell.get_or_init(|| build(lang))
+}
+
 pub fn access_denied(lang: Lang) -> String {
     tr(lang, "access_denied")
+}
+
+/// Renders a diagnosed process list as one readable fragment. The ellipsis
+/// marks a deliberately bounded diagnostic, so the sentence never claims to
+/// name every holder. Empty when nothing could be attributed.
+pub fn process_list<S: AsRef<str>>(lang: Lang, items: &[S], truncated: bool) -> String {
+    let separator = tr(lang, "list_separator");
+    let mut list = String::new();
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            list.push_str(&separator);
+        }
+        list.push_str(item.as_ref());
+    }
+    if truncated && !list.is_empty() {
+        list.push_str(&separator);
+        list.push_str(&tr(lang, "list_ellipsis"));
+    }
+    list
 }
 
 /// Human-readable message after an operation is refused by a Windows lock.
 /// The ownerless template stays honest when Restart Manager confirms the
 /// conflict but can't inspect the process (permissions, folder handle).
 pub fn item_in_use(lang: Lang, item: &str, processes: &[String], truncated: bool) -> String {
-    let mut process = processes.join(", ");
-    if truncated && !process.is_empty() {
-        process.push_str(", …");
-    }
+    let process = process_list(lang, processes, truncated);
     let key = if process.is_empty() {
         "op_in_use_unknown"
     } else {
@@ -507,6 +616,26 @@ pub fn item_in_use(lang: Lang, item: &str, processes: &[String], truncated: bool
     tr(lang, key)
         .replace("{item}", item)
         .replace("{process}", &process)
+}
+
+/// Message for an entry an operation could not process and stepped over. Used
+/// when no holding program could be named: `reason` then carries the system
+/// error, which stays the only thing known about the refusal.
+pub fn item_skipped(lang: Lang, item: &str, reason: &str) -> String {
+    tr(lang, "op_item_skipped")
+        .replace("{item}", item)
+        .replace("{reason}", reason)
+}
+
+/// Message for a move whose copy succeeded but whose original could not be
+/// removed. The item then exists in both places, which the user has to be told
+/// explicitly: the action was requested as a move and behaved as a copy.
+/// `reason` names the holding process when one could be attributed, and
+/// carries the system error otherwise.
+pub fn move_source_kept(lang: Lang, item: &str, reason: &str) -> String {
+    tr(lang, "move_source_kept")
+        .replace("{item}", item)
+        .replace("{reason}", reason)
 }
 
 /// Translated fallback when a rename fails without an attributable Windows
@@ -525,9 +654,8 @@ pub fn eject_error_message(lang: Lang, err: &favnyr_core::eject::EjectError) -> 
     use favnyr_core::eject::EjectError;
     match err {
         EjectError::UnknownDevice => tr(lang, "eject_unknown_device"),
-        EjectError::BlockedByProcesses(processes) => {
-            tr(lang, "eject_blocked_by_processes").replace("{processes}", &processes.join(", "))
-        }
+        EjectError::BlockedByProcesses(processes) => tr(lang, "eject_blocked_by_processes")
+            .replace("{processes}", &process_list(lang, processes, false)),
         EjectError::BlockedByService => tr(lang, "eject_blocked_by_service"),
         EjectError::BlockedByApplication => tr(lang, "eject_blocked_by_application"),
         EjectError::BlockedByOpenFile => tr(lang, "eject_blocked_by_open_file"),
@@ -550,6 +678,25 @@ pub fn eject_error_message(lang: Lang, err: &favnyr_core::eject::EjectError) -> 
         }
         EjectError::SystemQueryFailed => tr(lang, "eject_system_query_failed"),
         EjectError::PlatformUnsupported => tr(lang, "eject_platform_unsupported"),
+    }
+}
+
+/// Translated reason for a mount failure. `err` carries no text of its own
+/// (see [`favnyr_core::mount::MountError`]); this is the only place that turns
+/// it into a sentence.
+pub fn mount_error_message(lang: Lang, err: &favnyr_core::mount::MountError) -> String {
+    use favnyr_core::mount::MountError;
+    match err {
+        MountError::UnknownDevice => tr(lang, "mount_unknown_device"),
+        MountError::ToolNotFound => tr(lang, "mount_tool_not_found"),
+        MountError::NotAuthorized => tr(lang, "mount_not_authorized"),
+        MountError::AlreadyMounted => tr(lang, "mount_already_mounted"),
+        MountError::NoMountPoint => tr(lang, "mount_no_mount_point"),
+        MountError::ToolFailed {
+            detail: Some(detail),
+        } => tr(lang, "mount_failed_detail").replace("{detail}", detail),
+        MountError::ToolFailed { detail: None } => tr(lang, "mount_failed"),
+        MountError::PlatformUnsupported => tr(lang, "mount_platform_unsupported"),
     }
 }
 
@@ -593,7 +740,7 @@ mod tests {
         // Key present everywhere: the language's value.
         assert_eq!(shortcut_action_name(Lang::Fr, "copy"), "Copier");
         // Nonexistent key → returned as-is (no panic/empty string).
-        assert_eq!(tr(Lang::Fr, "zzz_inexistante"), "zzz_inexistante");
+        assert_eq!(tr(Lang::Fr, "zzz_missing_key"), "zzz_missing_key");
     }
 
     #[test]
@@ -605,16 +752,36 @@ mod tests {
     #[test]
     fn item_in_use_message_is_translated_and_interpolated() {
         for &lang in Lang::all() {
-            let processes = vec!["Code.exe".to_owned()];
-            let known = item_in_use(lang, "Tofs", &processes, true);
-            assert!(known.contains("Tofs") && known.contains("Code.exe"));
+            let processes = vec!["editor.exe".to_owned()];
+            let known = item_in_use(lang, "my_file.txt", &processes, true);
+            assert!(known.contains("my_file.txt") && known.contains("editor.exe"));
             assert!(known.contains('…'));
             assert!(!known.contains("{item}") && !known.contains("{process}"));
 
-            let unknown = item_in_use(lang, "Tofs", &[], false);
-            assert!(unknown.contains("Tofs"));
+            let unknown = item_in_use(lang, "my_file.txt", &[], false);
+            assert!(unknown.contains("my_file.txt"));
             assert!(!unknown.contains("{item}") && !unknown.contains("{process}"));
         }
+    }
+
+    #[test]
+    fn move_source_kept_is_translated_and_interpolated() {
+        for &lang in Lang::all() {
+            // Attributed holder: the process list reaches the sentence.
+            let named =
+                move_source_kept(lang, "report.odt", &process_list(lang, &["editor"], false));
+            assert!(named.contains("report.odt") && named.contains("editor"));
+            assert!(!named.contains("{item}") && !named.contains("{reason}"));
+
+            // No attributable holder: the system error takes its place.
+            let raw = move_source_kept(lang, "report.odt", "permission denied");
+            assert!(raw.contains("permission denied"));
+            assert!(!raw.contains("{reason}"));
+        }
+        // Nothing diagnosed at all → empty fragment, which is what makes the
+        // caller fall back to the system error instead of an empty reason.
+        assert!(process_list::<&str>(Lang::En, &[], false).is_empty());
+        assert_eq!(process_list(Lang::En, &["a", "b"], true), "a, b, …");
     }
 
     #[test]

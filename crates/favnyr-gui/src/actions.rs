@@ -558,6 +558,46 @@ pub fn spawn_new_instance(dir: &Path, at: Option<(i32, i32)>, tab_bar_mode: u8) 
         .map_err(|e| anyhow!("new Favnyr instance: {e}"))
 }
 
+/// Opens a NEW Favnyr instance holding a whole VIEW: all its tabs, in order,
+/// the FIRST being the one that stays active.
+///
+/// Its own marker rather than an extension of `--detached-tab`, which is left
+/// untouched — so the proven single-tab path cannot regress, and two builds of
+/// different versions keep understanding each other.
+///
+/// Every folder travels in the SAME launch, so the operation succeeds whole or
+/// fails whole: there is no state where some tabs have moved and the others are
+/// stranded. Paths go as `OsStr`, so no shell interprets them and a name that
+/// is not valid UTF-8 survives the trip.
+pub fn spawn_detached_view(dirs: &[PathBuf], at: (i32, i32), tab_bar_mode: u8) -> Result<()> {
+    if dirs.is_empty() {
+        return Err(anyhow!("a detached view needs at least one tab"));
+    }
+    let exe = std::env::current_exe().map_err(|e| anyhow!("Favnyr executable not found: {e}"))?;
+    info!(tabs = dirs.len(), at = ?at, "spawn new Favnyr instance (view tear-off)");
+    let mut cmd = Command::new(&exe);
+    // Position and bar mode FIRST, fixed arity; the folders last, however many
+    // there are. The list can then be read without any ambiguity.
+    cmd.arg("--detached-view")
+        .arg(at.0.to_string())
+        .arg(at.1.to_string())
+        .arg(tab_bar_mode.to_string());
+    for dir in dirs {
+        cmd.arg(dir);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| anyhow!("new Favnyr instance: {e}"))
+}
+
 /// Detached spawn (stdio cut off; on Windows, no ghost console).
 ///
 /// `elevated` (Windows only): launches via `ShellExecuteW("runas", …)` →
@@ -1040,7 +1080,7 @@ pub(crate) fn pick_terminal() -> Option<String> {
         }
     }
     const CANDIDATES: &[&str] = &[
-        "kgx",            // GNOME Console (Bazzite GNOME)
+        "kgx",            // GNOME Console
         "konsole",        // KDE
         "gnome-terminal", // legacy GNOME
         "kitty",
@@ -1087,10 +1127,10 @@ pub fn resolve_program(candidates: &[&str]) -> Option<String> {
 
 /// Is an opener's "Program" field launchable? An EXISTING file path
 /// (Windows case, where one browses to an `.exe`), OR — especially on
-/// Linux — a simple COMMAND resolvable via `PATH` (`gimp`, `kate`…).
+/// Linux — a simple COMMAND resolvable via `PATH` (`viewer`, `editor`…).
 ///
 /// A valid program isn't always a file path: a PATH command
-/// entered as-is (`gimp`, `kate`) is valid on Linux without
+/// entered as-is (`viewer`, `editor`) is valid on Linux without
 /// being an existing file, unlike a Windows executable which is always
 /// resolved to an absolute path.
 pub fn program_is_valid(program: &str) -> bool {
@@ -1364,11 +1404,11 @@ mod image_activation_tests {
     #[test]
     fn photos_gallery_protocol_encodes_query_delimiters_and_unicode() {
         let target =
-            photos_gallery_target(std::path::Path::new(r"C:\Images été\vacances + #1 %20.png"))
+            photos_gallery_target(std::path::Path::new(r"C:\Photos café\image + #1 %20.png"))
                 .unwrap();
         assert_eq!(
             target.to_string_lossy(),
-            r"ms-photos:viewer?fileName=C:\Images%20%C3%A9t%C3%A9\vacances%20%2B%20%231%20%2520.png"
+            r"ms-photos:viewer?fileName=C:\Photos%20caf%C3%A9\image%20%2B%20%231%20%2520.png"
         );
     }
 
@@ -1448,7 +1488,7 @@ mod program_tests {
 
         // A binary without an extension with its bit set: the everyday case
         // this bypass exists for.
-        assert!(is_launchable_program(&write(&dir, "blender", 0o755)));
+        assert!(is_launchable_program(&write(&dir, "sample-app", 0o755)));
         assert!(is_launchable_program(&write(&dir, "run.sh", 0o755)));
 
         // Same file without the bit: it is not a program, the desktop opener
@@ -1486,7 +1526,7 @@ mod program_tests {
         // desktop's own rule never consults the bit for a launcher.
         assert!(is_desktop_launcher(&write(
             &dir,
-            "Blender 5.desktop",
+            "Sample App 5.desktop",
             0o644
         )));
         assert!(is_desktop_launcher(&write(&dir, "game.desktop", 0o755)));

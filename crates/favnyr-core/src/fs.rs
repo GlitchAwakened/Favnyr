@@ -13,7 +13,6 @@ use std::time::UNIX_EPOCH;
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
-use crate::i18n::Lang;
 
 /// Category of a file — drives icon selection on the Slint side.
 ///
@@ -236,6 +235,157 @@ pub fn is_unc_path(path: &Path) -> bool {
     }
 }
 
+// ---------- What the user types in the address bar ----------
+
+/// Turns an address typed by the user into a path.
+///
+/// Two conveniences, each written the way its own platform writes it:
+///   - `~` and `~/…` for the home folder, on every platform;
+///   - `%VAR%` on Windows, `$VAR` and `${VAR}` elsewhere.
+///
+/// **A name that is not a defined variable is left exactly as typed.** That one
+/// rule covers the three cases that matter: a real variable expands, a typo
+/// reaches the caller untouched so the usual "not listable" message can name
+/// it, and a folder whose name merely carries a percent sign or a dollar is
+/// never mangled.
+///
+/// Case follows the platform for free: a variable name is matched without
+/// regard to case on Windows and with it elsewhere, because that is how the
+/// system itself answers.
+///
+/// A folder CAN legitimately be named after a variable. Expanding wins, as it
+/// does in the system's own file manager; such a folder stays reachable by
+/// navigating into it rather than by typing its name.
+pub fn expand_typed_path(raw: &str) -> PathBuf {
+    // The tilde goes first, as a shell does it: it is only special at the very
+    // start, and what a variable expands to must not be re-read for one.
+    match strip_home_prefix(raw) {
+        Some((home, rest)) => {
+            let rest = expand_variables(rest);
+            if rest.is_empty() {
+                home
+            } else {
+                home.join(rest)
+            }
+        }
+        None => PathBuf::from(expand_variables(raw)),
+    }
+}
+
+/// Splits a leading `~` off, returning the home folder and what followed it.
+/// Both separators are accepted on Windows, where a user types either.
+fn strip_home_prefix(raw: &str) -> Option<(PathBuf, &str)> {
+    let home = || dirs::home_dir().unwrap_or_else(std::env::temp_dir);
+    if raw == "~" {
+        return Some((home(), ""));
+    }
+    let rest = raw.strip_prefix("~/").or_else(|| {
+        if cfg!(windows) {
+            raw.strip_prefix(r"~\")
+        } else {
+            None
+        }
+    })?;
+    Some((home(), rest))
+}
+
+/// Replaces every `%NAME%` that names a defined variable. A `%` that opens
+/// nothing, or opens a name the environment does not know, stays where it is —
+/// which is also what leaves `%%` alone.
+#[cfg(windows)]
+fn expand_variables(text: &str) -> String {
+    expand_variables_with(text, |name| std::env::var(name).ok())
+}
+
+/// The rules above, with the environment handed in: what a variable resolves to
+/// is the only thing here that depends on the machine, so injecting it is what
+/// makes the parsing testable.
+#[cfg(windows)]
+fn expand_variables_with(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('%') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        // The name runs to the next `%`. Anything may sit between the two but a
+        // `%` itself: two real variables carry parentheses
+        // (`%ProgramFiles(x86)%`), so letters alone would not do.
+        match after.find('%').map(|close| (close, &after[..close])) {
+            Some((close, name)) if !name.is_empty() => match lookup(name) {
+                Some(value) => {
+                    out.push_str(&value);
+                    rest = &after[close + 1..];
+                }
+                None => {
+                    out.push('%');
+                    rest = after;
+                }
+            },
+            _ => {
+                out.push('%');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Replaces every `$NAME` and `${NAME}` that names a defined variable. A `$`
+/// followed by something else, or by a name the environment does not know,
+/// stays where it is.
+#[cfg(not(windows))]
+fn expand_variables(text: &str) -> String {
+    expand_variables_with(text, |name| std::env::var(name).ok())
+}
+
+/// The rules above, with the environment handed in: what a variable resolves to
+/// is the only thing here that depends on the machine, so injecting it is what
+/// makes the parsing testable.
+#[cfg(not(windows))]
+fn expand_variables_with(text: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(dollar) = rest.find('$') {
+        out.push_str(&rest[..dollar]);
+        let after = &rest[dollar + 1..];
+        let braced = after.strip_prefix('{');
+        let found = match braced {
+            // `${NAME}`: the braces say where the name ends, so it may hold
+            // anything, which is the reason the form exists.
+            Some(body) => body
+                .find('}')
+                .map(|close| (&body[..close], &body[close + 1..])),
+            // `$NAME`: the name ends at the first character a variable name
+            // cannot hold, which is how `$USER/Documents` finds `USER`.
+            None => {
+                let end = after
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(after.len());
+                Some((&after[..end], &after[end..]))
+            }
+        };
+        match found {
+            Some((name, tail)) if !name.is_empty() => match lookup(name) {
+                Some(value) => {
+                    out.push_str(&value);
+                    rest = tail;
+                }
+                None => {
+                    out.push('$');
+                    rest = after;
+                }
+            },
+            _ => {
+                out.push('$');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Lists the shares of a UNC server root as `Entry` items (folders) —
 /// `\\HOST` becomes "browsable" like in Explorer. `Err(PermissionDenied)`
 /// if authentication is required (→ GUI-side login prompt), `Err(NotConnected)`
@@ -336,16 +486,24 @@ pub fn list_dir_counted(path: &Path, include_hidden: bool) -> Result<(Vec<Entry>
             .unwrap_or(false);
         let (is_dir, size_bytes, mtime_unix, executable) = match md_res {
             Ok(md) => {
-                // On Unix, a link's permissions (often 0777) don't describe
-                // those of its target. Reusing the followed metadata therefore
-                // avoids marking every symlink as executable.
+                // A link describes itself, not what it points at: its own
+                // length is the size of the stored path and its own timestamp
+                // is when the link was made. On Unix its permissions are
+                // usually 0777 as well. Every displayed field therefore reads
+                // the FOLLOWED metadata, so a link to a file reports that
+                // file's size, date and executability rather than the link's.
+                // A broken link has no target to follow and keeps its own.
                 let followed_md = is_symlink
                     .then(|| std::fs::metadata(&full_path).ok())
                     .flatten();
                 let effective_md = followed_md.as_ref().unwrap_or(&md);
                 let is_dir = effective_md.is_dir();
-                let size = if is_dir { None } else { Some(md.len()) };
-                let mtime = md
+                let size = if is_dir {
+                    None
+                } else {
+                    Some(effective_md.len())
+                };
+                let mtime = effective_md
                     .modified()
                     .ok()
                     .and_then(|st| st.duration_since(UNIX_EPOCH).ok())
@@ -547,36 +705,47 @@ pub fn sort(entries: &mut [Entry], column: SortColumn, order: SortOrder, group: 
 
 // ----- Formatting ----------------------------------------------------------
 
-/// Size units depending on the language. French uses `o/Ko/Mo/Go/To`,
-/// other languages use `B/KB/MB/GB/TB` (common convention).
-pub fn size_units(lang: Lang) -> &'static [&'static str] {
-    match lang {
-        Lang::Fr => &["o", "Ko", "Mo", "Go", "To"],
-        _ => &["B", "KB", "MB", "GB", "TB"],
+/// Wording of a formatted size, supplied by the CALLER.
+///
+/// This crate holds no translations: the algorithm lives here, the vocabulary
+/// lives with the interface. That also keeps the two locale-dependent pieces
+/// together — a language that writes `Ko` also writes `1,0`, and separating
+/// them is how the decimal mark ended up applied to French alone while
+/// Spanish, German and Italian kept an English point.
+#[derive(Debug, Clone, Copy)]
+pub struct SizeUnits<'a> {
+    /// Units by increasing power of 1024: byte, kilo, mega, giga, tera.
+    pub steps: [&'a str; 5],
+    /// Mark between the integer and the decimal part.
+    pub decimal: char,
+}
+
+impl SizeUnits<'_> {
+    /// Renders `value` with `decimals` places, using the locale's mark.
+    fn number(&self, value: f64, decimals: usize) -> String {
+        let s = format!("{value:.decimals$}");
+        if self.decimal == '.' {
+            s
+        } else {
+            s.replace('.', &self.decimal.to_string())
+        }
     }
 }
 
 /// Formats a size in bytes with the most appropriate unit.
 /// Base-1024 convention (binary), one decimal beyond KB.
-pub fn format_size(bytes: u64, lang: Lang) -> String {
-    let units = size_units(lang);
+pub fn format_size(bytes: u64, units: SizeUnits<'_>) -> String {
     if bytes < 1024 {
-        return format!("{bytes} {}", units[0]);
+        return format!("{bytes} {}", units.steps[0]);
     }
     let mut value = bytes as f64;
     let mut idx = 0usize;
-    while value >= 1024.0 && idx + 1 < units.len() {
+    while value >= 1024.0 && idx + 1 < units.steps.len() {
         value /= 1024.0;
         idx += 1;
     }
-    // One decimal for intermediate values. The FR locale uses a comma.
-    let s = format!("{value:.1}");
-    let s = if matches!(lang, Lang::Fr) {
-        s.replace('.', ",")
-    } else {
-        s
-    };
-    format!("{s} {}", units[idx])
+    // One decimal beyond the byte step.
+    format!("{} {}", units.number(value, 1), units.steps[idx])
 }
 
 /// How comfortable the remaining space on a volume is: `0` roomy, `1` low,
@@ -613,7 +782,7 @@ pub fn free_space_level(free: u64, total: u64) -> i32 {
 }
 
 /// Formats a used/total pair for the capacity gauge, both figures sharing the
-/// **total's** unit so they can be compared at a glance: `26,0/57,3 Go`.
+/// **total's** unit so they can be compared at a glance: `26.0 / 57.3 GB`.
 ///
 /// [`format_size`] cannot do this — called twice it picks each number's own
 /// unit, so a nearly empty disk would read "900 Mo/1,8 To" and force the reader
@@ -624,27 +793,23 @@ pub fn free_space_level(free: u64, total: u64) -> i32 {
 /// figures grows as the volume fills, so a figure counting DOWN while the bar
 /// counts up left the reader with two contradictory readings of one fact. The
 /// free space has its own, unambiguous place in the hover hint.
-pub fn format_used_total(used: u64, total: u64, lang: Lang) -> String {
-    let units = size_units(lang);
+pub fn format_used_total(used: u64, total: u64, units: SizeUnits<'_>) -> String {
     // Unit of the total: the larger of the two, so the pair stays comparable.
     let mut scale = 1.0_f64;
     let mut idx = 0usize;
-    while (total as f64) / scale >= 1024.0 && idx + 1 < units.len() {
+    while (total as f64) / scale >= 1024.0 && idx + 1 < units.steps.len() {
         scale *= 1024.0;
         idx += 1;
     }
     let decimals = if idx == 0 { 0 } else { 1 };
-    let used_scaled = used as f64 / scale;
-    let total_scaled = total as f64 / scale;
     // Spaces around the slash: at this size the two figures ran into the
     // separator and read as one long number.
-    let text = format!("{used_scaled:.decimals$} / {total_scaled:.decimals$}");
-    let text = if matches!(lang, Lang::Fr) {
-        text.replace('.', ",")
-    } else {
-        text
-    };
-    format!("{text} {}", units[idx])
+    format!(
+        "{} / {} {}",
+        units.number(used as f64 / scale, decimals),
+        units.number(total as f64 / scale, decimals),
+        units.steps[idx]
+    )
 }
 
 /// A single bounded walk over `path` computing BOTH its recursive **max mtime**
@@ -764,36 +929,27 @@ pub fn format_mtime(unix: i64, offset_secs: i64) -> String {
 /// Compact units for the "age" column depending on the language:
 /// `(minute, day, month, year, "just now")`. The hour uses `h` and
 /// minutes the apostrophe `'` (compact and language-neutral, for example "2 h 50'").
-fn age_units(
-    lang: Lang,
-) -> (
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-) {
-    match lang {
-        Lang::Fr => ("min", "j", "mois", "an", "à l'instant"),
-        Lang::En => ("min", "d", "mo", "y", "just now"),
-        Lang::Es => ("min", "d", "mes", "a", "ahora"),
-        Lang::De => ("Min", "T", "Mon", "J", "gerade"),
-        Lang::It => ("min", "g", "mes", "a", "ora"),
-    }
+#[derive(Debug, Clone, Copy)]
+pub struct AgeUnits<'a> {
+    pub minute: &'a str,
+    pub day: &'a str,
+    pub month: &'a str,
+    pub year: &'a str,
+    /// Whole wording for "less than a minute ago" — a sentence, not a unit.
+    pub now: &'a str,
 }
 
 /// Formats the **age** (now − mtime) compactly, readable at a glance:
 /// `42 min`, `2 h 50'`, `25d`, `3mo`, `2y`. `now_unix` and
 /// `mtime_unix` are Unix seconds.
-pub fn format_age(mtime_unix: i64, now_unix: i64, lang: Lang) -> String {
+pub fn format_age(mtime_unix: i64, now_unix: i64, units: AgeUnits<'_>) -> String {
     let secs = (now_unix - mtime_unix).max(0);
-    let (min_u, day_u, month_u, year_u, now_w) = age_units(lang);
     if secs < 60 {
-        return now_w.to_string();
+        return units.now.to_string();
     }
     let mins = secs / 60;
     if mins < 60 {
-        return format!("{mins} {min_u}");
+        return format!("{mins} {}", units.minute);
     }
     let hours = mins / 60;
     if hours < 24 {
@@ -802,14 +958,14 @@ pub fn format_age(mtime_unix: i64, now_unix: i64, lang: Lang) -> String {
     }
     let days = hours / 24;
     if days < 31 {
-        return format!("{days}{day_u}");
+        return format!("{days}{}", units.day);
     }
     if days < 365 {
         let mo = days / 30;
-        return format!("{mo}{month_u}");
+        return format!("{mo}{}", units.month);
     }
     let years = days / 365;
-    format!("{years}{year_u}")
+    format!("{years}{}", units.year)
 }
 
 /// "Heat" index of the age, for the hot→cold color gradient of the
@@ -854,7 +1010,108 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+
+    /// The environment is handed in, so these assert the PARSING rather than
+    /// whatever the machine running them happens to define.
+    fn fake_env(name: &str) -> Option<String> {
+        match name {
+            "APPDATA" => Some(r"C:\Users\someone\AppData\Roaming".to_owned()),
+            "ProgramFiles(x86)" => Some(r"C:\Program Files (x86)".to_owned()),
+            "HOME" => Some("/home/someone".to_owned()),
+            "USER" => Some("someone".to_owned()),
+            _ => None,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_variables_expand_only_when_they_exist() {
+        let expand = |text: &str| expand_variables_with(text, fake_env);
+
+        assert_eq!(
+            expand(r"%APPDATA%\Favnyr"),
+            r"C:\Users\someone\AppData\Roaming\Favnyr"
+        );
+        // Two real variables carry parentheses, so a letters-only name would
+        // have missed them.
+        assert_eq!(
+            expand(r"%ProgramFiles(x86)%\Tool"),
+            r"C:\Program Files (x86)\Tool"
+        );
+        // Anywhere in the path, not just at the start.
+        assert_eq!(
+            expand(r"C:\x\%APPDATA%"),
+            r"C:\x\C:\Users\someone\AppData\Roaming"
+        );
+
+        // Untouched: an unknown name reaches the caller so it can say so, and a
+        // percent sign that names nothing is just a character in a folder name.
+        assert_eq!(expand("%NOT_A_VARIABLE%"), "%NOT_A_VARIABLE%");
+        assert_eq!(expand("Report 100% final"), "Report 100% final");
+        assert_eq!(expand("50%-75%"), "50%-75%");
+        assert_eq!(expand("%%"), "%%");
+        assert_eq!(expand("%unterminated"), "%unterminated");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_variables_expand_in_both_spellings() {
+        let expand = |text: &str| expand_variables_with(text, fake_env);
+
+        assert_eq!(expand("$HOME/Documents"), "/home/someone/Documents");
+        assert_eq!(expand("${HOME}/Documents"), "/home/someone/Documents");
+        // Mid-path, which is the form a shell user reaches for.
+        assert_eq!(expand("/home/$USER/Documents"), "/home/someone/Documents");
+        // The braces are what allow a name to be followed by a letter.
+        assert_eq!(expand("${USER}name"), "someonename");
+        assert_eq!(expand("$USERname"), "$USERname");
+
+        // Untouched: unknown names, and a dollar that opens nothing.
+        assert_eq!(expand("$NOT_A_VARIABLE/x"), "$NOT_A_VARIABLE/x");
+        assert_eq!(expand("price $ 5"), "price $ 5");
+        assert_eq!(expand("${unterminated"), "${unterminated");
+    }
+
+    #[test]
+    fn a_plain_path_is_returned_unchanged() {
+        // Nothing to expand must mean nothing altered, on either platform.
+        let typed = if cfg!(windows) {
+            r"C:\Users\someone\Documents"
+        } else {
+            "/home/someone/Documents"
+        };
+        assert_eq!(expand_typed_path(typed), PathBuf::from(typed));
+    }
+
+    #[test]
+    fn the_home_shorthand_still_works() {
+        let home = dirs::home_dir().unwrap_or_else(std::env::temp_dir);
+        assert_eq!(expand_typed_path("~"), home);
+        assert_eq!(expand_typed_path("~/Documents"), home.join("Documents"));
+        #[cfg(windows)]
+        assert_eq!(expand_typed_path(r"~\Documents"), home.join("Documents"));
+        // Only at the very start: a tilde inside a name is a name.
+        assert_eq!(expand_typed_path("backup~1"), PathBuf::from("backup~1"));
+    }
     use super::*;
+
+    /// Wording the interface supplies for English and French. Mirrored here so
+    /// the formatting assertions keep testing the exact rendered strings.
+    const EN: SizeUnits<'static> = SizeUnits {
+        steps: ["B", "KB", "MB", "GB", "TB"],
+        decimal: '.',
+    };
+    const FR: SizeUnits<'static> = SizeUnits {
+        steps: ["o", "Ko", "Mo", "Go", "To"],
+        decimal: ',',
+    };
+    const FR_AGE: AgeUnits<'static> = AgeUnits {
+        minute: "min",
+        day: "j",
+        month: "mois",
+        year: "an",
+        now: "à l'instant",
+    };
 
     #[test]
     fn classify_folder_overrides_extension() {
@@ -986,33 +1243,24 @@ mod tests {
 
         // Both figures in the total's unit — calling `format_size` twice would
         // have picked a unit per number.
-        assert_eq!(
-            format_used_total(26 * GIB, 64 * GIB, Lang::En),
-            "26.0 / 64.0 GB"
-        );
-        assert_eq!(
-            format_used_total(26 * GIB, 64 * GIB, Lang::Fr),
-            "26,0 / 64,0 Go"
-        );
+        assert_eq!(format_used_total(26 * GIB, 64 * GIB, EN), "26.0 / 64.0 GB");
+        assert_eq!(format_used_total(26 * GIB, 64 * GIB, FR), "26,0 / 64,0 Go");
 
         // A barely used volume keeps the total's unit and reads near zero,
         // which is what it means. No special case is needed now that the
         // figure counts UP alongside the bar instead of down against it.
-        assert_eq!(
-            format_used_total(900 * MIB, 2 * TIB, Lang::En),
-            "0.0 / 2.0 TB"
-        );
+        assert_eq!(format_used_total(900 * MIB, 2 * TIB, EN), "0.0 / 2.0 TB");
 
         // Kept honest against the size column: same base-1024 convention, so a
         // drive sold as "64 GB" reads the same here as everywhere else.
-        assert_eq!(format_size(64_000_000_000, Lang::En), "59.6 GB");
+        assert_eq!(format_size(64_000_000_000, EN), "59.6 GB");
         assert_eq!(
-            format_used_total(32_000_000_000, 64_000_000_000, Lang::En),
+            format_used_total(32_000_000_000, 64_000_000_000, EN),
             "29.8 / 59.6 GB"
         );
 
         // Tiny volume: bytes carry no decimal.
-        assert_eq!(format_used_total(200, 900, Lang::En), "200 / 900 B");
+        assert_eq!(format_used_total(200, 900, EN), "200 / 900 B");
     }
 
     #[test]
@@ -1038,17 +1286,17 @@ mod tests {
         const D: i64 = 86_400;
         let now = 1_000_000_000;
         // < 1 min → "à l'instant".
-        assert_eq!(format_age(now - 30, now, Lang::Fr), "à l'instant");
+        assert_eq!(format_age(now - 30, now, FR_AGE), "à l'instant");
         assert_eq!(age_bucket(now - 30, now), 0);
         // minutes.
-        assert_eq!(format_age(now - 42 * 60, now, Lang::Fr), "42 min");
+        assert_eq!(format_age(now - 42 * 60, now, FR_AGE), "42 min");
         // hours + minutes ("2 h 05'").
-        assert_eq!(format_age(now - (2 * H + 5 * 60), now, Lang::Fr), "2 h 05'");
+        assert_eq!(format_age(now - (2 * H + 5 * 60), now, FR_AGE), "2 h 05'");
         // days.
-        assert_eq!(format_age(now - 25 * D, now, Lang::Fr), "25j");
+        assert_eq!(format_age(now - 25 * D, now, FR_AGE), "25j");
         assert_eq!(age_bucket(now - 25 * D, now), 4);
         // mtime in the future (clock) → clamped to 0 → "à l'instant".
-        assert_eq!(format_age(now + 9999, now, Lang::Fr), "à l'instant");
+        assert_eq!(format_age(now + 9999, now, FR_AGE), "à l'instant");
     }
 
     #[test]
@@ -1062,17 +1310,17 @@ mod tests {
 
     #[test]
     fn format_size_units() {
-        assert_eq!(format_size(0, Lang::En), "0 B");
-        assert_eq!(format_size(512, Lang::En), "512 B");
-        assert_eq!(format_size(1024, Lang::En), "1.0 KB");
-        assert_eq!(format_size(1536, Lang::En), "1.5 KB");
-        assert_eq!(format_size(1024 * 1024, Lang::En), "1.0 MB");
+        assert_eq!(format_size(0, EN), "0 B");
+        assert_eq!(format_size(512, EN), "512 B");
+        assert_eq!(format_size(1024, EN), "1.0 KB");
+        assert_eq!(format_size(1536, EN), "1.5 KB");
+        assert_eq!(format_size(1024 * 1024, EN), "1.0 MB");
     }
 
     #[test]
     fn format_size_fr_uses_o_and_comma() {
-        assert_eq!(format_size(1024, Lang::Fr), "1,0 Ko");
-        assert_eq!(format_size(1_500_000_000, Lang::Fr), "1,4 Go");
+        assert_eq!(format_size(1024, FR), "1,0 Ko");
+        assert_eq!(format_size(1_500_000_000, FR), "1,4 Go");
     }
 
     #[test]
@@ -1251,6 +1499,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[test]
+    fn list_dir_reports_target_size_and_date_for_a_symlink() {
+        // A link stores a path, so its own length is a handful of bytes and its
+        // own timestamp is when it was created. Showing those would describe
+        // the link instead of the file the user sees listed.
+        let tmp = std::env::temp_dir().join(format!("favnyr-symlink-size-{}", nano()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let target = tmp.join("payload.bin");
+        let payload = vec![7u8; 4096];
+        std::fs::write(&target, &payload).unwrap();
+        let link = tmp.join("payload-link.bin");
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&target, &link).is_ok();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&target, &link).is_ok();
+        #[cfg(not(any(unix, windows)))]
+        let made = false;
+
+        // Creating a link is refused without privilege on Windows; asserting
+        // only when one exists keeps the test meaningful and non-flaky.
+        if made {
+            let (entries, _) = list_dir_counted(&tmp, false).unwrap();
+            let linked = entries
+                .iter()
+                .find(|e| e.name == "payload-link.bin")
+                .expect("link listed");
+            let real = entries
+                .iter()
+                .find(|e| e.name == "payload.bin")
+                .expect("target listed");
+            assert!(linked.is_symlink, "the entry is still marked as a link");
+            assert_eq!(
+                linked.size_bytes,
+                Some(payload.len() as u64),
+                "a link must report the size of its target"
+            );
+            assert_eq!(
+                linked.mtime_unix, real.mtime_unix,
+                "a link must report the date of its target"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[cfg(unix)]
     #[test]
     fn list_dir_reports_target_executable_bits_including_symlinks() {
@@ -1347,7 +1639,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("favnyr-bench-{}", nano()));
         std::fs::create_dir_all(&tmp).unwrap();
         for i in 0..10_000 {
-            std::fs::write(tmp.join(format!("fichier_{i}.txt")), b"").unwrap();
+            std::fs::write(tmp.join(format!("file_{i}.txt")), b"").unwrap();
         }
 
         let t0 = std::time::Instant::now();

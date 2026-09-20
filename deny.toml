@@ -7,16 +7,29 @@
 #     cargo install --locked cargo-deny
 #     cargo deny check
 #
+# The CI runs it on every push and pull request, so a policy break fails the
+# build instead of reaching a release unnoticed.
+#
 # This configuration is deliberately strict on bans (deny anything that
-# speaks TCP/HTTP) and permissive on "advisories.unmaintained" (warn):
-# our dependency tree is dominated by Slint and its transitives; a warning
-# doesn't break CI but stays visible.
+# speaks TCP/HTTP). Unmaintained crates are handled the other way round: the
+# tree is dominated by Slint and its transitives, so those advisories are
+# listed one by one under `advisories.ignore`, each with the reason it does
+# not apply here — rather than silenced wholesale by a policy switch.
+#
+# `check advisories` clones the RUSTSEC database, so that one part needs
+# network access; `bans`, `licenses` and `sources` are entirely offline.
 
 [graph]
 all-features = false
 no-default-features = false
+# BOTH shipped platforms. A single target checks only half the tree: crates
+# behind `cfg(windows)` are absent from a Linux-only graph, so neither their
+# licence nor a network dependency among them would ever be seen. The Windows
+# clipboard stack is a live example — it carries a licence no other crate in
+# the tree uses.
 targets = [
     { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "x86_64-pc-windows-msvc" },
 ]
 
 [advisories]
@@ -48,6 +61,9 @@ ignore = [
 ]
 
 [licenses]
+# Every entry below is carried by at least one crate in the resolved graph of
+# one of the two targets. Licences nobody uses are not listed: a permission
+# granted to no one only hides what the tree really contains.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -56,17 +72,18 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Zlib",
-    "Unicode-3.0",
-    "Unicode-DFS-2016",
-    "MPL-2.0",
-    "OFL-1.1",
     "0BSD",
+    "Unicode-3.0",
+    "MPL-2.0",
     "CC0-1.0",
-    "GPL-3.0",
-    "GPL-3.0-only",        # Slint (open-source) : « GPL-3.0-only OR LicenseRef-Slint-* »
+    # Boost. Windows only: the clipboard stack (`clipboard-win`, `error-code`),
+    # reached through both `arboard` and Slint's winit backend.
+    "BSL-1.0",
+    # Slint publishes as "GPL-3.0-only OR LicenseRef-Slint-*"; this is the
+    # branch we take, and the reason Favnyr itself is GPL.
+    "GPL-3.0-only",
+    # Favnyr's own two crates.
     "GPL-3.0-or-later",
-    "LGPL-3.0",
-    "LGPL-3.0-or-later",
 ]
 confidence-threshold = 0.93
 exceptions = []
@@ -82,21 +99,74 @@ allow = []
 
 # Anything that talks to the network: forbidden. If Slint or a transitive
 # dependency tries to pull in openssl-sys, hyper, reqwest, etc., CI must fail.
+#
+# A blocklist can never be exhaustive, so the crates listed are those whose
+# presence has no innocent reading: HTTP clients and servers, TLS backends, DNS
+# resolvers, socket plumbing. General-purpose async runtimes are deliberately
+# NOT here — `tokio` alone proves nothing, and banning it would break the build
+# over a timer.
+#
+# Two crates in the tree look like network and are not, so they must stay out
+# of this list: `mio` (inotify backend of `notify` — removing it breaks the
+# file watcher) and `async-io` (D-Bus accessibility bus, via zbus).
 deny = [
-    { name = "openssl" },
-    { name = "openssl-sys" },
-    { name = "native-tls" },
-    { name = "rustls" },
-    { name = "rustls-pemfile" },
+    # --- HTTP clients ---
     { name = "reqwest" },
-    { name = "hyper" },
-    { name = "hyper-rustls" },
-    { name = "hyper-tls" },
     { name = "ureq" },
     { name = "isahc" },
     { name = "surf" },
     { name = "curl" },
     { name = "curl-sys" },
+    { name = "attohttpc" },
+    { name = "minreq" },
+    { name = "http_req" },
+    # --- HTTP cores and servers ---
+    { name = "hyper" },
+    { name = "hyper-rustls" },
+    { name = "hyper-tls" },
+    { name = "hyper-util" },
+    { name = "h2" },
+    { name = "h3" },
+    { name = "tonic" },
+    { name = "axum" },
+    { name = "warp" },
+    { name = "tide" },
+    { name = "rocket" },
+    { name = "actix-web" },
+    { name = "actix-http" },
+    { name = "awc" },
+    # --- WebSocket ---
+    { name = "tungstenite" },
+    { name = "tokio-tungstenite" },
+    { name = "async-tungstenite" },
+    # --- TLS backends (every platform, so a port cannot slip one in) ---
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+    { name = "rustls" },
+    { name = "rustls-pemfile" },
+    { name = "boring" },
+    { name = "boring-sys" },
+    { name = "schannel" },
+    { name = "security-framework" },
+    # --- DNS resolution ---
+    { name = "hickory-resolver" },
+    { name = "hickory-proto" },
+    { name = "trust-dns-resolver" },
+    { name = "trust-dns-proto" },
+    # --- Transport and raw sockets ---
+    # `socket2` is the highest-value tripwire of the list: nearly every
+    # networking crate ends up on it, whatever layer it sits at.
+    { name = "socket2" },
+    { name = "quinn" },
+    { name = "quinn-proto" },
+    { name = "smoltcp" },
+    # --- Other protocols ---
+    { name = "git2" },
+    { name = "libgit2-sys" },
+    { name = "lettre" },
+    { name = "ssh2" },
+    { name = "russh" },
 ]
 skip = []
 skip-tree = []

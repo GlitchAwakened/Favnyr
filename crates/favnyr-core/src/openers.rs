@@ -68,7 +68,7 @@ impl OpenerIcon {
 pub struct Opener {
     /// Stable identifier (generated).
     pub id: String,
-    /// Displayed label ("GIMP", "VS Code"…).
+    /// Displayed label ("Image Editor", "Text Editor"…).
     pub label: String,
     /// ABSOLUTE path of the executable (never interpreted by a shell). Can be
     /// empty if `assoc` is set (OS app with no directly launchable exe).
@@ -94,7 +94,7 @@ pub struct Opener {
     /// Extensions (no dot, lowercase) **learned through use**: each time
     /// the opener is launched on a file, its extension is recorded here. Used
     /// to only offer, in the "Open with" flyout, programs that are ACTUALLY
-    /// suited to the file's extension (no more Word suggested for a .mp4).
+    /// suited to the file's extension (no more text editor offered for a .mp4).
     #[serde(default)]
     pub used_exts: Vec<String>,
     /// Usage counter (MRU for "suggested applications").
@@ -378,7 +378,22 @@ impl OpenerStore {
     /// Loads from `path`; empty store if missing/unreadable (never fatal).
     pub fn load(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
-            Ok(content) => toml::from_str(&content).unwrap_or_default(),
+            Ok(content) => match toml::from_str(&content) {
+                Ok(store) => store,
+                Err(err) => {
+                    // The file is there but cannot be read back. Starting from
+                    // an empty store keeps the application usable; letting the
+                    // next save write that emptiness over the user's only copy
+                    // does not, so the file is kept aside first.
+                    tracing::warn!(
+                        error = %err,
+                        path = %path.display(),
+                        "unreadable store"
+                    );
+                    crate::paths::preserve_unreadable(path);
+                    Self::default()
+                }
+            },
             Err(_) => Self::default(),
         }
     }
@@ -390,7 +405,7 @@ impl OpenerStore {
         }
         let s = toml::to_string_pretty(self)
             .map_err(|e| Error::Openers(format!("serialization: {e}")))?;
-        std::fs::write(path, s)?;
+        crate::paths::write_atomic(path, &s)?;
         Ok(())
     }
 
@@ -640,7 +655,7 @@ impl OpenerStore {
     /// Suggestions ADAPTED to the `ext` extension: only openers
     /// **set** (`default_exts`) OR **already used** (`used_exts`) for this
     /// extension, sorted by recency (MRU). Avoids mixing in unrelated
-    /// programs (e.g. Word suggested for a `.mp4`). If `ext` is empty (file
+    /// programs (e.g. a text editor offered for a `.mp4`). If `ext` is empty (file
     /// with no extension), falls back to the global MRU.
     ///
     /// An empty list is possible (extension never opened) → the GUI keeps the
@@ -721,7 +736,7 @@ mod tests {
         // set_elevated toggles the flag (and fails on an unknown id).
         assert!(s.set_elevated(&id, true));
         assert!(s.get(&id).unwrap().elevated);
-        assert!(!s.set_elevated("inconnu", true));
+        assert!(!s.set_elevated("unknown-id", true));
         // TOML round-trip preserved.
         let toml = toml::to_string_pretty(&s).unwrap();
         let back: OpenerStore = toml::from_str(&toml).unwrap();
@@ -950,8 +965,8 @@ mod tests {
     #[test]
     fn ctx_menu_mask_round_trips_and_filters() {
         let mut s = OpenerStore::default();
-        let a = s.add("Git Bash", "/bin/bash", vec!["--cd={dir}".into()]);
-        let b = s.add("BC", "/bin/bc", vec![]);
+        let a = s.add("Shell Here", "/bin/sh", vec!["--cd={dir}".into()]);
+        let b = s.add("Compare", "/bin/compare", vec![]);
         // Default: not pinned.
         assert!(s.for_context(CTX_BACKGROUND).is_empty());
         // Mask set + filter by bit.
@@ -1018,29 +1033,30 @@ mod tests {
     #[test]
     fn suggested_for_ext_filters_and_learns() {
         let mut s = OpenerStore::default();
-        let vlc = s.add("VLC", "/bin/vlc", vec![]);
-        let word = s.add("Word", "/bin/word", vec![]);
-        let _gimp = s.add("GIMP", "/bin/gimp", vec![]);
-        // Word used for a .docx, VLC for a .mp4 (learning).
-        s.record_use(&word, Some("docx"));
-        s.record_use(&vlc, Some("mp4"));
+        let player = s.add("Media Player", "/bin/mediaplayer", vec![]);
+        let text = s.add("Text Editor", "/bin/textedit", vec![]);
+        let _image = s.add("Image Editor", "/bin/imageedit", vec![]);
+        // The text editor was used on a .docx, the player on a .mp4 (learning).
+        s.record_use(&text, Some("docx"));
+        s.record_use(&player, Some("mp4"));
         let labels = |v: Vec<&Opener>| v.iter().map(|o| o.label.clone()).collect::<Vec<_>>();
-        // Flyout for a .mp4: ONLY VLC (Word/GIMP never used for mp4).
-        assert_eq!(labels(s.suggested_for_ext("mp4", 8)), ["VLC"]);
-        // Flyout for a .docx: only Word.
-        assert_eq!(labels(s.suggested_for_ext(".DOCX", 8)), ["Word"]); // dot + case normalized
+        // Flyout for a .mp4: ONLY the player (no editor was ever used on one).
+        assert_eq!(labels(s.suggested_for_ext("mp4", 8)), ["Media Player"]);
+        // Flyout for a .docx: only the text editor.
+        // (dot + case normalized)
+        assert_eq!(labels(s.suggested_for_ext(".DOCX", 8)), ["Text Editor"]);
         // Extension never opened → empty list (→ "Choose an application…").
         assert!(s.suggested_for_ext("png", 8).is_empty());
         // An explicit `default_ext` also counts.
-        s.set_default_ext(&_gimp, "png", true);
-        assert_eq!(labels(s.suggested_for_ext("png", 8)), ["GIMP"]);
+        s.set_default_ext(&_image, "png", true);
+        assert_eq!(labels(s.suggested_for_ext("png", 8)), ["Image Editor"]);
     }
 
     #[test]
     fn tag_context_splits_path() {
-        let c = ctx("/home/u/photos/chat.PNG");
-        assert_eq!(c.name, "chat.PNG");
-        assert_eq!(c.stem, "chat");
+        let c = ctx("/home/u/photos/image.PNG");
+        assert_eq!(c.name, "image.PNG");
+        assert_eq!(c.stem, "image");
         assert_eq!(c.ext, "png"); // lowercase
         assert_eq!(c.dir, "/home/u/photos");
     }
@@ -1123,8 +1139,8 @@ mod tests {
     fn save_load_round_trip() {
         let mut s = OpenerStore::default();
         let id = s.add(
-            "VS Code",
-            "/usr/bin/code",
+            "Text Editor",
+            "/usr/bin/textedit",
             vec!["-n".into(), "{file}".into()],
         );
         s.set_default_ext(&id, "rs", true);

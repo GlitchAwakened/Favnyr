@@ -84,13 +84,33 @@ mod imp {
     }
 
     const WM_COPYDATA: u32 = 0x004A;
+    const WM_DEVICECHANGE: u32 = 0x0219;
+    /// `DBT_DEVNODES_CHANGED`: a device was added to or removed from the
+    /// machine. Windows broadcasts it to every top-level window WITHOUT any
+    /// prior `RegisterDeviceNotification`, and it carries exactly the
+    /// granularity needed here — "something was plugged or unplugged", not
+    /// which device — which is the signal to re-scan rather than to poll.
+    const DBT_DEVNODES_CHANGED: usize = 0x0007;
     const GA_ROOT: u32 = 2;
     const GW_OWNER: u32 = 4;
-    const SUBCLASS_ID: usize = 0x52_4E_47_52; // "RNGR"
+    /// Subclass identity, unique to this application among the subclasses set
+    /// on the same window. The value is the ASCII of the application name,
+    /// spelled out in the comment so that renaming the application finds it by
+    /// searching for the old name: a value written only in hexadecimal is
+    /// invisible to that search, and outlives the rename unnoticed.
+    ///
+    /// Four bytes, so the value also fits a 32-bit `usize`: the identity does
+    /// not depend on the pointer width the application is built for.
+    const SUBCLASS_ID: usize = 0x46_56_4E_52; // "FVNR", for FAVNYR
     /// Protocol tag/version (`dwData` field of the COPYDATASTRUCT): identifies
     /// a "Favnyr tab" payload — any other WM_COPYDATA (from another app) is
-    /// ignored.
-    const PROTO_TAB_V1: usize = 0x524E_4701; // "RNG" + version 1
+    /// ignored. Same ASCII spelling as the subclass id, plus the version.
+    ///
+    /// Changing this value makes instances built before the change and after
+    /// it unable to hand tabs to each other: the tag no longer matches, so the
+    /// message is ignored. Nothing crashes, and mismatched builds are not
+    /// expected to run side by side.
+    const PROTO_TAB_V1: usize = 0x46_56_4E_01; // "FVN", for FAVNYR, + version 1
     const SMTO_BLOCK: u32 = 0x0001;
     const SMTO_ABORTIFHUNG: u32 = 0x0002;
     const SEND_TIMEOUT_MS: u32 = 2000;
@@ -109,7 +129,7 @@ mod imp {
     static WM_HOVER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static WM_HOVER_END: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-    /// Incoming message from another Favnyr instance.
+    /// Incoming message: from another Favnyr instance, or from the system.
     pub enum Incoming {
         /// Tab DROPPED (serialized payload) → insert it.
         Transfer(String),
@@ -117,6 +137,9 @@ mod imp {
         Hover(i32, i32),
         /// End of hover (cursor left / drag ended elsewhere) → clear the preview.
         HoverEnd,
+        /// The set of devices attached to the machine changed → re-scan the
+        /// portable devices. Sent by Windows, not by another instance.
+        DevicesChanged,
     }
 
     /// Handler for incoming messages (on the UI thread).
@@ -182,6 +205,13 @@ mod imp {
             if hover_end != 0 && msg == hover_end {
                 dispatch(Incoming::HoverEnd);
                 return 0;
+            }
+            // Device arrival/removal. Observed, never consumed: this is a
+            // broadcast, so the default procedure and any other subclass on
+            // this window must still receive it.
+            if msg == WM_DEVICECHANGE && wparam == DBT_DEVNODES_CHANGED {
+                dispatch(Incoming::DevicesChanged);
+                return DefSubclassProc(hwnd, msg, wparam, lparam);
             }
             if msg == WM_COPYDATA {
                 let cds = &*(lparam as *const CopyDataStruct);
@@ -361,6 +391,7 @@ mod imp {
         Transfer(String),
         Hover(i32, i32),
         HoverEnd,
+        DevicesChanged,
     }
     /// No-op outside Windows (`true` = don't retry). Cross-instance IPC is
     /// Windows-only for now (Linux: window detection + IPC still to be defined).

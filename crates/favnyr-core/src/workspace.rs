@@ -153,6 +153,10 @@ impl WorkspaceState {
         match std::fs::read_to_string(path) {
             Ok(content) => {
                 let ws: WorkspaceState = toml::from_str(&content).map_err(|e| {
+                    // A default workspace takes over and will be saved in its
+                    // place: the unreadable one is kept aside so the panels and
+                    // tabs it described are not lost with it.
+                    crate::paths::preserve_unreadable(path);
                     crate::error::Error::Workspace(format!("parse {}: {e}", path.display()))
                 })?;
                 // Guard: a workspace without a panel is invalid.
@@ -174,7 +178,7 @@ impl WorkspaceState {
         let text = toml::to_string_pretty(self).map_err(|e| {
             crate::error::Error::Workspace(format!("serialize {}: {e}", path.display()))
         })?;
-        std::fs::write(path, text)?;
+        crate::paths::write_atomic(path, &text)?;
         Ok(())
     }
 
@@ -451,7 +455,7 @@ fn write_named(dir: &Path, id: &str, file: &NamedWorkspaceFile) -> Result<()> {
         .ok_or_else(|| crate::error::Error::Workspace(format!("invalid workspace id: {id:?}")))?;
     let text = toml::to_string_pretty(file)
         .map_err(|e| crate::error::Error::Workspace(format!("serialize: {e}")))?;
-    std::fs::write(&path, text)?;
+    crate::paths::write_atomic(&path, &text)?;
     Ok(())
 }
 
@@ -657,11 +661,11 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        let id = save_named_workspace(&dir, "Projet Été", &sample()).unwrap();
+        let id = save_named_workspace(&dir, "Café Project", &sample()).unwrap();
 
-        let found = find_named_workspace(&dir, "  PROJET ÉTÉ  ").unwrap();
+        let found = find_named_workspace(&dir, "  CAFÉ PROJECT  ").unwrap();
         assert_eq!(found.id, id);
-        assert_eq!(found.name, "Projet Été");
+        assert_eq!(found.name, "Café Project");
         assert!(find_named_workspace(&dir, "workspace.toml").is_none());
 
         std::fs::remove_dir_all(dir).ok();
@@ -758,10 +762,10 @@ mod tests {
         assert!(list_named_workspaces(&dir).is_empty());
 
         // Save → appears in the list.
-        let id = save_named_workspace(&dir, "  Mon espace  ", &sample()).unwrap();
+        let id = save_named_workspace(&dir, "  My workspace  ", &sample()).unwrap();
         let list = list_named_workspaces(&dir);
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0].name, "Mon espace"); // trim applied
+        assert_eq!(list[0].name, "My workspace"); // trim applied
         assert_eq!(list[0].id, id);
         // Counters: sample() = 2 panels, 1+2 = 3 tabs.
         assert_eq!(list[0].panels, 2);
@@ -769,13 +773,13 @@ mod tests {
 
         // Load → name + state returned (sanitized: migrated layout materialized).
         let (name, state) = load_named_workspace(&dir, &id).unwrap();
-        assert_eq!(name, "Mon espace");
+        assert_eq!(name, "My workspace");
         assert_eq!(state, sample().sanitized());
 
         // Rename → name changed, id stable.
-        rename_named_workspace(&dir, &id, "Renommé").unwrap();
+        rename_named_workspace(&dir, &id, "Renamed").unwrap();
         let list = list_named_workspaces(&dir);
-        assert_eq!(list[0].name, "Renommé");
+        assert_eq!(list[0].name, "Renamed");
         assert_eq!(list[0].id, id);
 
         // Overwrite → state replaced, name kept.
@@ -804,7 +808,7 @@ mod tests {
         };
         overwrite_named_workspace(&dir, &id, &other).unwrap();
         let (name, state) = load_named_workspace(&dir, &id).unwrap();
-        assert_eq!(name, "Renommé"); // name preserved
+        assert_eq!(name, "Renamed"); // name preserved
         assert_eq!(state.panels.len(), 1);
         assert_eq!(state.panels[0].tabs[0].path, "/var");
 
@@ -815,11 +819,34 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Was this refused BECAUSE the id is unusable, rather than merely failing
+    /// because nothing was there?
+    ///
+    /// The distinction carries the test. The paths these ids build do not
+    /// exist, so a plain `is_err()` holds just as well with the guard removed —
+    /// it would then be reading "file not found" and calling it a rejection.
+    /// Only the cause tells the two apart: the guard answers `Workspace`, a
+    /// missing file answers `Io`.
+    fn refused_as_invalid_id<T>(result: crate::error::Result<T>) -> bool {
+        match result {
+            Err(crate::error::Error::Workspace(message)) => {
+                message.starts_with("invalid workspace id")
+            }
+            _ => false,
+        }
+    }
+
     #[test]
     fn rejects_unsafe_id() {
         let dir = temp_dir("unsafe");
-        assert!(load_named_workspace(&dir, "../etc/passwd").is_err());
-        assert!(delete_named_workspace(&dir, "a/b").is_err());
+        // An id becomes a file path, so one that walks out of the folder — or
+        // simply carries a separator — must be turned away before it reaches
+        // the filesystem.
+        assert!(refused_as_invalid_id(load_named_workspace(
+            &dir,
+            "../outside"
+        )));
+        assert!(refused_as_invalid_id(delete_named_workspace(&dir, "a/b")));
         assert!(!id_is_safe(""));
         assert!(!id_is_safe("a.b"));
         assert!(id_is_safe("ws-12345"));

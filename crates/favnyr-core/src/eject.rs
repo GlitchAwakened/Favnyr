@@ -51,9 +51,14 @@ pub enum EjectError {
     PlatformUnsupported,
 }
 
-/// Safely removes a removable device.
-pub fn safe_remove(device: &str) -> Result<(), EjectError> {
-    imp::safe_remove(device)
+/// Releases a device: unmounts it, and cuts its power when `power_off` says
+/// the hardware can actually be unplugged.
+///
+/// Powering off a drive wired to the motherboard achieves nothing and, on some
+/// systems, needs an administrator — see
+/// [`crate::places::is_hotplug_device`], which answers that question.
+pub fn safe_remove(device: &str, power_off: bool) -> Result<(), EjectError> {
+    imp::safe_remove(device, power_off)
 }
 
 /// Disconnects a mapped network drive (Windows). No-op elsewhere.
@@ -70,7 +75,7 @@ mod imp {
     /// `udisksctl unmount -b <dev>` then `power-off -b <dev>` (best-effort for
     /// the power-off: cutting power can fail without invalidating the
     /// unmount). Falls back to `umount` if `udisksctl` is absent.
-    pub fn safe_remove(device: &str) -> Result<(), EjectError> {
+    pub fn safe_remove(device: &str, power_off: bool) -> Result<(), EjectError> {
         if device.is_empty() {
             return Err(EjectError::UnknownDevice);
         }
@@ -81,9 +86,21 @@ mod imp {
             Err(e) => Err(e),
         };
         match unmount {
+            Ok(()) if !power_off => Ok(()),
             Ok(()) => {
-                // Cut the power (the LED turns off) — non-blocking.
-                let _ = run("udisksctl", &["power-off", "-b", device]);
+                // Cut the power (the LED turns off) — best-effort, and it
+                // must stay silent. Powering off a drive the system considers
+                // internal needs an administrator, so without this flag polkit
+                // pops its password dialog for a step whose result is thrown
+                // away just below: the volume is already unmounted either way,
+                // and cancelling the dialog changed nothing but left the user
+                // wondering what had been asked. With it, the request is
+                // refused outright instead of prompting, while a genuinely
+                // removable drive still powers down without a word.
+                let _ = run(
+                    "udisksctl",
+                    &["power-off", "-b", device, "--no-user-interaction"],
+                );
                 Ok(())
             }
             Err(run_err) => {
@@ -261,7 +278,7 @@ mod imp {
 
     // Event log (wevtapi.dll, a system DLL → zero dependency). When a removal
     // request is refused because of open handles, the KERNEL logs Kernel-PnP
-    // event 225 ("The application …\kate.exe with process id N stopped the
+    // event 225 ("The application …\editor.exe with process id N stopped the
     // removal or ejection for the device …") to the System channel — with the
     // exe path, the PID, and the device involved, in RAW EventData fields
     // (independent of Windows' display language). This is the only source
@@ -393,7 +410,7 @@ mod imp {
     /// directory, CWD). `expect_device` (Some = instance identifier of the
     /// ejected device) filters out vetoes from another device. "System"
     /// entries (pid 4, kernel bookkeeping, always present in duplicate) are
-    /// ignored. Deduplicated result: `["kate.exe", …]`, empty if unavailable.
+    /// ignored. Deduplicated result: `["editor.exe", …]`, empty if unavailable.
     unsafe fn veto_processes(window_ms: u64, expect_device: Option<&str>) -> Vec<String> {
         unsafe {
             let channel = wide("System");
@@ -462,7 +479,7 @@ mod imp {
                             let pid: u32 = field("ProcessId")
                                 .and_then(|v| v.trim().parse().ok())
                                 .unwrap_or(0);
-                            // NT path (`\Device\HarddiskVolume3\…\kate.exe`) → base
+                            // NT path (`\Device\HarddiskVolume3\…\editor.exe`) → base
                             // name; the kernel's "System" entry (pid 4) is ignored.
                             let name = field("ProcessName")
                                 .filter(|p| p.contains('\\'))
@@ -653,7 +670,9 @@ mod imp {
         }
     }
 
-    pub fn safe_remove(device: &str) -> Result<(), EjectError> {
+    // Windows cuts the power through its own removal request, which needs no
+    // separate decision: the flag is Linux's business.
+    pub fn safe_remove(device: &str, _power_off: bool) -> Result<(), EjectError> {
         let letter = drive_letter(device).ok_or(EjectError::UnknownDevice)?;
         unsafe {
             let disk = disk_number_of(letter)?;
@@ -726,7 +745,7 @@ mod imp {
 mod imp {
     use super::EjectError;
 
-    pub fn safe_remove(_device: &str) -> Result<(), EjectError> {
+    pub fn safe_remove(_device: &str, _power_off: bool) -> Result<(), EjectError> {
         Err(EjectError::PlatformUnsupported)
     }
     pub fn disconnect(_device: &str) -> Result<(), EjectError> {

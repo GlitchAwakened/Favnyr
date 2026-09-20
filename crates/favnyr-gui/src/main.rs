@@ -29,6 +29,8 @@ mod actions;
 mod bridge;
 mod clipboard;
 mod i18n;
+#[cfg(target_os = "linux")]
+mod linportable;
 mod openwith;
 mod shellmenu;
 #[cfg(windows)]
@@ -57,6 +59,13 @@ enum StartupRequest {
     /// Internal protocol used only for tab tear-off.
     DetachedTab {
         dir: PathBuf,
+        position: Option<(i32, i32)>,
+        tab_bar_mode: u8,
+    },
+    /// Internal protocol used only for VIEW tear-off: every tab of the view,
+    /// the first being the one that stays active.
+    DetachedView {
+        dirs: Vec<PathBuf>,
         position: Option<(i32, i32)>,
         tab_bar_mode: u8,
     },
@@ -100,6 +109,37 @@ fn parse_startup_request(args: impl IntoIterator<Item = OsString>) -> StartupReq
             dir,
             position,
             tab_bar_mode,
+        };
+    }
+
+    // View tear-off. Position and bar mode have a FIXED arity and come first;
+    // the folders make up the rest, however many there are, so the list can be
+    // read with no ambiguity. Its own marker: `--detached-tab` is untouched.
+    if first == "--detached-view" {
+        let number = |arg: Option<OsString>| {
+            arg.and_then(|value| value.to_str().and_then(|value| value.parse::<i32>().ok()))
+        };
+        let (x, y, mode) = (
+            number(args.next()),
+            number(args.next()),
+            number(args.next()),
+        );
+        let dirs: Vec<PathBuf> = args
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect();
+        // A malformed header, or not a single folder: a plain window is a
+        // better answer than a window on nothing.
+        let (Some(x), Some(y), Some(mode)) = (x, y, mode) else {
+            return StartupRequest::Normal;
+        };
+        if dirs.is_empty() {
+            return StartupRequest::Normal;
+        }
+        return StartupRequest::DetachedView {
+            dirs,
+            position: Some((x, y)),
+            tab_bar_mode: u8::try_from(mode).unwrap_or(0).min(2),
         };
     }
 
@@ -329,14 +369,21 @@ fn main() -> Result<()> {
     // which frees up the first public positional argument for a workspace name.
     // The parser performs no disk access.
     let startup = parse_startup_request(std::env::args_os().skip(1));
-    let (detached_dir, detached_pos, detached_tab_bar, requested_workspace) = match startup {
+    let (detached_dirs, detached_pos, detached_tab_bar, requested_workspace) = match startup {
         StartupRequest::Normal => (None, None, 0, None),
         StartupRequest::Workspace(name) => (None, None, 0, Some(name)),
+        // A torn-off tab is a torn-off view holding one tab: the two protocols
+        // meet here and everything downstream sees the same shape.
         StartupRequest::DetachedTab {
             dir,
             position,
             tab_bar_mode,
-        } => (Some(dir), position, tab_bar_mode, None),
+        } => (Some(vec![dir]), position, tab_bar_mode, None),
+        StartupRequest::DetachedView {
+            dirs,
+            position,
+            tab_bar_mode,
+        } => (Some(dirs), position, tab_bar_mode, None),
     };
 
     let window = MainWindow::new().context("Slint MainWindow::new failed")?;
@@ -413,7 +460,7 @@ fn main() -> Result<()> {
         // A normal instance sanitizes any size incompatible with the
         // current monitor. A detached instance stays ephemeral and never modifies this
         // global preference.
-        if detached_dir.is_none()
+        if detached_dirs.is_none()
             && (config.window_width != restored.0 || config.window_height != restored.1)
         {
             info!(
@@ -435,9 +482,11 @@ fn main() -> Result<()> {
     // Otherwise: restores the workspace (panels + tabs) if present, or falls
     // back to the default state (one panel, one tab on $HOME).
     let mut workspace_warning = None;
-    let state = if let Some(dir) = &detached_dir {
-        info!(dir = %dir.display(), "starting detached instance (tab tear-off)");
-        let s = bridge::AppState::new_at(config, dir.clone(), detached_tab_bar);
+    let state = if let Some(dirs) = detached_dirs.as_ref().filter(|dirs| !dirs.is_empty()) {
+        info!(tabs = dirs.len(), dir = %dirs[0].display(), "starting detached instance");
+        let s = bridge::AppState::new_at(config, dirs[0].clone(), detached_tab_bar);
+        // The rest of the view's tabs, in order, then back to the first.
+        s.adopt_tabs(&dirs[1..]);
         // A detached instance is ephemeral: its view changes must
         // never replace the main instance's shared workspace.
         s.set_ephemeral();
@@ -494,7 +543,7 @@ fn main() -> Result<()> {
     // another instance: otherwise we'd overwrite the shared workspace (empty
     // state), and the tab — already on the other instance — would be "recreated" on
     // the next launch.
-    if detached_dir.is_none() && !bridge::suppress_workspace_persist() {
+    if detached_dirs.is_none() && !bridge::suppress_workspace_persist() {
         bridge::persist_window_size(&window, &state);
         state.persist_workspace();
     }
@@ -568,8 +617,8 @@ mod tests {
     #[test]
     fn positional_arguments_form_a_workspace_name() {
         assert_eq!(
-            parse_startup_request([OsString::from("Mon"), OsString::from("Workspace")]),
-            StartupRequest::Workspace("Mon Workspace".into())
+            parse_startup_request([OsString::from("My"), OsString::from("Workspace")]),
+            StartupRequest::Workspace("My Workspace".into())
         );
     }
 
@@ -578,14 +627,91 @@ mod tests {
         assert_eq!(
             parse_startup_request([
                 OsString::from("--detached-tab"),
-                OsString::from("C:\\Photos"),
+                OsString::from("C:\\folder_01"),
                 OsString::from("120"),
                 OsString::from("240"),
                 OsString::from("2"),
             ]),
             StartupRequest::DetachedTab {
-                dir: PathBuf::from("C:\\Photos"),
+                dir: PathBuf::from("C:\\folder_01"),
                 position: Some((120, 240)),
+                tab_bar_mode: 2,
+            }
+        );
+    }
+
+    /// A whole view: the header has a fixed arity and comes first, the folders
+    /// make up the rest. The FIRST folder is the tab that stays active.
+    #[test]
+    fn detached_view_protocol_carries_every_tab_in_order() {
+        assert_eq!(
+            parse_startup_request([
+                OsString::from("--detached-view"),
+                OsString::from("120"),
+                OsString::from("240"),
+                OsString::from("1"),
+                OsString::from("/folder_01"),
+                OsString::from("/folder_02"),
+                OsString::from("/folder_03"),
+            ]),
+            StartupRequest::DetachedView {
+                dirs: vec![
+                    PathBuf::from("/folder_01"),
+                    PathBuf::from("/folder_02"),
+                    PathBuf::from("/folder_03"),
+                ],
+                position: Some((120, 240)),
+                tab_bar_mode: 1,
+            }
+        );
+    }
+
+    /// A marker with nothing behind it opens an ordinary window rather than a
+    /// window on nothing.
+    #[test]
+    fn detached_view_without_a_folder_falls_back_to_normal() {
+        assert_eq!(
+            parse_startup_request([
+                OsString::from("--detached-view"),
+                OsString::from("10"),
+                OsString::from("20"),
+                OsString::from("0"),
+            ]),
+            StartupRequest::Normal
+        );
+    }
+
+    /// Same answer for a header that cannot be read: better an ordinary window
+    /// than a guess about where it belongs.
+    #[test]
+    fn detached_view_with_an_unreadable_header_falls_back_to_normal() {
+        assert_eq!(
+            parse_startup_request([
+                OsString::from("--detached-view"),
+                OsString::from("left"),
+                OsString::from("20"),
+                OsString::from("0"),
+                OsString::from("/folder_01"),
+            ]),
+            StartupRequest::Normal
+        );
+    }
+
+    /// An out-of-range bar mode is clamped rather than refused: the folders are
+    /// what matter, the chrome can fall back to the default.
+    #[test]
+    fn detached_view_clamps_an_impossible_tab_bar_mode() {
+        assert_eq!(
+            parse_startup_request([
+                OsString::from("--detached-view"),
+                OsString::from("0"),
+                OsString::from("0"),
+                OsString::from("9"),
+                OsString::from("/folder_01"),
+            ]),
+            StartupRequest::DetachedView {
+                dirs: vec![PathBuf::from("/folder_01")],
+                position: Some((0, 0)),
                 tab_bar_mode: 2,
             }
         );

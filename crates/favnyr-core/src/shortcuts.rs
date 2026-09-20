@@ -154,6 +154,16 @@ pub const ACTIONS: &[ActionDef] = &[
         group: ActionGroup::TabsViews,
         default: "Ctrl+Shift+Backslash",
     },
+    // Shipped unassigned on purpose. The mnemonic sequel to the two splits
+    // would be Ctrl+Alt+Backslash, but AltGr IS Ctrl+Alt on Windows and the
+    // backslash itself is an AltGr combination on several of the keyboard
+    // layouts this ships for. Better no default than one that fights the
+    // keyboard; the action is listed, and a chord can be bound to it.
+    ActionDef {
+        id: "equalize-views",
+        group: ActionGroup::TabsViews,
+        default: "",
+    },
     // ----- File operations -----
     ActionDef {
         id: "open",

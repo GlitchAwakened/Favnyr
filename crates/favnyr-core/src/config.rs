@@ -249,6 +249,10 @@ impl Config {
         match std::fs::read_to_string(path) {
             Ok(content) => {
                 let cfg: Config = toml::from_str(&content).map_err(|e| {
+                    // The caller falls back to defaults and will save them, so
+                    // the settings that could not be read are kept aside rather
+                    // than overwritten a moment later.
+                    crate::paths::preserve_unreadable(path);
                     crate::error::Error::Config(format!("parse {}: {e}", path.display()))
                 })?;
                 Ok(cfg.sanitized())
@@ -270,7 +274,7 @@ impl Config {
         let text = toml::to_string_pretty(self).map_err(|e| {
             crate::error::Error::Config(format!("serialize {}: {e}", path.display()))
         })?;
-        std::fs::write(path, text)?;
+        crate::paths::write_atomic(path, &text)?;
         Ok(())
     }
 

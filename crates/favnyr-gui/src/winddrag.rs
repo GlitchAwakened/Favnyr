@@ -3,8 +3,7 @@
 //! HYBRID approach: internal drag (between views / onto a folder) stays
 //! handled by Slint (ghost, auto-scroll, menu). When the cursor LEAVES the
 //! window during a drag, we switch here to a native OLE drag so that
-//! Notepad++, VSCode, Explorer, etc. receive the files (shell `CF_HDROP`
-//! format).
+//! external applications receive the files (shell `CF_HDROP` format).
 //!
 //! On the way out, the `IDataObject` is built by the shell
 //! (`IShellFolder::GetUIObjectOf`) and `SHDoDragDrop` provides the default
@@ -56,7 +55,7 @@ pub enum IncomingFileDrag {
         screen_y: i32,
         copy: bool,
         /// Present when Favnyr had to take ownership of source data before
-        /// returning from OLE `Drop` (for example an Outlook attachment or a
+        /// returning from OLE `Drop` (for example an email attachment or a
         /// temporary path exposed by an archive manager).
         staging: Option<DropStaging>,
     },
@@ -229,7 +228,7 @@ impl IDropTarget_Impl for FavnyrDropTarget_Impl {
                 IncomingDataKind::None => {}
             }
             // Some providers advertise CF_HDROP but render it only
-            // conditionally. Keep the already-working Outlook route as a
+            // conditionally. Keep the already-working email-attachment route as a
             // fallback when usable paths were not returned at Drop time.
             if paths.is_empty()
                 && staging.is_none()
@@ -578,7 +577,7 @@ fn file_paths(data: &IDataObject) -> Vec<PathBuf> {
     out
 }
 
-// ---- "Virtual files" (Outlook attachments, zip entries, browser images…) ----
+// ---- "Virtual files" (email attachments, zip entries, browser images…) ----
 // These aren't on disk: `CFSTR_FILEDESCRIPTORW` names them, `CFSTR_FILECONTENTS`
 // carries their bytes (usually an `IStream`). We materialize them into a temp
 // folder during `Drop`, and the normal drop pipeline then MOVES them into the
@@ -743,7 +742,7 @@ fn file_contents_medium(
 }
 
 /// Streams one virtual file straight to disk. This keeps memory use bounded
-/// even for large Outlook attachments.
+/// even for large email attachments.
 fn write_file_contents(data: &IDataObject, index: i32, path: &Path) -> Result<(), String> {
     let Some(mut medium) = file_contents_medium(data, index) else {
         return Err("the source did not provide a supported storage medium".into());

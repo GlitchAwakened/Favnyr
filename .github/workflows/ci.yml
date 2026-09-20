@@ -58,3 +58,26 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace --locked
+
+  # Dependency policy: the offline promise, the licence allow-list and the
+  # registry whitelist. A separate job because it is platform-independent —
+  # deny.toml declares BOTH target triples itself, so one runner checks the
+  # Linux and Windows halves of the tree at once. It also keeps a policy
+  # failure legible: it says the tree changed, not that the code broke.
+  deny:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Caches ~/.cargo/bin, so cargo-deny is compiled once and restored on
+      # every later run rather than rebuilt.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+
+      # `advisories` reaches the RUSTSEC database over the network; the other
+      # three are offline. All four run here — the runner has both.
+      - name: cargo-deny
+        run: cargo deny check

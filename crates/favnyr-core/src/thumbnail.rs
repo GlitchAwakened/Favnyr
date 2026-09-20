@@ -33,10 +33,103 @@
 //! Memoization (in-memory LRU cache, session only) is handled by the calling
 //! layer (GUI).
 
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::fs::FileKind;
+
+/// Most pixels an image may declare before its thumbnail is refused.
+///
+/// A crafted file can announce enormous dimensions in a few hundred bytes; the
+/// decoder would then try to materialise them. This is checked against the
+/// HEADER, so such a file costs nothing beyond the header read. The crate's own
+/// allocation ceiling is documented as non-strict — some decoders ignore it —
+/// which is why the real bound is enforced here rather than delegated.
+///
+/// Eighty megapixels sits well above the largest consumer sensor of the day
+/// (61 Mpx) and above most scans, and caps one decode near 320 MB. Above it the
+/// entry falls back to its type icon, exactly as a format the crate cannot
+/// decode already does. The thumbnail workers run in parallel, so the figure is
+/// paid several times over — that is what makes the ceiling worth having.
+const MAX_DECODE_PIXELS: u64 = 80_000_000;
+
+/// Allocation ceiling handed to the decoder, aligned with the pixel budget
+/// above (80 Mpx in RGBA8 needs ~320 MB, plus room for the decoder's own
+/// scratch). Best-effort by design, hence the strict check beside it.
+const MAX_DECODE_ALLOC: u64 = 384 * 1024 * 1024;
+
+/// How long an external rendering tool may run before it is killed.
+///
+/// `Command::output()` waits without any bound: a crafted file can keep the
+/// tool spinning forever, and the thumbnail queue runs several workers, so a
+/// handful of such files would starve it entirely. Generous for real content —
+/// extracting one frame after an input seek takes well under a second.
+const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the bounded wait checks whether the tool has finished.
+const TOOL_POLL: Duration = Duration::from_millis(25);
+
+/// Limits handed to every decoder reading untrusted bytes.
+fn decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    limits
+}
+
+/// Decodes what `reader` holds, refusing anything past [`MAX_DECODE_PIXELS`].
+///
+/// The dimensions come from the header, so an oversized image is turned away
+/// before a single pixel is allocated for it.
+fn decode_bounded<R: std::io::BufRead + std::io::Seek>(
+    mut reader: image::ImageReader<R>,
+) -> Option<image::DynamicImage> {
+    use image::ImageDecoder;
+    reader.limits(decode_limits());
+    let decoder = reader.into_decoder().ok()?;
+    let (width, height) = decoder.dimensions();
+    if u64::from(width) * u64::from(height) > MAX_DECODE_PIXELS {
+        return None;
+    }
+    image::DynamicImage::from_decoder(decoder).ok()
+}
+
+/// Runs `cmd` and returns its standard output, killing the child if it outlives
+/// [`TOOL_TIMEOUT`]. `None` if it failed, was killed, or could not start.
+///
+/// The pipe is drained on its own thread. Polling the exit status while nobody
+/// reads standard output would let a child fill its pipe buffer and block —
+/// indistinguishable from the hang this is meant to catch, and it would turn
+/// every large frame into a false timeout.
+fn run_bounded(mut cmd: Command, limit: Duration) -> Option<Vec<u8>> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let mut pipe = child.stdout.take()?;
+    let drain = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = pipe.read_to_end(&mut buffer);
+        buffer
+    });
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = drain.join();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(TOOL_POLL),
+            Err(_) => return None,
+        }
+    };
+    let bytes = drain.join().ok()?;
+    status.success().then_some(bytes)
+}
 
 /// On Windows, prevents a **console window** from opening (a "DOS" flash)
 /// when launching a CLI (ffmpeg/poppler) from a GUI app. No-op elsewhere.
@@ -108,8 +201,10 @@ pub fn image_meta(path: &Path) -> Option<(u32, u32, u16, bool)> {
 /// `max_px`. Used for renders produced outside `image` — e.g. a PDF page rendered
 /// by the WinRT API on Windows (cf. `favnyr-gui/src/winthumb.rs`).
 pub fn from_encoded(bytes: &[u8], max_px: u32) -> Option<Thumbnail> {
-    let img = image::load_from_memory(bytes).ok()?;
-    Some(downscale(img, max_px))
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    Some(downscale(decode_bounded(reader)?, max_px))
 }
 
 /// Thumbnail of an image file (pure-Rust decoding). `None` if the format
@@ -130,8 +225,7 @@ pub fn from_image(path: &Path, max_px: u32) -> Option<Thumbnail> {
         .ok()?
         .with_guessed_format()
         .ok()?;
-    let img = reader.decode().ok()?;
-    Some(downscale(img, max_px))
+    Some(downscale(decode_bounded(reader)?, max_px))
 }
 
 const PSD_THUMBNAIL_RESOURCE_V4: u16 = 1033;
@@ -939,14 +1033,8 @@ fn ffprobe_duration_secs(path: &Path) -> Option<f64> {
     ])
     .arg(path);
     no_console(&mut cmd);
-    let output = cmd.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let d: f64 = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .ok()?;
+    let stdout = run_bounded(cmd, TOOL_TIMEOUT)?;
+    let d: f64 = String::from_utf8_lossy(&stdout).trim().parse().ok()?;
     (d.is_finite() && d > 0.0).then_some(d)
 }
 
@@ -1006,12 +1094,13 @@ fn from_video_frame(
         "pipe:1",
     ]);
     no_console(&mut cmd);
-    let output = cmd.output().ok()?;
-    if !output.status.success() || output.stdout.is_empty() {
+    let stdout = run_bounded(cmd, TOOL_TIMEOUT)?;
+    if stdout.is_empty() {
         return None;
     }
-    let img = image::load_from_memory(&output.stdout).ok()?;
-    Some(downscale(img, max_px))
+    // The PNG ffmpeg just produced goes through the same bounded decode as any
+    // other encoded bytes: it is derived from an untrusted video.
+    from_encoded(&stdout, max_px)
 }
 
 /// Thumbnail of a PDF's 1st page via the **poppler** tools (`pdftoppm` then
@@ -1061,7 +1150,7 @@ fn run_pdf_tool(tool: &str, pdf: &Path, out_prefix: &Path, max_px: u32) -> bool 
         .arg(pdf)
         .arg(out_prefix);
     no_console(&mut cmd);
-    cmd.output().map(|o| o.status.success()).unwrap_or(false)
+    run_bounded(cmd, TOOL_TIMEOUT).is_some()
 }
 
 /// Shrinks `img` to fit within `max_px × max_px` (aspect preserved) and produces
@@ -1285,7 +1374,7 @@ mod tests {
 
         // Non-ISO-BMFF file → None, without panicking or looping.
         let txt = dir.join("not.mp4");
-        std::fs::write(&txt, b"pas un mp4 du tout, vraiment pas").unwrap();
+        std::fs::write(&txt, b"definitely not an mp4 file").unwrap();
         assert_eq!(mp4_duration_secs(&txt), None);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1586,5 +1675,59 @@ mod tests {
         assert!(generate(&path, FileKind::Document, 16).is_none());
         assert!(generate(&path, FileKind::Folder, 16).is_none());
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::*;
+
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60,
+        0x60, 0x60, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0xf6, 0x17, 0x38, 0x55, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+    const OVERSIZED_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0xea, 0x60, 0x00, 0x00, 0xea, 0x60, 0x08, 0x02, 0x00, 0x00, 0x00, 0x0f,
+        0xb0, 0xe2, 0x15, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60,
+        0x60, 0x60, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0xf6, 0x17, 0x38, 0x55, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    #[test]
+    fn an_ordinary_image_still_decodes() {
+        assert!(from_encoded(TINY_PNG, 256).is_some());
+    }
+
+    #[test]
+    fn an_image_declaring_absurd_dimensions_is_refused() {
+        // Sixty-nine bytes announcing 3.6 gigapixels. The refusal comes from
+        // the header, so nothing is ever allocated for it — which is the whole
+        // point: a decompression bomb costs the reader, not the memory.
+        assert_eq!(OVERSIZED_PNG.len(), TINY_PNG.len());
+        assert!(from_encoded(OVERSIZED_PNG, 256).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_that_never_finishes_is_killed() {
+        let started = Instant::now();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        assert!(run_bounded(cmd, Duration::from_millis(200)).is_none());
+        // Killed on the deadline rather than waited out.
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_that_finishes_in_time_returns_its_output() {
+        let mut cmd = Command::new("echo");
+        cmd.arg("ready");
+        let out = run_bounded(cmd, Duration::from_secs(5)).expect("echo should succeed");
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "ready");
     }
 }

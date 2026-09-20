@@ -91,7 +91,22 @@ impl FavStore {
     /// favorites must never prevent the app from starting).
     pub fn load(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
-            Ok(content) => toml::from_str(&content).unwrap_or_default(),
+            Ok(content) => match toml::from_str(&content) {
+                Ok(store) => store,
+                Err(err) => {
+                    // The file is there but cannot be read back. Starting from
+                    // an empty store keeps the application usable; letting the
+                    // next save write that emptiness over the user's only copy
+                    // does not, so the file is kept aside first.
+                    tracing::warn!(
+                        error = %err,
+                        path = %path.display(),
+                        "unreadable store"
+                    );
+                    crate::paths::preserve_unreadable(path);
+                    Self::default()
+                }
+            },
             Err(_) => Self::default(),
         }
     }
@@ -103,7 +118,7 @@ impl FavStore {
         }
         let s = toml::to_string_pretty(self)
             .map_err(|e| Error::Favorites(format!("serialization: {e}")))?;
-        std::fs::write(path, s)?;
+        crate::paths::write_atomic(path, &s)?;
         Ok(())
     }
 
@@ -362,20 +377,20 @@ mod tests {
     #[test]
     fn add_and_flatten_respects_tree_and_collapse() {
         let mut s = FavStore::default();
-        let work = s.add_container("", "Travail").unwrap();
-        let _f1 = s.add_favorite(&work, "Projet", "/home/u/proj").unwrap();
-        let sub = s.add_container(&work, "Sous").unwrap();
+        let work = s.add_container("", "Work").unwrap();
+        let _f1 = s.add_favorite(&work, "Project", "/home/u/proj").unwrap();
+        let sub = s.add_container(&work, "Nested").unwrap();
         s.add_favorite(&sub, "Docs", "/home/u/docs").unwrap();
 
         // Expanded everywhere → 4 rows.
         assert_eq!(s.flatten().len(), 4);
         // Depths.
         let flat = s.flatten();
-        assert_eq!(flat[0].depth, 0); // Travail
-        assert_eq!(flat[1].depth, 1); // Projet
+        assert_eq!(flat[0].depth, 0); // Work
+        assert_eq!(flat[1].depth, 1); // Project
         assert!(flat[0].has_children);
 
-        // Collapse "Travail" → only it stays visible.
+        // Collapse "Work" → only it stays visible.
         s.set_expanded(&work, false);
         assert_eq!(s.flatten().len(), 1);
     }
@@ -384,10 +399,10 @@ mod tests {
     fn container_has_path_detects_duplicate() {
         let mut s = FavStore::default();
         let c = s.add_container("", "C").unwrap();
-        s.add_favorite(&c, "Projet", "/home/u/proj").unwrap();
+        s.add_favorite(&c, "Project", "/home/u/proj").unwrap();
         assert!(s.container_has_path(&c, "/home/u/proj"));
         // A different path → absent.
-        assert!(!s.container_has_path(&c, "/home/u/autre"));
+        assert!(!s.container_has_path(&c, "/home/u/other"));
         // Same path but a DIFFERENT container → absent (per-container dedup).
         let c2 = s.add_container("", "C2").unwrap();
         assert!(!s.container_has_path(&c2, "/home/u/proj"));

@@ -1,6 +1,13 @@
 //! Small shared Windows utilities (avoids duplication between `openwith`,
 //! `winthumb`, `clipboard`) — keeps the implementations cohesive.
 
+use std::ffi::OsString;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
+
+use windows::Win32::Storage::FileSystem::GetLongPathNameW;
+use windows::core::PCWSTR;
+
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, GetDC, GetDIBits, GetObjectW,
     HBITMAP, HGDIOBJ, ReleaseDC,
@@ -63,5 +70,106 @@ pub unsafe fn hbitmap_to_rgba(hbitmap: HBITMAP) -> Option<(Vec<u8>, u32, u32)> {
             }
         }
         Some((buf, w, h))
+    }
+}
+
+/// The path with its 8.3 short components replaced by the real names.
+///
+/// `%TEMP%` commonly expands to a shortened form when the account name is long
+/// — `C:\Users\SOMEO~1.NAM\…` — where Explorer shows the full one. Matching
+/// the system's spelling is not only about looks: a folder reached under two
+/// spellings is two folders to anything that keys on its path, and a short name
+/// is not something a case rule can reconcile.
+///
+/// This asks the filesystem, so the caller must only reach for it when a
+/// component actually looks mangled — see [`has_short_component`] — and never
+/// on a network path, whose round trip would be paid on the UI thread.
+///
+/// `None` when nothing can be resolved, which includes a path that does not
+/// exist: the caller then keeps what it had, and that stays perfectly usable.
+pub fn long_path(path: &Path) -> Option<PathBuf> {
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // First call sizes the buffer, second fills it — the usual Win32 shape.
+    let needed = unsafe { GetLongPathNameW(PCWSTR(wide.as_ptr()), None) };
+    if needed == 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; needed as usize];
+    let written = unsafe { GetLongPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buf)) };
+    if written == 0 || written as usize > buf.len() {
+        return None;
+    }
+    Some(PathBuf::from(OsString::from_wide(&buf[..written as usize])))
+}
+
+/// Does any component look like an 8.3 short name?
+///
+/// The mangling Windows applies is a tilde followed by a digit, as in
+/// `SOMEO~1.NAM`. Testing for it costs nothing and is what keeps the
+/// filesystem query off every ordinary navigation — a tilde alone is a
+/// perfectly common character in a backup name, hence the digit.
+pub fn has_short_component(path: &Path) -> bool {
+    path.components().any(|component| {
+        let text = component.as_os_str().to_string_lossy();
+        text.as_bytes()
+            .windows(2)
+            .any(|pair| pair[0] == b'~' && pair[1].is_ascii_digit())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An already-full path must come back untouched: the resolution is meant
+    /// to normalise, never to rewrite what is already right.
+    #[test]
+    fn a_path_already_spelled_in_full_survives_the_round_trip() {
+        let dir = std::env::current_dir().expect("current dir");
+        assert!(
+            !has_short_component(&dir),
+            "the test only means something on a full path"
+        );
+        assert_eq!(long_path(&dir).as_deref(), Some(dir.as_path()));
+    }
+
+    /// The whole point, expressed on the one variable known to answer short.
+    /// Skipped where it does not — a short account name, or 8.3 turned off on
+    /// the volume — rather than asserting something the machine cannot show.
+    #[test]
+    fn the_temp_variable_is_brought_back_to_its_full_spelling() {
+        let Ok(temp) = std::env::var("TEMP") else {
+            return;
+        };
+        let temp = PathBuf::from(temp);
+        if !has_short_component(&temp) {
+            return;
+        }
+        let long = long_path(&temp).expect("an existing path resolves");
+        assert!(
+            !has_short_component(&long),
+            "no mangled component is left: {}",
+            long.display()
+        );
+    }
+
+    #[test]
+    fn only_a_tilde_followed_by_a_digit_reads_as_a_short_name() {
+        assert!(has_short_component(Path::new(
+            r"C:\Users\SOMEO~1.NAM\AppData"
+        )));
+        assert!(has_short_component(Path::new(r"C:\PROGRA~2")));
+        // A tilde is an ordinary character in a name, and on its own it says
+        // nothing: querying the filesystem for those would be pure waste.
+        assert!(!has_short_component(Path::new(
+            r"C:\Users\someone\backup~\notes.txt"
+        )));
+        assert!(!has_short_component(Path::new(
+            r"C:\Users\someone\Documents"
+        )));
     }
 }

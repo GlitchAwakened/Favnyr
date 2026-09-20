@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/favnyr-core", "crates/favnyr-gui"]
 
 [workspace.package]
-version      = "0.3.1"
+version      = "0.3.2"
 edition      = "2024"
 rust-version = "1.88"
 license      = "GPL-3.0-or-later"

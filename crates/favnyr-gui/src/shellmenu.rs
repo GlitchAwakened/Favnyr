@@ -114,9 +114,9 @@ mod imp {
     /// Entries DISCARDED by LABEL — redundant with Favnyr or meaningless,
     /// but WITHOUT a usable canonical verb (the "Open with" cascade, or shell
     /// commands without a verb). Normalized comparison (lowercase, no
-    /// trailing "…", no "&") and EXACT ("Open with" discarded, "Open with VS
-    /// Code" kept). Multilingual: the label comes from the OS, not from
-    /// Favnyr.
+    /// trailing "…", no "&") and EXACT ("Open with" discarded, "Open with
+    /// <application>" kept). Multilingual: the label comes from the OS, not
+    /// from Favnyr.
     const LABEL_BLOCKLIST: &[&str] = &[
         // "Add to favorites" (confused with Favnyr's own).
         "ajouter aux favoris",
@@ -497,8 +497,8 @@ mod imp {
             assert!(label_blocklisted("  add to favorites  "));
             assert!(label_blocklisted("Inclure dans la bibliothèque"));
             // EXACT: an "Open with <app>" entry is NOT discarded.
-            assert!(!label_blocklisted("Ouvrir avec VS Code"));
-            assert!(!label_blocklisted("Open with Notepad"));
+            assert!(!label_blocklisted("Ouvrir avec Editeur"));
+            assert!(!label_blocklisted("Open with Text Editor"));
             assert!(!label_blocklisted("7-Zip"));
         }
 

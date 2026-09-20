@@ -152,9 +152,9 @@ mod uri_list {
 
         #[test]
         fn file_uri_round_trip_preserves_special_and_non_utf8_bytes() {
-            let path = b"/tmp/Manual outlook #1%\xFF.png";
+            let path = b"/tmp/my file #1%\xFF.png";
             let uri = encode_file_uri(path);
-            assert_eq!(uri, "file:///tmp/Manual%20outlook%20%231%25%FF.png");
+            assert_eq!(uri, "file:///tmp/my%20file%20%231%25%FF.png");
             assert_eq!(decode_file_uri(uri.as_bytes()).as_deref(), Some(&path[..]));
         }
 

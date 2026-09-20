@@ -20,7 +20,7 @@ use crate::i18n;
 /// A candidate application, OS-neutral.
 #[derive(Debug, Clone)]
 pub struct AppHandler {
-    /// Displayed name ("GIMP", "Notepad"…).
+    /// Displayed name ("Image Editor", "Text Editor"…).
     pub name: String,
     /// Persistable key: exe path (classic apps) or identifier
     /// (Windows UWP / Linux `*.desktop`).
@@ -537,7 +537,7 @@ mod imp {
     /// Not [`crate::bridge::split_args`]: that one also treats `'` as a quote,
     /// which is right for a command the user typed but wrong here — the
     /// specification quotes with `"` only, so an apostrophe in a path (a folder
-    /// named "Bob's Apps") is an ordinary character that must survive intact.
+    /// named "it's here") is an ordinary character that must survive intact.
     /// Inside quotes, `\` escapes the next character.
     ///
     /// `file` is the document to hand over, if any: `%f`/`%F`/`%u`/`%U` take it,
@@ -939,8 +939,9 @@ mod imp {
         None
     }
 
-    /// Icon by extension — not implemented on Linux (v1; would require
-    /// MIME resolution + XDG icon theme, cf. DEVBOOK). Falls back to the
+    /// Icon by extension — not implemented on Linux: it would take MIME
+    /// resolution followed by a lookup through the XDG icon theme, which is
+    /// a great deal of work for a per-extension icon. Falls back to the
     /// generic type icon on the view side.
     pub fn icon_rgba_for_ext(_ext: &str, _big: bool) -> Option<(Vec<u8>, u32, u32)> {
         None
@@ -1110,10 +1111,10 @@ mod tests {
         // against handlers built by hand rather than real `.desktop` files, so
         // it exercises the platform-neutral sort regardless of the OS running
         // the test — `handlers_for_ext` itself is Linux-only.
-        let mut apps = [handler("vlc"), handler("GIMP"), handler("Blender")];
+        let mut apps = [handler("viewer"), handler("EDITOR"), handler("Archiver")];
         apps.sort_by_key(|a| a.name.to_lowercase());
         let names: Vec<&str> = apps.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, ["Blender", "GIMP", "vlc"]);
+        assert_eq!(names, ["Archiver", "EDITOR", "viewer"]);
     }
 
     #[cfg(not(windows))]
@@ -1125,24 +1126,24 @@ mod tests {
         // started on its own — a stray "%U" would reach the program as a
         // filename to open.
         assert_eq!(
-            exec_argv("steam steam://rungameid/548430 %U", None),
-            ["steam", "steam://rungameid/548430"]
+            exec_argv("myapp myapp://open/12345 %U", None),
+            ["myapp", "myapp://open/12345"]
         );
         assert_eq!(
-            exec_argv("gimp %U", Some("/tmp/a.png")),
-            ["gimp", "/tmp/a.png"]
+            exec_argv("viewer %U", Some("/tmp/a.png")),
+            ["viewer", "/tmp/a.png"]
         );
 
         // The specification quotes with `"` only. An apostrophe is an ordinary
         // character: treating it as a quote — as a shell-style splitter would —
         // swallowed the rest of the command line.
         assert_eq!(
-            exec_argv("/opt/Bob's Apps/run --now", None),
-            ["/opt/Bob's", "Apps/run", "--now"]
+            exec_argv("/opt/it's here/run --now", None),
+            ["/opt/it's", "here/run", "--now"]
         );
         assert_eq!(
-            exec_argv("\"/opt/Bob's Apps/run\" --now", None),
-            ["/opt/Bob's Apps/run", "--now"]
+            exec_argv("\"/opt/it's here/run\" --now", None),
+            ["/opt/it's here/run", "--now"]
         );
 
         // Quoted space stays inside one argument; inside quotes `\` escapes.
@@ -1184,34 +1185,37 @@ mod tests {
         };
 
         // Both size-folder orderings found in the wild.
-        let sized = touch("hicolor/48x48/apps/steam_icon_548430.png");
-        let inverted = touch("hicolor/apps/64/othergame.png");
+        let sized = touch("hicolor/48x48/apps/app_icon_12345.png");
+        let inverted = touch("hicolor/apps/64/other-app.png");
         // A vector wins over a bitmap of the same name: it stays sharp at any
         // row height, which is the whole reason for preferring it.
-        touch("hicolor/32x32/apps/blender.png");
-        let vector = touch("hicolor/scalable/apps/blender.svg");
+        touch("hicolor/32x32/apps/sample-app.png");
+        let vector = touch("hicolor/scalable/apps/sample-app.svg");
 
         let bases = vec![root.clone()];
         let themes = vec!["hicolor".to_string()];
         assert_eq!(
-            find_themed_icon(&bases, &themes, "steam_icon_548430"),
+            find_themed_icon(&bases, &themes, "app_icon_12345"),
             Some(sized)
         );
         assert_eq!(
-            find_themed_icon(&bases, &themes, "othergame"),
+            find_themed_icon(&bases, &themes, "other-app"),
             Some(inverted)
         );
-        assert_eq!(find_themed_icon(&bases, &themes, "blender"), Some(vector));
+        assert_eq!(
+            find_themed_icon(&bases, &themes, "sample-app"),
+            Some(vector)
+        );
         assert_eq!(find_themed_icon(&bases, &themes, "absent"), None);
 
         // The user's theme is searched before the fallback every theme
         // inherits, so a local override wins.
-        let mine = touch("Breeze/48x48/apps/steam_icon_548430.png");
+        let mine = touch("Breeze/48x48/apps/app_icon_12345.png");
         assert_eq!(
             find_themed_icon(
                 &bases,
                 &["Breeze".to_string(), "hicolor".to_string()],
-                "steam_icon_548430"
+                "app_icon_12345"
             ),
             Some(mine)
         );
@@ -1251,19 +1255,19 @@ mod tests {
         let entry = parse_desktop(
             "#!/usr/bin/env xdg-open\n\
              [Desktop Entry]\n\
-             Name=Blender 5.2\n\
-             Exec=/opt/blender/blender\n\
-             Icon=/opt/blender/blender.svg\n\
+             Name=Sample App 5.2\n\
+             Exec=/opt/sample-app/sample-app\n\
+             Icon=/opt/sample-app/sample-app.svg\n\
              Path=\n\
              Terminal=false\n\
              Type=Application\n\
              [Desktop Action Render]\n\
              Name=Render\n\
-             Exec=/opt/blender/blender --render\n",
+             Exec=/opt/sample-app/sample-app --render\n",
         );
-        assert_eq!(entry.name, "Blender 5.2");
-        assert_eq!(entry.exec, "/opt/blender/blender");
-        assert_eq!(entry.icon, "/opt/blender/blender.svg");
+        assert_eq!(entry.name, "Sample App 5.2");
+        assert_eq!(entry.exec, "/opt/sample-app/sample-app");
+        assert_eq!(entry.icon, "/opt/sample-app/sample-app.svg");
         assert_eq!(entry.kind, "Application");
         assert!(!entry.terminal);
         // `Path=` present but empty means "no preference", not the root.

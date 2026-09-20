@@ -108,9 +108,33 @@ pub fn signature() -> u64 {
     REVISION.load(Ordering::Acquire)
 }
 
-/// Requests an asynchronous scan. Slint polls may call this function
-/// every 1.5 s: only one scan is allowed at a time, and the UI thread never
-/// blocks on COM or on a slow phone driver.
+/// Did the last completed scan leave a Shell entry it could not confirm?
+///
+/// A phone whose WPD driver is still initializing looks exactly like that. The
+/// device-arrival event has already fired by then, so nothing else would come
+/// back to finish the job: the caller keeps asking for a scan while this
+/// returns `true`, and stops as soon as everything resolved. `WPD_RETRY_INTERVAL`
+/// still bounds how often the expensive half actually runs.
+pub fn has_unresolved() -> bool {
+    match resolution_cache().lock() {
+        Ok(cache) => cache
+            .as_ref()
+            .is_some_and(|cached| cached.has_unresolved_candidates),
+        // A poisoned lock means a scan panicked; retrying is the safer answer
+        // than silently never looking again.
+        Err(poisoned) => poisoned
+            .into_inner()
+            .as_ref()
+            .is_some_and(|cached| cached.has_unresolved_candidates),
+    }
+}
+
+/// Requests an asynchronous scan. Called on device arrival/removal, at
+/// startup, and while [`has_unresolved`] reports a candidate still waiting on
+/// its driver — never on a plain timer, because the Shell walk it triggers
+/// instantiates every namespace extension registered under "This PC" inside
+/// this process. Only one scan runs at a time, and the UI thread never blocks
+/// on COM or on a slow phone driver.
 pub fn request_refresh() {
     if SCAN_IN_FLIGHT
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -539,42 +563,45 @@ mod tests {
     }
 
     #[test]
-    fn apple_portable_devices_are_explicitly_excluded() {
+    fn apple_devices_are_excluded_by_vendor_id_or_by_label() {
+        // Neutral label on purpose: only the vendor id betrays the device, so
+        // this asserts the id path rather than the label one.
         assert!(is_apple_device(
-            "Mon téléphone",
+            "My phone",
             r"USB\VID_05AC&PID_12A8",
             "::{shell-item}"
         ));
-        assert!(is_apple_device("Apple iPhone", "WPD-1", "::{shell-item}"));
+        // And the reverse: a label is enough when the id says nothing.
+        assert!(is_apple_device("iPhone", "WPD-1", "::{shell-item}"));
     }
 
     #[test]
-    fn android_mtp_device_is_kept() {
+    fn a_non_apple_mtp_device_is_kept() {
         assert!(!is_apple_device(
-            "Pixel 8",
+            "Pixel",
             r"USB\VID_18D1&PID_4EE1",
             "::{shell-item}"
         ));
     }
 
     #[test]
-    fn missing_shell_property_is_resolved_by_unique_wpd_name() {
+    fn a_device_without_shell_id_is_resolved_by_its_unique_wpd_name() {
         let result = reconcile_candidates(
-            &[candidate("HONOR Magic5 Pro", None)],
-            &[wpd("HONOR Magic5 Pro", r"USB\VID_0BB4&WPD")],
+            &[candidate("Pixel", None)],
+            &[wpd("Pixel", r"USB\VID_18D1&WPD")],
         );
 
         assert!(!result.has_unresolved_candidates);
         assert_eq!(result.devices.len(), 1);
-        assert_eq!(result.devices[0].name, "HONOR Magic5 Pro");
-        assert_eq!(result.devices[0].device_instance_id, r"USB\VID_0BB4&WPD");
+        assert_eq!(result.devices[0].name, "Pixel");
+        assert_eq!(result.devices[0].device_instance_id, r"USB\VID_18D1&WPD");
     }
 
     #[test]
-    fn duplicate_wpd_names_are_not_guessed() {
+    fn two_devices_sharing_one_name_are_never_guessed() {
         let result = reconcile_candidates(
-            &[candidate("Android", None)],
-            &[wpd("Android", "WPD-1"), wpd("Android", "WPD-2")],
+            &[candidate("Pixel", None)],
+            &[wpd("Pixel", "WPD-1"), wpd("Pixel", "WPD-2")],
         );
 
         assert!(result.has_unresolved_candidates);
@@ -582,8 +609,8 @@ mod tests {
     }
 
     #[test]
-    fn existing_shell_device_id_does_not_require_wpd() {
-        let result = reconcile_candidates(&[candidate("Pixel 8", Some("WPD-PIXEL"))], &[]);
+    fn a_shell_supplied_device_id_skips_the_wpd_lookup() {
+        let result = reconcile_candidates(&[candidate("Pixel", Some("WPD-PIXEL"))], &[]);
 
         assert!(!result.has_unresolved_candidates);
         assert_eq!(result.devices.len(), 1);
@@ -591,16 +618,14 @@ mod tests {
     }
 
     #[test]
-    fn shell_path_device_id_disambiguates_duplicate_names() {
+    fn the_device_id_inside_the_shell_path_separates_identical_names() {
         let candidates = [ShellCandidate {
-            name: "Android".to_owned(),
+            name: "Pixel".to_owned(),
             shell_path: "::{shell-item}\\WPD-2".to_owned(),
             device_instance_id: None,
         }];
-        let result = reconcile_candidates(
-            &candidates,
-            &[wpd("Android", "WPD-1"), wpd("Android", "WPD-2")],
-        );
+        let result =
+            reconcile_candidates(&candidates, &[wpd("Pixel", "WPD-1"), wpd("Pixel", "WPD-2")]);
 
         assert!(!result.has_unresolved_candidates);
         assert_eq!(result.devices[0].device_instance_id, "WPD-2");

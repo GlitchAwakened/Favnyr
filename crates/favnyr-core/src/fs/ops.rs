@@ -362,9 +362,53 @@ fn try_clone_symlink(src: &Path, dst: &Path) -> (bool, bool) {
     (created, target_is_dir)
 }
 
+/// Identity of a directory, as the copy walks use it to notice they are about
+/// to enter one they are already inside.
+///
+/// A tree of real directories cannot loop on its own, but two things make one
+/// appear: following a directory link that points back up (Windows
+/// materialises such a link when it cannot recreate it), and a bind mount that
+/// grafts a directory under itself (Linux). Both end as a directory the walk
+/// has already entered, so both are caught the same way.
+///
+/// Unix answers with the device and inode, the identity the filesystem itself
+/// uses. Elsewhere the resolved path stands in, which is what `canonicalize`
+/// is for.
+#[cfg(unix)]
+type DirMark = (u64, u64);
+#[cfg(not(unix))]
+type DirMark = PathBuf;
+
+#[cfg(unix)]
+fn dir_mark(path: &Path) -> Option<DirMark> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|md| (md.dev(), md.ino()))
+}
+
+#[cfg(not(unix))]
+fn dir_mark(path: &Path) -> Option<DirMark> {
+    std::fs::canonicalize(path).ok()
+}
+
+/// The error a walk reports instead of descending into itself for ever.
+fn loops_back(path: &Path) -> Error {
+    Error::Workspace(format!(
+        "{} is already part of this copy; descending into it would never end",
+        path.display()
+    ))
+}
+
 /// Recursive copy of `src` to `dst`. `dst` must not exist.
 /// For folders, recreates the tree; for files, `std::fs::copy`.
 pub fn copy_path(src: &Path, dst: &Path) -> Result<()> {
+    // Same reasoning as `copy_tree_progress`: only a followed directory link
+    // can make the walk re-enter itself, so the chain of real directories
+    // already entered is what stops it.
+    let mut entered: Vec<DirMark> = Vec::new();
+    copy_path_inner(src, dst, &mut entered)
+}
+
+fn copy_path_inner(src: &Path, dst: &Path, entered: &mut Vec<DirMark>) -> Result<()> {
     let metadata = std::fs::symlink_metadata(src)?;
     if metadata.file_type().is_symlink() {
         // Copy the link as-is (re-creation of the link).
@@ -385,7 +429,9 @@ pub fn copy_path(src: &Path, dst: &Path) -> Result<()> {
             // not a link → no infinite recursion). For a file, `fs::copy`
             // follows `src` and copies the target's content.
             if target_is_dir {
-                return copy_path(&std::fs::canonicalize(src)?, dst);
+                // Materialising follows the link out of the tree being copied.
+                // Where it lands is checked on entry like any other directory.
+                return copy_path_inner(&std::fs::canonicalize(src)?, dst, entered);
             }
             std::fs::copy(src, dst)?;
             return Ok(());
@@ -398,13 +444,32 @@ pub fn copy_path(src: &Path, dst: &Path) -> Result<()> {
     }
 
     if metadata.is_dir() {
-        std::fs::create_dir(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            let src_child = entry.path();
-            let dst_child = dst.join(entry.file_name());
-            copy_path(&src_child, &dst_child)?;
+        let mark = dir_mark(src);
+        if let Some(mark) = mark.as_ref()
+            && entered.contains(mark)
+        {
+            return Err(loops_back(src));
         }
+        std::fs::create_dir(dst)?;
+        // Moved rather than cloned: the mark is a pair of integers on Unix and
+        // a path elsewhere, and only one of the two would tolerate a clone.
+        let marked = mark.is_some();
+        if let Some(mark) = mark {
+            entered.push(mark);
+        }
+        let walk = (|| -> Result<()> {
+            for entry in std::fs::read_dir(src)? {
+                let entry = entry?;
+                let src_child = entry.path();
+                let dst_child = dst.join(entry.file_name());
+                copy_path_inner(&src_child, &dst_child, entered)?;
+            }
+            Ok(())
+        })();
+        if marked {
+            entered.pop();
+        }
+        walk?;
     } else {
         std::fs::copy(src, dst)?;
     }
@@ -441,11 +506,32 @@ pub fn path_size(path: &Path) -> u64 {
 ///
 /// If cancelled while writing a file, the partial file is deleted (a
 /// truncated file is never left behind).
+/// `on_skipped` is called for each entry the walk could not copy — a file held
+/// by another program, one the account may not read. Such an entry is reported
+/// and stepped over rather than ending the copy: its siblings have nothing to
+/// do with it, and a folder of a thousand files should not be lost to one of
+/// them. Only a failure on the root itself is returned as an error, since there
+/// is then nothing to continue with.
 pub fn copy_tree_progress(
     src: &Path,
     dst: &Path,
     on_bytes: &mut dyn FnMut(u64),
+    on_skipped: &mut dyn FnMut(&Path, &crate::Error),
     cancel: &dyn Fn() -> bool,
+) -> Result<OpStatus> {
+    // The directories this branch has already entered, so it can refuse to
+    // enter one of them a second time. See `DirMark`.
+    let mut entered: Vec<DirMark> = Vec::new();
+    copy_tree_inner(src, dst, on_bytes, on_skipped, cancel, &mut entered)
+}
+
+fn copy_tree_inner(
+    src: &Path,
+    dst: &Path,
+    on_bytes: &mut dyn FnMut(u64),
+    on_skipped: &mut dyn FnMut(&Path, &crate::Error),
+    cancel: &dyn Fn() -> bool,
+    entered: &mut Vec<DirMark>,
 ) -> Result<OpStatus> {
     if cancel() {
         return Ok(OpStatus::Cancelled);
@@ -465,7 +551,18 @@ pub fn copy_tree_progress(
                 // Insufficient privilege: materialize the target with byte
                 // tracking and cancellation support. See `copy_path`.
                 if target_is_dir {
-                    return copy_tree_progress(&std::fs::canonicalize(src)?, dst, on_bytes, cancel);
+                    // Materialising follows the link out of the tree being
+                    // copied. Where it lands is checked on entry like any
+                    // other directory, and a refusal is reported as an entry
+                    // the copy could not take — so the rest still lands.
+                    return copy_tree_inner(
+                        &std::fs::canonicalize(src)?,
+                        dst,
+                        on_bytes,
+                        on_skipped,
+                        cancel,
+                        entered,
+                    );
                 }
                 return copy_file_progress(src, dst, on_bytes, cancel);
             }
@@ -478,23 +575,47 @@ pub fn copy_tree_progress(
     }
 
     if md.is_dir() {
-        std::fs::create_dir(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            if cancel() {
-                return Ok(OpStatus::Cancelled);
-            }
-            if copy_tree_progress(
-                &entry.path(),
-                &dst.join(entry.file_name()),
-                on_bytes,
-                cancel,
-            )? == OpStatus::Cancelled
-            {
-                return Ok(OpStatus::Cancelled);
-            }
+        let mark = dir_mark(src);
+        if let Some(mark) = mark.as_ref()
+            && entered.contains(mark)
+        {
+            return Err(loops_back(src));
         }
-        Ok(OpStatus::Done)
+        std::fs::create_dir(dst)?;
+        // Moved rather than cloned: the mark is a pair of integers on Unix and
+        // a path elsewhere, and only one of the two would tolerate a clone.
+        let marked = mark.is_some();
+        if let Some(mark) = mark {
+            entered.push(mark);
+        }
+        let walk = (|| -> Result<OpStatus> {
+            for entry in std::fs::read_dir(src)? {
+                let entry = entry?;
+                if cancel() {
+                    return Ok(OpStatus::Cancelled);
+                }
+                let child = entry.path();
+                match copy_tree_inner(
+                    &child,
+                    &dst.join(entry.file_name()),
+                    on_bytes,
+                    on_skipped,
+                    cancel,
+                    entered,
+                ) {
+                    Ok(OpStatus::Cancelled) => return Ok(OpStatus::Cancelled),
+                    Ok(OpStatus::Done) => {}
+                    // Reported, then stepped over: the rest of the folder is
+                    // copied, which is what the user asked for.
+                    Err(err) => on_skipped(&child, &err),
+                }
+            }
+            Ok(OpStatus::Done)
+        })();
+        if marked {
+            entered.pop();
+        }
+        walk
     } else {
         copy_file_progress(src, dst, on_bytes, cancel)
     }
@@ -519,18 +640,29 @@ fn copy_file_progress(
     let mut reader = std::fs::File::open(src)?;
     let mut writer = std::fs::File::create(dst)?;
     let mut buf = vec![0u8; COPY_BUF_BYTES];
-    loop {
+    let outcome = loop {
         if cancel() {
-            drop(writer);
-            let _ = std::fs::remove_file(dst); // clean up the partial file
-            return Ok(OpStatus::Cancelled);
+            break Ok(OpStatus::Cancelled);
         }
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break Ok(OpStatus::Done),
+            Ok(n) => n,
+            Err(err) => break Err(Error::from(err)),
+        };
+        if let Err(err) = writer.write_all(&buf[..n]) {
+            break Err(Error::from(err));
         }
-        writer.write_all(&buf[..n])?;
         on_bytes(n as u64);
+    };
+    // Anything but a clean end of file leaves a truncated destination, which
+    // looks exactly like a complete copy. Since the walk now steps over a
+    // failing entry and carries on, those remains must not survive to be taken
+    // for one: they go before the outcome is reported. Windows needs no
+    // equivalent — `CopyFileExW` deletes its own partial target.
+    if !matches!(outcome, Ok(OpStatus::Done)) {
+        drop(writer);
+        let _ = std::fs::remove_file(dst);
+        return outcome;
     }
     // Best-effort: preserve permissions (Unix mode).
     if let Ok(meta) = std::fs::metadata(src) {
@@ -834,8 +966,15 @@ pub fn copy_into(src: &Path, dst_dir: &Path) -> Result<PathBuf> {
 }
 
 /// Moves `src` into `dst_dir`. Uses `std::fs::rename` (fast, atomic on the
-/// same filesystem); on EXDEV failure (different filesystems), falls back to
-/// copy + remove.
+/// same filesystem) and falls back to copy + remove on ANY rename failure —
+/// crossing filesystems is the common case, but a bind mount or an exotic
+/// driver can refuse the rename with a different error, and copy + remove
+/// handles those just as well.
+///
+/// The fallback is not atomic: if the copy succeeds and the source cannot then
+/// be removed, the item exists in BOTH places and the removal error is
+/// returned. The caller must surface that outcome rather than treat it as a
+/// completed move.
 pub fn move_into(src: &Path, dst_dir: &Path) -> Result<PathBuf> {
     let name = src
         .file_name()
@@ -846,7 +985,8 @@ pub fn move_into(src: &Path, dst_dir: &Path) -> Result<PathBuf> {
     match std::fs::rename(src, &target) {
         Ok(()) => Ok(target),
         Err(_) => {
-            // Cross-device fallback: copy then remove.
+            // Copy first, then drop the source: a failure here leaves the copy
+            // in place, which the propagated error tells the caller about.
             copy_path(src, &target)?;
             permanent_delete(src)?;
             Ok(target)
@@ -855,8 +995,11 @@ pub fn move_into(src: &Path, dst_dir: &Path) -> Result<PathBuf> {
 }
 
 /// Moves `src` to the **exact** path `dst` (which must not exist).
-/// Fast `rename`, cross-device copy+remove fallback. Used when the target
-/// name has already been resolved (e.g. after the conflict popup).
+/// Fast `rename`, with the same copy + remove fallback as [`move_into`] —
+/// including its non-atomicity: a source that cannot be removed after a
+/// successful copy leaves the item in both places and returns the error.
+/// Used when the target name has already been resolved (e.g. after the
+/// conflict popup).
 pub fn move_to(src: &Path, dst: &Path) -> Result<()> {
     match std::fs::rename(src, dst) {
         Ok(()) => Ok(()),
@@ -1033,6 +1176,34 @@ pub fn paths_equal(left: &Path, right: &Path) -> bool {
     {
         left == right
     }
+}
+
+/// Is `path` `ancestor` itself, or somewhere inside it? Compares component by
+/// component, so a shared spelling prefix is never mistaken for containment
+/// (`/ab/c` is not inside `/a`), and follows the platform's case rules like
+/// [`paths_equal`]. Lexical: no `canonicalize`, hence safe on a slow share.
+///
+/// The rule an operation needs before copying or moving an item: a destination
+/// inside its own source makes the walk keep meeting the copy it has just
+/// created, and recurse until the path length or the disk gives out.
+pub fn is_within(path: &Path, ancestor: &Path) -> bool {
+    let mut here = path.components();
+    for expected in ancestor.components() {
+        let Some(actual) = here.next() else {
+            return false; // `path` is shorter: it cannot contain `ancestor`
+        };
+        #[cfg(windows)]
+        let same = actual
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&expected.as_os_str().to_string_lossy());
+        #[cfg(not(windows))]
+        let same = actual == expected;
+        if !same {
+            return false;
+        }
+    }
+    true
 }
 
 /// Platforms without a restore API exposed by `trash::os_limited`.
@@ -1263,6 +1434,87 @@ mod tests {
     }
 
     #[test]
+    fn is_within_matches_only_real_containment() {
+        let root = Path::new("/folder01");
+        assert!(is_within(Path::new("/folder01"), root), "itself counts");
+        assert!(is_within(Path::new("/folder01/sub"), root));
+        assert!(is_within(Path::new("/folder01/sub/deep"), root));
+        // A shared spelling prefix is not containment: this is the case a
+        // plain string comparison gets wrong.
+        assert!(!is_within(Path::new("/folder0123"), root));
+        assert!(!is_within(Path::new("/folder02"), root));
+        // The other way round, and unrelated branches.
+        assert!(!is_within(root, Path::new("/folder01/sub")));
+        assert!(!is_within(Path::new("/other"), root));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn is_within_ignores_case_on_windows() {
+        // Paths reaching an operation can come from another application's
+        // clipboard, which spells them however it likes.
+        assert!(is_within(
+            Path::new(r"C:\Folder01\Sub"),
+            Path::new(r"c:\folder01")
+        ));
+    }
+
+    /// A directory link pointing back into the tree being copied used to make
+    /// the walk re-enter itself forever, each turn adding one level to the
+    /// destination. Windows only: there, a link that cannot be recreated is
+    /// materialised by following it, which is what opens the cycle. Unix
+    /// recreates the link and never walks through it.
+    ///
+    /// The junction is built with the system tool: `symlink_dir` needs a
+    /// privilege that a plain account does not have — precisely the case that
+    /// makes Favnyr fall back to materialising.
+    #[cfg(windows)]
+    #[test]
+    fn copy_refuses_a_directory_link_that_loops_back() {
+        let dir = tempdir();
+        let src = dir.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        write_file(&src.join("a.bin"), &[7u8; 10]);
+
+        let loop_link = src.join("sub").join("back");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&loop_link)
+            .arg(&src)
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !made {
+            std::fs::remove_dir_all(&dir).ok();
+            return; // junctions unavailable (filesystem without reparse points)
+        }
+
+        let mut skipped: Vec<String> = Vec::new();
+        let status = copy_tree_progress(
+            &src,
+            &dir.join("dst"),
+            &mut |_| {},
+            &mut |path, _| skipped.push(path.file_name().unwrap().to_string_lossy().into_owned()),
+            &|| false,
+        )
+        .unwrap();
+
+        assert_eq!(status, OpStatus::Done);
+        assert_eq!(skipped, ["back"], "the looping link is the only casualty");
+        assert_eq!(
+            std::fs::read(dir.join("dst").join("a.bin")).unwrap().len(),
+            10,
+            "everything outside the loop is still copied"
+        );
+        // The strict variant has no way to report, so it refuses outright
+        // rather than walking forever.
+        assert!(copy_path(&src, &dir.join("dst2")).is_err());
+
+        std::fs::remove_dir(&loop_link).ok(); // the link itself, never its target
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn copy_tree_progress_reports_bytes() {
         let dir = tempdir();
         let src = dir.join("src");
@@ -1272,10 +1524,60 @@ mod tests {
 
         let dst = dir.join("dst");
         let mut total = 0u64;
-        let status = copy_tree_progress(&src, &dst, &mut |d| total += d, &|| false).unwrap();
+        let status =
+            copy_tree_progress(&src, &dst, &mut |d| total += d, &mut |_, _| {}, &|| false).unwrap();
         assert_eq!(status, OpStatus::Done);
         assert_eq!(total, 800);
         assert_eq!(std::fs::read(dst.join("a.bin")).unwrap().len(), 500);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The point of the skip callback: one file another program holds must
+    /// cost that file alone. Windows only, because only there can the
+    /// condition be staged — opening a handle with no sharing is exactly what
+    /// a service doing the same to a user's file produces. Elsewhere an open
+    /// file stays perfectly copyable, so there is nothing to reproduce.
+    #[cfg(windows)]
+    #[test]
+    fn copy_tree_progress_skips_a_held_file_and_keeps_going() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempdir();
+        let src = dir.join("src");
+        std::fs::create_dir(&src).unwrap();
+        write_file(&src.join("a.bin"), &[7u8; 40]);
+        let held = src.join("held.bin");
+        write_file(&held, &[7u8; 50]);
+        write_file(&src.join("z.bin"), &[7u8; 60]);
+
+        // `share_mode(0)` = no other open is granted, the way a program that
+        // keeps a file for itself leaves it.
+        let _handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&held)
+            .unwrap();
+
+        let dst = dir.join("dst");
+        let mut skipped: Vec<String> = Vec::new();
+        let status = copy_tree_progress(
+            &src,
+            &dst,
+            &mut |_| {},
+            &mut |path, _| skipped.push(path.file_name().unwrap().to_string_lossy().into_owned()),
+            &|| false,
+        )
+        .unwrap();
+
+        assert_eq!(status, OpStatus::Done);
+        assert_eq!(skipped, ["held.bin"], "only the held file is reported");
+        // Read order is not guaranteed, so both siblings are checked: whichever
+        // side of the held file they fell on, they went through.
+        assert_eq!(std::fs::read(dst.join("a.bin")).unwrap().len(), 40);
+        assert_eq!(std::fs::read(dst.join("z.bin")).unwrap().len(), 60);
+        assert!(!dst.join("held.bin").exists(), "no stub left behind");
+
+        drop(_handle);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1286,7 +1588,7 @@ mod tests {
         write_file(&src, &[1u8; 1_000_000]); // > chunk size → cancellation mid-flight
         let dst = dir.join("big-copy.bin");
         // cancel() true right away → nothing is copied.
-        let status = copy_tree_progress(&src, &dst, &mut |_| {}, &|| true).unwrap();
+        let status = copy_tree_progress(&src, &dst, &mut |_| {}, &mut |_, _| {}, &|| true).unwrap();
         assert_eq!(status, OpStatus::Cancelled);
         assert!(!dst.exists(), "the partial file must be cleaned up");
         std::fs::remove_dir_all(&dir).ok();
@@ -1395,10 +1697,10 @@ mod tests {
         // only looks suspicious.
         for ok in [
             "notes.txt",
-            "Rapport 2026",
+            "Report 2026",
             ".clang-format",
             "a-b_c(1)[2]{3}",
-            "été & co",
+            "café & co",
             "archive.tar.gz",
         ] {
             assert_eq!(check_file_name(ok), Ok(()), "{ok} should be accepted");
