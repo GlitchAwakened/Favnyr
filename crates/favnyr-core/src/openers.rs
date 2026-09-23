@@ -138,7 +138,9 @@ pub const CTX_EXT_ALL: &str = "*";
 
 /// Tags describing ONE file. Their presence is what makes a command run once
 /// per selected item. Order = order of the GUI insertion buttons.
-pub const TAGS: &[&str] = &["file", "dir", "dirname", "name", "stem", "ext", "uri"];
+pub const TAGS: &[&str] = &[
+    "file", "dir", "dirname", "setname", "name", "stem", "ext", "uri",
+];
 
 /// Tag standing for the WHOLE selection. Unlike the tags above it does not
 /// describe one file, so it does the opposite: the command runs a single time
@@ -166,9 +168,14 @@ pub struct TagContext {
     pub file: String,
     pub dir: String,
     /// Name alone of the containing folder — `{dir}` gives its full path.
-    /// Lets an archive be named after the folder rather than after one of the
-    /// files it holds, which is what archivers do for a multiple selection.
     pub dirname: String,
+    /// Name to give something built FROM the selection, an archive above all.
+    ///
+    /// The only value here that describes the selection rather than one path:
+    /// the item's own name when a single one is selected, and the name of the
+    /// folder they share when there are several — which is what an archiver
+    /// does, having nothing better to name the whole after.
+    pub setname: String,
     pub name: String,
     pub stem: String,
     pub ext: String,
@@ -198,10 +205,21 @@ impl TagContext {
             .map(|s| s.to_string_lossy().to_ascii_lowercase())
             .unwrap_or_default();
         let uri = file_uri(&file);
+        // A folder keeps its whole name, a file loses its extension: an
+        // archive of `report.pdf` is `report.zip`, but a folder named
+        // `archive.old` must not become `archive`. Telling the two apart needs
+        // the filesystem, the extension alone cannot — and this is paid once
+        // per launch, not per row.
+        let setname = if path.is_dir() {
+            name.clone()
+        } else {
+            stem.clone()
+        };
         Self {
             file,
             dir,
             dirname,
+            setname,
             name,
             stem,
             ext,
@@ -252,6 +270,7 @@ fn substitute(template: &str, ctx: &TagContext) -> String {
                     (true, "file") => out.push_str(&ctx.file),
                     (true, "dir") => out.push_str(&ctx.dir),
                     (true, "dirname") => out.push_str(&ctx.dirname),
+                    (true, "setname") => out.push_str(&ctx.setname),
                     (true, "name") => out.push_str(&ctx.name),
                     (true, "stem") => out.push_str(&ctx.stem),
                     (true, "ext") => out.push_str(&ctx.ext),
@@ -345,10 +364,22 @@ impl Opener {
     /// unlike the historical fallback which always appended paths at the end.
     /// The remaining tags describe `ctx`, which the caller builds from the
     /// first selected item; `{dir}` and `{dirname}` therefore designate the
-    /// folder the whole selection shares.
+    /// folder the whole selection shares, and `{setname}` names the selection
+    /// itself.
     /// `paths` are the selected items; each expands to its full path for
     /// [`LIST_TAG`] and to its bare name for [`LIST_NAMES_TAG`].
     pub fn render_for_batch(&self, ctx: &TagContext, paths: &[&Path]) -> Vec<String> {
+        // `{setname}` is the one tag that depends on HOW MANY items there are.
+        // `ctx` describes the first of them, which names the whole only when it
+        // is the whole; past that, the folder they share does.
+        let ctx = if paths.len() > 1 {
+            let mut many = ctx.clone();
+            many.setname = many.dirname.clone();
+            std::borrow::Cow::Owned(many)
+        } else {
+            std::borrow::Cow::Borrowed(ctx)
+        };
+        let ctx = ctx.as_ref();
         let mut out = Vec::with_capacity(self.args.len() + paths.len());
         for arg in &self.args {
             if arg == LIST_TAG {
@@ -823,6 +854,87 @@ mod tests {
         // every file, which is the opposite of what the copy was made for.
         let dup = s.duplicate(&id).unwrap();
         assert_eq!(s.get(&dup).unwrap().ctx_exts, ["zip", "rar"]);
+    }
+
+    /// An archive takes the name of what it holds. One item names it itself;
+    /// past that there is nothing better than the folder they share.
+    #[test]
+    fn an_archive_is_named_after_a_lone_item_and_after_their_folder_otherwise() {
+        // Real entries: telling a folder from a file is a filesystem question,
+        // and a fictional path would answer "file" for both.
+        let root = std::env::temp_dir().join(format!("favnyr-setname-{}", std::process::id()));
+        let folder = root.join("folder 01");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = root.join("my_file.pdf");
+        std::fs::write(&file, b"x").unwrap();
+
+        let zip = Opener {
+            id: "x".into(),
+            label: "zip".into(),
+            program: "/usr/bin/7z".into(),
+            assoc: None,
+            icon: OpenerIcon::None,
+            args: vec!["a".into(), "{dir}/{setname}.zip".into(), "{files}".into()],
+            default_exts: vec![],
+            used_exts: vec![],
+            use_count: 0,
+            last_used: 0,
+            elevated: false,
+            ctx_menu: 0,
+            ctx_exts: Vec::new(),
+        };
+        let name = |args: &[String]| args[1].clone();
+
+        // A single file: its own name, without the extension — an archive of
+        // `my_file.pdf` is `my_file.zip`, not `my_file.pdf.zip`.
+        let one_file = [file.as_path()];
+        assert_eq!(
+            name(&zip.render_for_batch(&TagContext::from_path(&file), &one_file)),
+            format!("{}/my_file.zip", root.display())
+        );
+
+        // A single folder keeps its WHOLE name: dropping an extension here
+        // would truncate a folder that merely has a dot in its name.
+        let dotted = root.join("archive.old");
+        std::fs::create_dir_all(&dotted).unwrap();
+        let one_dir = [dotted.as_path()];
+        assert_eq!(
+            name(&zip.render_for_batch(&TagContext::from_path(&dotted), &one_dir)),
+            format!("{}/archive.old.zip", root.display())
+        );
+
+        // Several items: the first no longer names the whole, the folder does.
+        let many = [file.as_path(), folder.as_path()];
+        assert_eq!(
+            name(&zip.render_for_batch(&TagContext::from_path(&file), &many)),
+            format!(
+                "{}/{}.zip",
+                root.display(),
+                root.file_name().unwrap().to_string_lossy()
+            )
+        );
+
+        // `{dirname}` keeps its own meaning, whatever the count: commands
+        // written before this tag existed must not start behaving differently.
+        let by_folder = Opener {
+            args: vec!["a".into(), "{dir}/{dirname}.zip".into(), "{files}".into()],
+            ..zip.clone()
+        };
+        let expected = format!(
+            "{}/{}.zip",
+            root.display(),
+            root.file_name().unwrap().to_string_lossy()
+        );
+        assert_eq!(
+            name(&by_folder.render_for_batch(&TagContext::from_path(&file), &one_file)),
+            expected
+        );
+        assert_eq!(
+            name(&by_folder.render_for_batch(&TagContext::from_path(&file), &many)),
+            expected
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

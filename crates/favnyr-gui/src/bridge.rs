@@ -62,6 +62,8 @@ struct OwPickCtx {
     ext: String,
     path: PathBuf,
     handlers: Vec<openwith::AppHandler>,
+    /// Cached rows keep icon extraction out of the typing path.
+    items: Vec<OpenerItem>,
 }
 
 // ---------- Internal clipboard ----------
@@ -373,17 +375,17 @@ struct TabBook {
 }
 
 impl TabBook {
-    fn single(initial: PathBuf) -> Self {
-        Self {
-            tabs: vec![Tab::new(initial)],
-            active: 0,
-        }
+    /// Inserts a tab at a visible gap, clamping stale UI coordinates, and
+    /// activates it. Shared by every source that creates or transfers a tab.
+    fn insert_tab_at(&mut self, at: usize, tab: Tab) -> usize {
+        let at = at.min(self.tabs.len());
+        self.tabs.insert(at, tab);
+        self.active = at;
+        at
     }
 
     fn open(&mut self, path: PathBuf) -> usize {
-        self.tabs.push(Tab::new(path));
-        self.active = self.tabs.len() - 1;
-        self.active
+        self.insert_tab_at(self.tabs.len(), Tab::new(path))
     }
 
     /// Inserts `tab` right after tab `idx` and activates the new entry.
@@ -392,10 +394,7 @@ impl TabBook {
         if idx >= self.tabs.len() {
             return None;
         }
-        let at = idx + 1;
-        self.tabs.insert(at, tab);
-        self.active = at;
-        Some(at)
+        Some(self.insert_tab_at(idx + 1, tab))
     }
 
     /// Opens a target right after the active tab. A `TabBook` always has
@@ -550,9 +549,19 @@ impl Panel {
     /// New panel with an explicit tab bar position (settings
     /// default, inherited on split, instance detached via tear-off).
     fn with_mode(initial: PathBuf, columns: Vec<ColumnSpec>, tab_bar_mode: u8) -> Self {
+        Self::from_tab(Tab::new(initial), columns, tab_bar_mode, 0.0)
+    }
+
+    /// Shared panel initialization for a new location and a tab moved by drag.
+    /// The latter keeps its history and view options instead of rebuilding it.
+    fn from_tab(tab: Tab, columns: Vec<ColumnSpec>, tab_bar_mode: u8, vbar_user_w: f32) -> Self {
+        let initial = tab.current_path.clone();
         let (rows_model, rendered_rows_model) = new_row_models();
         Self {
-            tabs: TabBook::single(initial.clone()),
+            tabs: TabBook {
+                tabs: vec![tab],
+                active: 0,
+            },
             rows_model,
             rendered_rows_model,
             rows_revision: Cell::new(0),
@@ -567,7 +576,7 @@ impl Panel {
             unavailable: false,
             tabs_viewport_x: 0.0,
             tab_bar_mode: tab_bar_mode.min(2),
-            vbar_user_w: 0.0,
+            vbar_user_w: vbar_user_w.max(0.0),
             pending_initial: false,
             pending_listing: false,
             listing_gen: 0,
@@ -1545,6 +1554,7 @@ pub fn install(window: &MainWindow, state: AppState) {
     window.set_closed_tabs_available(state.has_closed_tabs());
     // The "Open with…" entry (native picker) only exists on Windows.
     window.set_platform_windows(cfg!(windows));
+    window.set_platform_linux(cfg!(target_os = "linux"));
     window.set_theme_pref(match cfg.theme {
         Theme::Auto => 0,
         Theme::Light => 1,
@@ -1732,14 +1742,11 @@ pub fn install(window: &MainWindow, state: AppState) {
             if kind == 3 || kind == 5 || kind == 6 || kind == 7 {
                 return;
             }
-            let p = PathBuf::from(path.to_string());
-            // Same logic as a simple click: no blocking `is_dir()` on a
-            // network path (the listing resolves it, banner on failure).
-            if p.as_os_str().is_empty()
-                || (!favnyr_core::places::is_network_path(&p) && !p.is_dir())
-            {
+            // Same resolver as a drag from the sidebar: network paths are
+            // handed to the asynchronous listing without a blocking probe.
+            let Some(p) = resolve_sidebar_place_dir(path.as_str()) else {
                 return;
-            }
+            };
             let opened = st.with_tabs_mut(|book| {
                 let a = book.open_after_active(p);
                 book.tabs[a].current_path.clone()
@@ -2087,6 +2094,53 @@ pub fn install(window: &MainWindow, state: AppState) {
             }
         });
     }
+    // Drop a navigable sidebar item on a tab gap or panel zone. Exact gaps
+    // insert at that position; a panel center appends a tab; an edge creates a
+    // split. Favorite files keep the historical gap behavior (their parent is
+    // opened) but only favorite directories may target a panel zone.
+    {
+        let st = state.clone();
+        let weak = window.as_weak();
+        window.on_sidebar_item_dropped(
+            move |source: SharedString, kind: i32, panel: i32, gap: i32, zone: i32| {
+                let Some(w) = weak.upgrade() else { return };
+                let panel_drop = gap < 0 && zone > 0;
+                let target = if kind == -1 {
+                    let stored = {
+                        let favorites = favorites_now(&st);
+                        favorites.path_of(source.as_str()).map(PathBuf::from)
+                    };
+                    if panel_drop {
+                        stored.filter(|path| path.is_dir())
+                    } else {
+                        stored.and_then(|path| {
+                            resolve_fav_dir(&w, &path, st.snapshot_config().language)
+                        })
+                    }
+                } else if matches!(kind, 0 | 1 | 2 | 4) {
+                    resolve_sidebar_place_dir(source.as_str())
+                } else {
+                    None
+                };
+                let Some(target) = target else { return };
+
+                if gap >= 0 || zone == 1 {
+                    let insert_at = if gap >= 0 { gap } else { i32::MAX };
+                    open_path_in_tab_at(&w, &st, target, panel, insert_at);
+                } else if panel >= 0 && (2..=5).contains(&zone) {
+                    let dir = if zone == 4 || zone == 5 {
+                        SplitDir::Column
+                    } else {
+                        SplitDir::Row
+                    };
+                    let new_first = zone == 2 || zone == 4;
+                    if split_with_path(&st, target, panel as usize, dir, new_first) {
+                        refresh_all_panels(&w, &st);
+                    }
+                }
+            },
+        );
+    }
     // Middle click: opens a favorite in a new tab.
     {
         let st = state.clone();
@@ -2388,31 +2442,36 @@ pub fn install(window: &MainWindow, state: AppState) {
             w.set_fav_drag_hover_container(hover.into());
         });
     }
-    // Reorder drag: drop → actual move of the node.
+    // Reorder drag release: always clears transient state, and mutates the
+    // tree only when the UI confirms that the cursor is in its visible frame.
     {
         let st = state.clone();
         let weak = window.as_weak();
-        window.on_fav_drag_drop(move |row_idx: i32, cur_y: f32, row_top: f32| {
-            let Some(w) = weak.upgrade() else { return };
-            let (src_id, count) = {
-                let fav = favorites_now(&st);
-                let flat = fav.flatten();
-                (
-                    flat.get(row_idx.max(0) as usize).map(|n| n.id.clone()),
-                    flat.len() as i32,
-                )
-            };
-            w.set_fav_drag_active(false);
-            w.set_fav_drag_target_index(-1);
-            w.set_fav_drag_hover_container(SharedString::new());
-            if let Some(src_id) = src_id {
-                let (ti, zone) = fav_drag_target(cur_y, row_top, row_idx, count);
-                if fav_perform_move(&st, &src_id, ti, zone) {
+        window.on_fav_drag_drop(
+            move |row_idx: i32, cur_y: f32, row_top: f32, commit_reorder: bool| {
+                let Some(w) = weak.upgrade() else { return };
+                let (src_id, count) = {
+                    let fav = favorites_now(&st);
+                    let flat = fav.flatten();
+                    (
+                        flat.get(row_idx.max(0) as usize).map(|n| n.id.clone()),
+                        flat.len() as i32,
+                    )
+                };
+                w.set_fav_drag_active(false);
+                w.set_fav_drag_target_index(-1);
+                w.set_fav_drag_zone(0);
+                w.set_fav_drag_hover_container(SharedString::new());
+                if let (Some(src_id), Some((ti, zone))) = (
+                    src_id,
+                    fav_drop_target(commit_reorder, cur_y, row_top, row_idx, count),
+                ) && fav_perform_move(&st, &src_id, ti, zone)
+                {
                     save_favorites(&st);
                     push_favorites_ui(&w, &st);
                 }
-            }
-        });
+            },
+        );
     }
     // Auto-expand during a drag: expands a container IN PLACE (inserting the
     // subtree into the existing VecModel → row components, including the
@@ -3618,31 +3677,36 @@ pub fn install(window: &MainWindow, state: AppState) {
                 .extension()
                 .map(|e| e.to_string_lossy().to_ascii_lowercase())
                 .unwrap_or_default();
-            let mut handlers = openwith::handlers_for_ext(&ext);
-            // Recommended first, then alphabetical order (already sorted on the Linux side).
-            handlers.sort_by(|a, b| {
-                b.recommended
-                    .cmp(&a.recommended)
-                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            });
-            let items: Vec<OpenerItem> = handlers
-                .iter()
-                .map(|h| OpenerItem {
-                    id: h.key.clone().into(),
-                    label: h.name.clone().into(),
-                    available: true,
-                    icon: opener_icon(h.exe.as_deref().unwrap_or_default()),
-                    icon_kind: openers::OpenerIcon::None.as_i32(),
-                })
-                .collect();
-            *st.ow_pick_ctx.borrow_mut() = Some(OwPickCtx {
-                ext,
-                path,
-                handlers,
-            });
-            w.set_ow_picker_handlers(ModelRc::new(VecModel::from(items)));
+            w.set_ow_picker_show_other_apps(false);
+            w.set_ow_picker_search_text(SharedString::new());
+            refresh_ow_picker_handlers(&w, &st, &ext, &path, false);
             w.set_ow_picker_set_default(false); // unchecked on every opening
             w.set_ow_picker_open(true);
+        });
+    }
+    // The picker search filters its cached rows only; application discovery and
+    // icon extraction remain tied to opening the picker or changing its scope.
+    {
+        let st = state.clone();
+        let weak = window.as_weak();
+        window.on_ow_picker_search(move |text: SharedString| {
+            let Some(w) = weak.upgrade() else { return };
+            push_filtered_ow_picker_ui(&w, &st, text.as_str());
+        });
+    }
+    // Linux-only option: include launchers that make no MIME declaration.
+    {
+        let st = state.clone();
+        let weak = window.as_weak();
+        window.on_ow_picker_show_other_apps_changed(move |show_other_apps| {
+            let Some(w) = weak.upgrade() else { return };
+            let context = st
+                .ow_pick_ctx
+                .borrow()
+                .as_ref()
+                .map(|ctx| (ctx.ext.clone(), ctx.path.clone()));
+            let Some((ext, path)) = context else { return };
+            refresh_ow_picker_handlers(&w, &st, &ext, &path, show_other_apps);
         });
     }
     // Choice in the picker: launches + CAPTURES the app (persisted as an opener).
@@ -3821,7 +3885,7 @@ pub fn install(window: &MainWindow, state: AppState) {
                 w.set_ow_popup_icon_kind(effective_opener_icon(op).as_i32());
                 // OS/Store app (assoc, without exe) → Program field frozen.
                 w.set_ow_popup_is_store(op.assoc.is_some());
-                w.set_ow_popup_args(op.args.join(" ").into());
+                w.set_ow_popup_args(join_args(&op.args).into());
                 w.set_ow_popup_default_ext(op.default_exts.join(", ").into());
                 // Learned/manual extensions → offered in "Open with".
                 w.set_ow_popup_used_ext(op.used_exts.join(", ").into());
@@ -7652,7 +7716,13 @@ fn save_favorites(state: &AppState) {
 /// Converts a flattened core node into a Slint struct (existence checked for
 /// favorites → grayed out if the path is missing).
 fn flat_to_favnode(f: &FlatFav) -> FavNode {
-    let available = f.is_container || f.path.is_empty() || Path::new(&f.path).exists();
+    // One metadata read answers both questions and follows directory symlinks,
+    // matching navigation. Containers carry no filesystem path.
+    let metadata = (!f.is_container && !f.path.is_empty())
+        .then(|| std::fs::metadata(&f.path).ok())
+        .flatten();
+    let available = f.is_container || f.path.is_empty() || metadata.is_some();
+    let is_dir = metadata.is_some_and(|entry| entry.is_dir());
     FavNode {
         id: f.id.clone().into(),
         label: f.name.clone().into(),
@@ -7662,6 +7732,7 @@ fn flat_to_favnode(f: &FlatFav) -> FavNode {
         expanded: f.expanded,
         has_children: f.has_children,
         available,
+        is_dir,
     }
 }
 
@@ -7743,6 +7814,62 @@ fn opener_icon(path: &str) -> Image {
         )),
         None => Image::default(),
     }
+}
+
+/// Filters the already-built picker rows. Images are shared when cloned, so
+/// typing never re-enumerates the OS or extracts executable icons again.
+fn filtered_ow_picker_items(items: &[OpenerItem], filter: &str) -> Vec<OpenerItem> {
+    let needle = filter.trim().to_lowercase();
+    items
+        .iter()
+        .filter(|item| needle.is_empty() || item.label.to_lowercase().contains(&needle))
+        .cloned()
+        .collect()
+}
+
+fn push_filtered_ow_picker_ui(window: &MainWindow, state: &AppState, filter: &str) {
+    let visible = state
+        .ow_pick_ctx
+        .borrow()
+        .as_ref()
+        .map(|context| filtered_ow_picker_items(&context.items, filter))
+        .unwrap_or_default();
+    window.set_ow_picker_handlers(ModelRc::new(VecModel::from(visible)));
+}
+
+/// Rebuilds both the visible application list and the handler context used when
+/// the user picks an entry. Keeping them together prevents stale selections.
+fn refresh_ow_picker_handlers(
+    window: &MainWindow,
+    state: &AppState,
+    ext: &str,
+    path: &Path,
+    include_without_mime: bool,
+) {
+    let mut handlers = openwith::handlers_for_ext(ext, include_without_mime);
+    handlers.sort_by(|a, b| {
+        b.recommended
+            .cmp(&a.recommended)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    let items: Vec<OpenerItem> = handlers
+        .iter()
+        .map(|handler| OpenerItem {
+            id: handler.key.clone().into(),
+            label: handler.name.clone().into(),
+            available: true,
+            icon: opener_icon(handler.exe.as_deref().unwrap_or_default()),
+            icon_kind: openers::OpenerIcon::None.as_i32(),
+        })
+        .collect();
+    *state.ow_pick_ctx.borrow_mut() = Some(OwPickCtx {
+        ext: ext.to_owned(),
+        path: path.to_owned(),
+        handlers,
+        items,
+    });
+    let filter = window.get_ow_picker_search_text();
+    push_filtered_ow_picker_ui(window, state, filter.as_str());
 }
 
 fn opener_matches_filter(opener: &openers::Opener, needle: &str) -> bool {
@@ -8123,6 +8250,60 @@ fn split_args(s: &str) -> Vec<String> {
     args
 }
 
+/// Renders ONE argument so that [`split_args`] hands it back unchanged.
+///
+/// Needed because an argument list is stored split, and putting it back in
+/// front of the user means writing a command line again: joining with plain
+/// spaces would lose exactly what made a path with spaces a single argument,
+/// and the next save would tear it into pieces.
+///
+/// `split_args` has no escape character, so an argument is protected by the
+/// quote it does not itself contain.
+fn quote_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_string();
+    }
+    if !arg
+        .chars()
+        .any(|c| c.is_whitespace() || c == '"' || c == '\'')
+    {
+        return arg.to_string();
+    }
+    if !arg.contains('"') {
+        return format!("\"{arg}\"");
+    }
+    if !arg.contains('\'') {
+        return format!("'{arg}'");
+    }
+    // Both quote characters: neither can wrap the whole argument. A quote may
+    // open anywhere inside a token, though, so each awkward character is
+    // wrapped in the other quote and the pieces are written with nothing
+    // between them — `split_args` rejoins them into one argument.
+    let mut out = String::with_capacity(arg.len() + 2);
+    for c in arg.chars() {
+        match c {
+            '"' => out.push_str("'\"'"),
+            '\'' => out.push_str("\"'\""),
+            c if c.is_whitespace() => {
+                out.push('"');
+                out.push(c);
+                out.push('"');
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Writes an argument list back as an editable command line. Inverse of
+/// [`split_args`]: what this produces, that one splits back identically.
+fn join_args(args: &[String]) -> String {
+    args.iter()
+        .map(|a| quote_arg(a))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Renders an `argv` for display, quoting whatever contains a space so that
 /// argument boundaries stay readable. A plain join would show a single path
 /// containing spaces exactly like two separate arguments.
@@ -8227,13 +8408,14 @@ const RECIPES: &[Recipe] = &[
         ctx: openers::CTX_FILE | openers::CTX_DIR,
         icon: openers::OpenerIcon::SevenZip,
     },
-    // Everything in ONE archive named after the folder — what archivers do for
-    // a multiple selection, and what `{files}` exists to make expressible.
+    // Everything in ONE archive, which `{files}` exists to make expressible.
+    // `{setname}` names it after the selected item when there is only one, and
+    // after the folder they share otherwise — what archivers do.
     Recipe {
         tool: "7z",
         label_key: "ow_recipe_compress_zip",
         programs: SEVEN_ZIP,
-        args: "a {dir}/{dirname}.zip {files}",
+        args: "a {dir}/{setname}.zip {files}",
         ctx_exts: &[openers::CTX_EXT_ALL],
         ctx: openers::CTX_FILE | openers::CTX_DIR,
         icon: openers::OpenerIcon::SevenZip,
@@ -8266,7 +8448,7 @@ const RECIPES: &[Recipe] = &[
         tool: "tar",
         label_key: "ow_recipe_compress_targz",
         programs: &["tar"],
-        args: "-czf {dir}/{dirname}.tar.gz -C {dir} {names}",
+        args: "-czf {dir}/{setname}.tar.gz -C {dir} {names}",
         ctx_exts: &[openers::CTX_EXT_ALL],
         ctx: openers::CTX_FILE | openers::CTX_DIR,
         icon: openers::OpenerIcon::Archive,
@@ -8855,6 +9037,41 @@ fn resolve_fav_dir(window: &MainWindow, p: &Path, lang: Lang) -> Option<PathBuf>
     Some(target)
 }
 
+/// Returns a sidebar place only when Favnyr can navigate it without a
+/// potentially blocking local probe. Network paths are validated by listing.
+fn resolve_sidebar_place_dir(path: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(path);
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    (favnyr_core::places::is_network_path(&path) || path.is_dir()).then_some(path)
+}
+
+/// Opens a new default tab at an exact gap in any existing view.
+fn open_path_in_tab_at(
+    window: &MainWindow,
+    state: &AppState,
+    path: PathBuf,
+    panel: i32,
+    gap: i32,
+) -> bool {
+    let Some(panel) = usize::try_from(panel).ok() else {
+        return false;
+    };
+    {
+        let mut panels = state.panels.borrow_mut();
+        let Some(target) = panels.get_mut(panel) else {
+            return false;
+        };
+        target
+            .tabs
+            .insert_tab_at(gap.max(0) as usize, Tab::new(path.clone()));
+    }
+    *state.active_panel.borrow_mut() = panel;
+    load_directory(window, state, &path, false);
+    true
+}
+
 /// Opens a favorite path in a NEW tab of the active view: folder →
 /// tab on the folder; file → tab on its parent (we locate it, we
 /// don't execute it). Path not found → "notice" toast.
@@ -8998,6 +9215,18 @@ fn fav_drag_target(cur_y: f32, row_top: f32, row_idx: i32, count: i32) -> (i32, 
         1
     };
     (ti, zone)
+}
+/// A release outside the visible favorites tree has no reorder target. The
+/// geometric helper clamps by design for edge scrolling, so this semantic gate
+/// must run before its result is allowed to mutate the tree.
+fn fav_drop_target(
+    commit_reorder: bool,
+    cur_y: f32,
+    row_top: f32,
+    row_idx: i32,
+    count: i32,
+) -> Option<(i32, i32)> {
+    commit_reorder.then(|| fav_drag_target(cur_y, row_top, row_idx, count))
 }
 
 /// Applies a node move based on the computed target/zone. Returns
@@ -10050,9 +10279,8 @@ fn on_tab_received(window: &MainWindow, state: &AppState, payload: &str) {
     {
         let mut panels = state.panels.borrow_mut();
         let book = &mut panels[panel].tabs;
-        let at = gap.unwrap_or(book.tabs.len()).min(book.tabs.len());
-        book.tabs.insert(at, tab);
-        book.active = at;
+        let at = gap.unwrap_or(book.tabs.len());
+        book.insert_tab_at(at, tab);
     }
     *state.active_panel.borrow_mut() = panel;
     info!(path = %path.display(), panel, "tab received from another instance");
@@ -10088,10 +10316,7 @@ fn move_tab_between(
 
     // Insert into the target.
     {
-        let dst = &mut panels[target].tabs;
-        let at = insert_at.min(dst.tabs.len());
-        dst.tabs.insert(at, tab);
-        dst.active = at;
+        panels[target].tabs.insert_tab_at(insert_at, tab);
     }
 
     // Source emptied (it was its last tab) → close the source panel.
@@ -10139,7 +10364,6 @@ fn split_with_tab(
 
     // 1. Extract the tab from the source panel.
     let tab = panels[source_panel].tabs.tabs.remove(from_tab);
-    let path = tab.current_path.clone();
     {
         let b = &mut panels[source_panel].tabs;
         if !b.tabs.is_empty() && b.active >= b.tabs.len() {
@@ -10155,32 +10379,12 @@ fn split_with_tab(
     let inherited_cols = panels[source_panel].columns.clone();
     let inherited_mode = panels[source_panel].tab_bar_mode;
     let inherited_vbar = panels[source_panel].vbar_user_w;
-    let (rows_model, rendered_rows_model) = new_row_models();
-    panels.push(Panel {
-        tabs: TabBook {
-            tabs: vec![tab],
-            active: 0,
-        },
-        rows_model,
-        rendered_rows_model,
-        rows_revision: Cell::new(0),
-        viewport_reset_gen: Cell::new(0),
-        viewport_top: Cell::new(0.0),
-        viewport_height: Cell::new(DEFAULT_RENDER_VIEWPORT_HEIGHT),
-        rendered_first: Cell::new(0),
-        rendered_end: Cell::new(0),
-        displayed_path: path,
-        columns: inherited_cols,
-        hidden_count: 0,
-        unavailable: false,
-        tabs_viewport_x: 0.0,
-        tab_bar_mode: inherited_mode,
-        vbar_user_w: inherited_vbar,
-        pending_initial: false,
-        pending_listing: false,
-        listing_gen: 0,
-        pending_select: None,
-    });
+    panels.push(Panel::from_tab(
+        tab,
+        inherited_cols,
+        inherited_mode,
+        inherited_vbar,
+    ));
 
     // 3. Split the target leaf in the tree.
     let ok = state
@@ -10212,7 +10416,44 @@ fn split_with_tab(
     true
 }
 
-/// True if `name` can't be used as a copy name: empty,
+/// Splits a target view with a newly opened directory from the sidebar. Unlike
+/// `split_with_tab`, no source view is consumed: the panel count always grows
+/// by one, and the new view inherits the target chrome.
+fn split_with_path(
+    state: &AppState,
+    path: PathBuf,
+    target_panel: usize,
+    dir: SplitDir,
+    new_first: bool,
+) -> bool {
+    let mut panels = state.panels.borrow_mut();
+    if target_panel >= panels.len() || panels.len() >= MAX_PANELS {
+        return false;
+    }
+
+    let new_idx = panels.len();
+    let inherited_cols = panels[target_panel].columns.clone();
+    let inherited_mode = panels[target_panel].tab_bar_mode;
+    let inherited_vbar = panels[target_panel].vbar_user_w;
+    let panel = Panel::from_tab(
+        Tab::new(path),
+        inherited_cols,
+        inherited_mode,
+        inherited_vbar,
+    );
+    if !state
+        .layout
+        .borrow_mut()
+        .split_leaf(target_panel, dir, new_idx, 0.5, new_first)
+    {
+        return false;
+    }
+    panels.push(panel);
+    *state.active_panel.borrow_mut() = new_idx;
+    true
+}
+
+/// True if `name` cannot be used as a copy name: empty,
 /// a path separator, `.`/`..`, or already present in the target folder.
 fn paste_name_invalid(state: &AppState, name: &str) -> bool {
     if name.is_empty() || name.contains('/') || name.contains('\\') || name == "." || name == ".." {
@@ -15832,6 +16073,49 @@ mod tests {
         assert_eq!(split_args(r#"a "" b"#), ["a", "", "b"]);
     }
 
+    /// Reopening a saved command must not change what it runs. The arguments
+    /// are stored split, so putting them back in the field means writing a
+    /// command line again — and a plain join silently turned one quoted path
+    /// into as many arguments as it had spaces.
+    #[test]
+    fn an_argument_list_survives_the_trip_through_the_field() {
+        let cases: Vec<Vec<String>> = vec![
+            // The case that broke: a wrapper taking a quoted path with spaces,
+            // then the file.
+            vec!["run".into(), "folder 01/my app.exe".into(), "{file}".into()],
+            // A tag standing alone must stay alone, or the command stops
+            // running once for the whole selection.
+            vec!["a".into(), "{dir}/{dirname}.7z".into(), "{files}".into()],
+            // Each quote character on its own, then both at once — the last
+            // one cannot be wrapped and takes the piecewise path.
+            vec!["it's here".into()],
+            vec![r#"say "hi""#.into()],
+            vec![r#"it's "quoted" here"#.into()],
+            // An empty argument is a real argument.
+            vec!["a".into(), String::new(), "b".into()],
+            vec!["plain".into()],
+        ];
+        for args in cases {
+            assert_eq!(
+                split_args(&join_args(&args)),
+                args,
+                "round trip changed {args:?} (written as {:?})",
+                join_args(&args)
+            );
+        }
+    }
+
+    /// The common cases stay readable: quoting only what needs it is what
+    /// makes the field editable by hand afterwards.
+    #[test]
+    fn quoting_is_added_only_where_it_is_needed() {
+        assert_eq!(join_args(&["a".into(), "b".into()]), "a b");
+        assert_eq!(join_args(&["{file}".into()]), "{file}");
+        assert_eq!(join_args(&["b c".into()]), r#""b c""#);
+        assert_eq!(join_args(&["it's".into()]), r#""it's""#);
+        assert_eq!(join_args(&[r#"say "hi""#.into()]), r#"'say "hi"'"#);
+    }
+
     #[test]
     fn the_preview_keeps_argument_boundaries_visible() {
         // A single path containing spaces must not read as two arguments.
@@ -15943,7 +16227,10 @@ mod tests {
 
     #[test]
     fn contextual_open_and_duplicate_share_adjacent_tab_insertion() {
-        let mut book = TabBook::single(PathBuf::from("A"));
+        let mut book = TabBook {
+            tabs: vec![Tab::new(PathBuf::from("A"))],
+            active: 0,
+        };
         book.open(PathBuf::from("B"));
         book.open(PathBuf::from("C"));
         assert!(book.select(0));
@@ -15968,6 +16255,106 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["A", "X", "B", "B", "C"].map(Path::new)
         );
+    }
+
+    #[test]
+    fn an_external_location_is_inserted_at_the_claimed_tab_gap() {
+        let mut book = TabBook {
+            tabs: vec![Tab::new(PathBuf::from("A"))],
+            active: 0,
+        };
+        book.open(PathBuf::from("C"));
+
+        let inserted = book.insert_tab_at(1, Tab::new(PathBuf::from("B")));
+        assert_eq!(inserted, 1);
+        assert_eq!(book.active, 1);
+        assert_eq!(
+            book.tabs
+                .iter()
+                .map(|tab| tab.current_path.as_path())
+                .collect::<Vec<_>>(),
+            ["A", "B", "C"].map(Path::new)
+        );
+
+        let appended = book.insert_tab_at(usize::MAX, Tab::new(PathBuf::from("D")));
+        assert_eq!(appended, 3);
+        assert_eq!(book.active, 3);
+    }
+
+    #[test]
+    fn favorite_rows_distinguish_directories_files_and_missing_targets() {
+        let root =
+            std::env::temp_dir().join(format!("favnyr-favorite-kind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let folder = root.join("folder01");
+        let file = root.join("file01.bin");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&file, b"data").unwrap();
+        let row = |path: &Path| FlatFav {
+            id: "favorite01".into(),
+            name: "Favorite".into(),
+            path: path.display().to_string(),
+            is_container: false,
+            depth: 0,
+            expanded: false,
+            has_children: false,
+        };
+
+        let directory = flat_to_favnode(&row(&folder));
+        assert!(directory.available);
+        assert!(directory.is_dir);
+
+        let regular_file = flat_to_favnode(&row(&file));
+        assert!(regular_file.available);
+        assert!(!regular_file.is_dir);
+
+        let missing = flat_to_favnode(&row(&root.join("missing")));
+        assert!(!missing.available);
+        assert!(!missing.is_dir);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_sidebar_directory_split_creates_a_new_view_with_target_chrome() {
+        let state = AppState::new_at(Config::default(), PathBuf::from("folder01"), 2);
+        let expected_columns = {
+            let mut panels = state.panels.borrow_mut();
+            panels[0].vbar_user_w = 184.0;
+            panels[0].columns.clone()
+        };
+
+        assert!(split_with_path(
+            &state,
+            PathBuf::from("folder02"),
+            0,
+            SplitDir::Row,
+            true,
+        ));
+
+        let panels = state.panels.borrow();
+        assert_eq!(panels.len(), 2);
+        assert_eq!(*state.active_panel.borrow(), 1);
+        assert_eq!(
+            panels[1].tabs.tabs[0].current_path,
+            PathBuf::from("folder02")
+        );
+        assert_eq!(panels[1].tab_bar_mode, 2);
+        assert_eq!(panels[1].vbar_user_w, 184.0);
+        assert_eq!(panels[1].columns, expected_columns);
+        drop(panels);
+        assert_eq!(state.layout.borrow().leaf_indices(), vec![1, 0]);
+    }
+
+    #[test]
+    fn a_favorite_drop_outside_its_visible_tree_has_no_reorder_target() {
+        let clamped = fav_drag_target(-1000.0, 100.0, 1, 3);
+        assert_eq!(
+            clamped.0, 0,
+            "raw geometry deliberately clamps to the first row"
+        );
+        assert_eq!(fav_drop_target(false, -1000.0, 100.0, 1, 3), None);
+        assert_eq!(fav_drop_target(true, -1000.0, 100.0, 1, 3), Some(clamped));
     }
 
     #[test]
@@ -16961,6 +17348,38 @@ mod tests {
             assert!(opener_matches_filter(&opener, needle), "{needle}");
         }
         assert!(!opener_matches_filter(&opener, "archiver"));
+    }
+
+    #[test]
+    fn picker_filter_is_trimmed_case_insensitive_and_non_destructive() {
+        let item = |id: &str, label: &str| OpenerItem {
+            id: id.into(),
+            label: label.into(),
+            available: true,
+            icon: Image::default(),
+            icon_kind: 0,
+        };
+        let cached = vec![
+            item("image", "Image Editor"),
+            item("reader", "Document Reader"),
+            item("browser", "Web Browser"),
+        ];
+
+        let visible = filtered_ow_picker_items(&cached, "  EDITOR ");
+        assert_eq!(
+            visible
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["image"]
+        );
+        assert!(filtered_ow_picker_items(&cached, "missing").is_empty());
+        assert_eq!(filtered_ow_picker_items(&cached, "").len(), cached.len());
+        assert_eq!(
+            cached.len(),
+            3,
+            "filtering must leave the full cache intact"
+        );
     }
 
     #[test]

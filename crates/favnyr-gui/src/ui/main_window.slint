@@ -133,6 +133,7 @@ export struct FavNode {
     expanded: bool,        // container expanded?
     has-children: bool,    // container: has at least one child (chevron)
     available: bool,       // favorite: path exists? (false = greyed out)
+    is-dir: bool,          // favorite: existing target is a directory
 }
 
 // A list column. `id` = code ("name"/"path"/"size"/"modified"…),
@@ -670,6 +671,7 @@ export struct Strings {
     ow-tag-file: string,
     ow-tag-dir: string,
     ow-tag-dirname: string,
+    ow-tag-setname: string,
     ow-tag-name: string,
     ow-tag-stem: string,
     ow-tag-ext: string,
@@ -682,6 +684,7 @@ export struct Strings {
     ow-launch: string,
     ow-default-ext: string,
     ow-set-default: string,     // "Set as default" checkbox of the app picker
+    ow-display-other-apps: string, // Linux picker: include launchers without MimeType
     ow-used-ext: string,        // "Suggested in Open with for these extensions"
     ow-default-ext-placeholder: string,
     ow-used-ext-placeholder: string,
@@ -1901,6 +1904,38 @@ component EditLineEdit inherits LineEdit {
             }
         }
         return reject;
+    }
+}
+
+// Search input shared by filterable lists. The standard LineEdit owns text
+// editing and its single clear action; callers only provide the filter callback.
+component SearchField inherits Rectangle {
+    in property <string> placeholder-text;
+    in-out property <string> text;
+    callback edited(string);
+
+    height: 32px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: Theme.surface;
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 6px;
+        spacing: 6px;
+        Image {
+            width: 14px;
+            height: 14px;
+            y: (parent.height - self.height) / 2;
+            source: @image-url("../../assets/icons/search.svg");
+            colorize: Theme.foreground.with-alpha(0.5);
+        }
+        search-input := EditLineEdit {
+            placeholder-text: root.placeholder-text;
+            horizontal-stretch: 1;
+            text <=> root.text;
+            edited(value) => { root.edited(value); }
+        }
     }
 }
 
@@ -3521,6 +3556,12 @@ component PanelComponent inherits Rectangle {
     /// ITS OWN preview, and thus display the line in the cross-view
     /// target panel.
     in property <bool> drag-active: false;
+    // A real tab and a directory location can target panel zones. A favorite
+    // pointing to a file remains limited to tab gaps.
+    in property <bool> drag-panel-zones: true;
+    // Center remains an append target even when no new panel can be created;
+    // edge previews must reflect the actual split capacity.
+    in property <bool> drag-panel-split-edges: true;
     /// Absolute X position of the mouse during the drag (propagated from
     /// MainWindow). Each panel compares it with its tabs-row to know
     /// whether the mouse is within its tab zone.
@@ -3810,6 +3851,7 @@ component PanelComponent inherits Rectangle {
     /// Emitted (synchronously) on every gap claim — MainWindow stores
     /// (gap, panel) for cross-view drop.
     callback tab-gap-claimed(int);
+    callback tab-gap-cleared();
     function report-tab-drop(i: int, x: length) {
         root.tab-drop-idx = i;
         root.tab-drop-x = x;
@@ -3824,6 +3866,9 @@ component PanelComponent inherits Rectangle {
         (!root.drag-active || !root.drag-over || !root.drag-in-bar)
         ? -1
         : root.tab-drop-idx;
+    changed drag-preview-idx => {
+        if (root.drag-preview-idx < 0) { root.tab-gap-cleared(); }
+    }
 
     // Callbacks emitted to MainWindow (which dispatches to the active panel).
     callback activate();
@@ -6162,7 +6207,9 @@ component PanelComponent inherits Rectangle {
     // nothing; the drag stays driven by the tab).
     // No plate when the tab insertion line is active (header):
     // strip → insertion line; body → zone plate. Clean separation.
-    if root.drag-over && root.drag-zone > 0 && root.drag-preview-idx < 0 : Rectangle {
+    if root.drag-panel-zones && root.drag-over
+            && (root.drag-zone == 1 || root.drag-panel-split-edges)
+            && root.drag-zone > 0 && root.drag-preview-idx < 0 : Rectangle {
         // Candidate plate.
         Rectangle {
             x: root.drag-zone == 3 ? root.width / 2 : 0px;
@@ -6836,6 +6883,11 @@ component SidebarItem inherits Rectangle {
     callback clicked();
     callback middle-clicked();                 // open in a new tab
     callback right-clicked(length, length);   // absolute position
+    callback drag-started(length, length);
+    callback drag-moved(length, length);
+    callback drag-dropped(length, length);
+    in property <bool> drag-active: false;
+    in property <bool> draggable: true;
     in property <string> label;
     in property <int> kind;   // 0 folder · 1 home · 2 drive · 3 trash · 4 network · 5 phone · 6 unmounted volume · 7 locked volume
     in property <int> space-level: -1;   // -1 = unmeasurable → no gauge at all
@@ -6851,6 +6903,13 @@ component SidebarItem inherits Rectangle {
     /// compiler rejects outright. The panel width is set by the user and
     /// depends on nothing below it, which breaks the cycle at the source.
     in property <length> panel-width;
+    property <length> down-abs-x;
+    property <length> down-abs-y;
+    property <bool> dragging: false;
+    property <bool> suppress-click: false;
+    changed drag-active => {
+        if (!root.drag-active) { root.dragging = false; }
+    }
 
     // The row trades detail for room as the panel narrows: full figures, then
     // free space alone — the bar already carries the ratio, so the total is
@@ -6877,6 +6936,7 @@ component SidebarItem inherits Rectangle {
 
     height: 30px;
     border-radius: Tokens.radius-row;
+    opacity: root.dragging ? 0.45 : 1.0;
     // Both areas count: the gauge's sits on top of the row's, so over the
     // gauge only IT reports hover — without this the row would lose its
     // highlight exactly where the pointer is.
@@ -6969,26 +7029,61 @@ component SidebarItem inherits Rectangle {
     // Button handling for the row, shared by the two touch areas below so that
     // clicking the gauge behaves exactly like clicking anywhere else on the
     // row — one implementation, not a copy that can drift.
-    function dispatch-pointer(ev: PointerEvent, abs-x: length, abs-y: length) {
+    function dispatch-pointer(
+        ev: PointerEvent, abs-x: length, abs-y: length, inside: bool
+    ) {
         // LEFT click on the sidebar closes menus; right-click (drive/
-        // trash menu) does not bump → it can teleport the menu.
-        if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+        // trash menu) does not bump, so it can teleport the menu.
+        if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down) {
             Dismiss.serial += 1;
+            root.down-abs-x = abs-x;
+            root.down-abs-y = abs-y;
+            root.dragging = false;
+            root.suppress-click = false;
+        }
+        if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.up) {
+            if (root.dragging) {
+                root.drag-dropped(abs-x, abs-y);
+            } else if (inside && !root.suppress-click) {
+                root.clicked();
+            }
+            root.dragging = false;
+            root.suppress-click = false;
         }
         if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
             root.right-clicked(abs-x, abs-y);
         }
-        // Middle-click → open the target in a NEW tab (active view).
+        // Middle-click opens the target in a new tab, unchanged by the drag.
         if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.middle) {
             root.middle-clicked();
         }
     }
+    function dispatch-move(pressed: bool, abs-x: length, abs-y: length) {
+        if (!pressed || !root.draggable) { return; }
+        if (!root.dragging
+                && (abs(abs-x - root.down-abs-x) > 6px
+                    || abs(abs-y - root.down-abs-y) > 6px)) {
+            root.dragging = true;
+            root.suppress-click = true;
+            Tip.text = "";
+            root.drag-started(abs-x, abs-y);
+        }
+        if (root.dragging) {
+            root.drag-moved(abs-x, abs-y);
+        }
+    }
 
     touch := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.clicked(); }
+        mouse-cursor: root.dragging ? grabbing : pointer;
         pointer-event(ev) => {
             root.dispatch-pointer(ev,
+                self.absolute-position.x + self.mouse-x,
+                self.absolute-position.y + self.mouse-y,
+                self.mouse-x >= 0px && self.mouse-x <= self.width
+                    && self.mouse-y >= 0px && self.mouse-y <= self.height);
+        }
+        moved => {
+            root.dispatch-move(self.pressed,
                 self.absolute-position.x + self.mouse-x,
                 self.absolute-position.y + self.mouse-y);
         }
@@ -7028,9 +7123,15 @@ component SidebarItem inherits Rectangle {
                 Tip.text = "";
             }
         }
-        clicked => { root.clicked(); }
         pointer-event(ev) => {
             root.dispatch-pointer(ev,
+                self.absolute-position.x + self.mouse-x,
+                self.absolute-position.y + self.mouse-y,
+                self.mouse-x >= 0px && self.mouse-x <= self.width
+                    && self.mouse-y >= 0px && self.mouse-y <= self.height);
+        }
+        moved => {
+            root.dispatch-move(self.pressed,
                 self.absolute-position.x + self.mouse-x,
                 self.absolute-position.y + self.mouse-y);
         }
@@ -7231,11 +7332,15 @@ component Sidebar inherits Rectangle {
     in property <bool> header-visible: true;
     in property <bool> reorder-drag-active: false;
     in property <int> reorder-drag-source: -1;
+    in property <bool> item-drag-active: false;
     /// Width of the side panel, forwarded to the rows — see `SidebarItem`.
     in property <length> panel-width;
     callback place-clicked(string, int);   // (path, kind)
     callback place-middle-clicked(string, int);   // (path, kind) → new tab
     callback place-right-clicked(string, int, bool, bool, string, length, length);   // (path, kind, removable, hotplug, device, x, y)
+    callback place-drag-started(length, length);
+    callback place-drag-moved(length, length);
+    callback place-drag-dropped(string, int, length, length);
     callback section-toggled();
     callback section-drag-started(int, length, length);
     callback section-drag-moved(int, length, length);
@@ -7282,11 +7387,14 @@ component Sidebar inherits Rectangle {
                     padding-left: 6px;
                     padding-right: 6px;
                     padding-top: 2px;
-                    SidebarItem {
+                    place-item := SidebarItem {
                         label: p.kind == 1 ? root.strings.sidebar-home
                             : p.kind == 3 ? root.strings.sidebar-trash
                             : (p.kind == 2 && p.label == "") ? root.strings.sidebar-root
                             : p.label;
+                        draggable: p.path != ""
+                            && (p.kind == 0 || p.kind == 1 || p.kind == 2 || p.kind == 4);
+                        drag-active: root.item-drag-active;
                         kind: p.kind;
                         space-level: p.space-level;
                         space-used-ratio: p.space-used-ratio;
@@ -7297,6 +7405,9 @@ component Sidebar inherits Rectangle {
                         clicked => { root.place-clicked(p.path, p.kind); }
                         middle-clicked => { root.place-middle-clicked(p.path, p.kind); }
                         right-clicked(x, y) => { root.place-right-clicked(p.path, p.kind, p.removable, p.hotplug, p.device, x, y); }
+                        drag-started(x, y) => { root.place-drag-started(x, y); }
+                        drag-moved(x, y) => { root.place-drag-moved(x, y); }
+                        drag-dropped(x, y) => { root.place-drag-dropped(p.path, p.kind, x, y); }
                     }
                 }
             }
@@ -7312,6 +7423,8 @@ component FavRow inherits Rectangle {
     in property <bool> selected;
     in property <int> row-index;                // position in the visible list
     in property <bool> drag-active;             // a reorder drag is in progress
+    in property <bool> location-drag-active: false;
+    in property <bool> reorder-feedback-visible: true;
     in property <int> drag-target-index;        // current target row (-1 = none)
     in property <int> drag-zone;                // 0 before · 1 inside · 2 after
     // Target of a tab or file drag: this container is hovered and the
@@ -7323,8 +7436,8 @@ component FavRow inherits Rectangle {
     callback right-clicked(length, length);
     // Drag: (source row-index, absolute cursor y, top y of THIS row). The bridge
     // computes the target/zone in f32 (reliable) and performs the move on drop.
-    callback drag-move(int, length, length);
-    callback drag-drop(int, length, length);
+    callback drag-move(int, length, length, length);
+    callback drag-drop(int, length, length, length);
 
     height: 30px;
     border-radius: Tokens.radius-row;
@@ -7332,15 +7445,19 @@ component FavRow inherits Rectangle {
     property <length> indent: 8px + min(root.node.depth, 5) * 14px;
     // "Drop INTO this container" highlight: internal (reorder) drag
     // OR a tab/file drag — same rendering.
-    property <bool> drop-into: (root.drag-active && root.drag-target-index == root.row-index
-        && root.drag-zone == 1 && root.node.is-container) || root.drop-hover;
+    property <bool> drop-into: (root.drag-active && root.reorder-feedback-visible
+        && root.drag-target-index == root.row-index && root.drag-zone == 1
+        && root.node.is-container) || root.drop-hover;
     property <length> ds-y;
     property <length> row-top;
     property <bool> dragging: false;
     // See the reorderable sections: a drag cut from outside takes this row's
     // own state with it, so it stops looking carried.
     changed drag-active => {
-        if (!root.drag-active) { root.dragging = false; }
+        if (!root.drag-active && !root.location-drag-active) { root.dragging = false; }
+    }
+    changed location-drag-active => {
+        if (!root.drag-active && !root.location-drag-active) { root.dragging = false; }
     }
 
     opacity: root.dragging ? 0.4 : 1.0;
@@ -7353,7 +7470,8 @@ component FavRow inherits Rectangle {
     border-color: Theme.accent-background.with-alpha(0.45);
 
     // Insertion bar (reorder before / after).
-    if root.drag-active && root.drag-target-index == root.row-index && root.drag-zone == 0 : Rectangle {
+    if root.drag-active && root.reorder-feedback-visible
+            && root.drag-target-index == root.row-index && root.drag-zone == 0 : Rectangle {
         y: 0;
         height: 2px;
         x: root.indent;
@@ -7361,7 +7479,8 @@ component FavRow inherits Rectangle {
         background: Theme.accent-background;
         border-radius: 1px;
     }
-    if root.drag-active && root.drag-target-index == root.row-index && root.drag-zone == 2 : Rectangle {
+    if root.drag-active && root.reorder-feedback-visible
+            && root.drag-target-index == root.row-index && root.drag-zone == 2 : Rectangle {
         y: parent.height - 2px;
         height: 2px;
         x: root.indent;
@@ -7387,7 +7506,10 @@ component FavRow inherits Rectangle {
                 if (root.dragging) {
                     // CURRENT top of the row (auto-corrects if the list moved
                     // during the drag, e.g. auto-expand of a hovered container).
-                    root.drag-drop(root.row-index, self.absolute-position.y + self.mouse-y, self.absolute-position.y);
+                    root.drag-drop(root.row-index,
+                        self.absolute-position.x + self.mouse-x,
+                        self.absolute-position.y + self.mouse-y,
+                        self.absolute-position.y);
                     root.dragging = false;
                 } else {
                     root.activate();
@@ -7409,7 +7531,10 @@ component FavRow inherits Rectangle {
                     root.dragging = true;
                 }
                 if (root.dragging) {
-                    root.drag-move(root.row-index, self.absolute-position.y + self.mouse-y, self.absolute-position.y);
+                    root.drag-move(root.row-index,
+                        self.absolute-position.x + self.mouse-x,
+                        self.absolute-position.y + self.mouse-y,
+                        self.absolute-position.y);
                 }
             }
         }
@@ -7481,6 +7606,7 @@ component FavPanel inherits Rectangle {
     in property <int> section-code: 2;
     in property <bool> reorder-drag-active: false;
     in property <int> reorder-drag-source: -1;
+    in property <bool> location-drag-active: false;
     callback section-drag-started(int, length, length);
     callback section-drag-moved(int, length, length);
     callback section-drag-dropped(int, length, length);
@@ -7501,7 +7627,24 @@ component FavPanel inherits Rectangle {
     // Absolute cursor Y captured continuously during an INTERNAL reorder drag
     // (a file/tab drag carries its own `drag-ay`). Feeds the edge auto-scroll so
     // an off-screen target row can be reached without releasing the drag.
+    property <length> reorder-cursor-x;
     property <length> reorder-cursor-y;
+    // Internal reorder feedback belongs to the visible favorites frame only.
+    // Keep the logical target alive outside it so releasing over a tab gap can
+    // still turn a favorite into a tab, without flashing a clamped reorder bar.
+    property <bool> reorder-in-x:
+        !(root.drag-active && root.shown && !root.section-collapsed) ? false
+        : (root.reorder-cursor-x >= fav-scroll.absolute-position.x
+            && root.reorder-cursor-x <= fav-scroll.absolute-position.x + fav-scroll.width);
+    property <bool> reorder-in-frame:
+        !root.reorder-in-x ? false
+        : (root.reorder-cursor-y >= fav-scroll.absolute-position.y
+            && root.reorder-cursor-y <= fav-scroll.absolute-position.y + fav-scroll.height);
+    // Exposes the exact reorder commit area so the global drag indicator uses
+    // the same target decision as the release handler.
+    out property <bool> reorder-hover-panel: root.reorder-in-frame;
+    out property <length> reorder-drag-abs-x: root.reorder-cursor-x;
+    out property <length> reorder-drag-abs-y: root.reorder-cursor-y;
     // Index of the row hovered by the drag (uniform pitch 30 + 1px = 31px), or
     // -1. CRITICAL (→): every `absolute-position` read is CONFINED
     // to the "drag active" branch of the ternary → never evaluated outside a drag (the
@@ -7578,8 +7721,8 @@ component FavPanel inherits Rectangle {
     callback row-activate(string);
     callback row-middle(string);
     callback row-context(string, bool, string, length, length);   // id, is-container, label, x, y
-    callback row-drag-move(int, length, length);           // (row-index, cur-y, row-top)
-    callback row-drag-drop(int, length, length);
+    callback row-drag-move(int, length, length, length); // row, abs-x, cur-y, row-top
+    callback row-drag-drop(int, length, length, length, bool); // final bool: in visible tree
     callback new-container();
     callback collapse-all();
     callback expand-all();
@@ -7678,6 +7821,8 @@ component FavPanel inherits Rectangle {
                     selected: n.id == root.selected-id;
                     row-index: i;
                     drag-active: root.drag-active;
+                    location-drag-active: root.location-drag-active;
+                    reorder-feedback-visible: root.reorder-in-frame;
                     drag-target-index: root.drag-target-index;
                     drag-zone: root.drag-zone;
                     // Highlighted if THIS container is the row targeted by a drag
@@ -7686,8 +7831,16 @@ component FavPanel inherits Rectangle {
                     activate => { root.row-activate(n.id); }
                     middle-clicked => { root.row-middle(n.id); }
                     right-clicked(x, y) => { root.row-context(n.id, n.is-container, n.label, x, y); }
-                    drag-move(ri, cy, rt) => { root.reorder-cursor-y = cy; root.row-drag-move(ri, cy, rt); }
-                    drag-drop(ri, cy, rt) => { root.row-drag-drop(ri, cy, rt); }
+                    drag-move(ri, cx, cy, rt) => {
+                        root.reorder-cursor-x = cx;
+                        root.reorder-cursor-y = cy;
+                        root.row-drag-move(ri, cx, cy, rt);
+                    }
+                    drag-drop(ri, cx, cy, rt) => {
+                        root.reorder-cursor-x = cx;
+                        root.reorder-cursor-y = cy;
+                        root.row-drag-drop(ri, cx, cy, rt, root.reorder-in-frame);
+                    }
                 }
             }
             }   // closes content-rect
@@ -7705,7 +7858,7 @@ component FavPanel inherits Rectangle {
         // its `viewport-y` would leave it scrolled past the content (empty on
         // re-expand). The component guards this too, belt and suspenders.
         active: !root.section-collapsed
-            && (root.drag-active || root.drag-in-x);
+            && ((root.drag-active && root.reorder-in-x) || root.drag-in-x);
         cursor-y: root.drag-active ? root.reorder-cursor-y : root.drag-ay;
         frame-y: fav-scroll.absolute-position.y;
         frame-h: fav-scroll.height;
@@ -8208,8 +8361,11 @@ export component MainWindow inherits Window {
         root.view-drag-source = -1;
         root.view-drag-target = -1;
         root.drag-active = false;
+        root.cancel-sidebar-item-drag();
         root.drag-target-panel = -1;
         root.drag-target-zone = 0;
+        root.drag-target-gap = -1;
+        root.drag-target-gap-panel = -1;
         root.drag-source-panel = -1;
         root.file-drag-active = false;
         root.file-drag-target-panel = -1;
@@ -8407,6 +8563,8 @@ export component MainWindow inherits Window {
     // True on Windows only (pushed by the bridge): gates the
     // "Open with…" entry (native picker), absent on other OSes.
     in property <bool> platform-windows: false;
+    // True only on Linux: gates Linux-specific application discovery controls.
+    in property <bool> platform-linux: false;
 
     // Open with -----
     in property <[OpenerItem]> openers-suggested;   // "Open with" submenu
@@ -8444,7 +8602,12 @@ export component MainWindow inherits Window {
     callback ow-pick(string /*key handler*/);       // choice → launches + captures
     callback ow-pick-browse();                      // browse the OS → saves + launches
     in property <[OpenerItem]> ow-picker-handlers;
+    in-out property <string> ow-picker-search-text: "";
+    callback ow-picker-search(string);
     in-out property <bool> ow-picker-open: false;
+    callback ow-picker-show-other-apps-changed(bool);
+    // Linux-only discovery of .desktop launchers without a MimeType declaration.
+    in-out property <bool> ow-picker-show-other-apps: false;
     // "Set as default": the chosen app becomes Favnyr's default for the
     // file's extension (overrides the OS). Unchecked on every opening.
     in-out property <bool> ow-picker-set-default: false;
@@ -8520,8 +8683,6 @@ export component MainWindow inherits Window {
     in property <string> ow-popup-preview: "";       // resolved preview (set by the bridge)
     // How many processes the command will start, already worded by the bridge.
     in property <string> ow-popup-runs: "";
-    // Meaning of the tag currently hovered, shown next to the tag row.
-    property <string> owp-hovered-tag: "";
     in property <bool> ow-popup-valid: false;        // valid program (set by the bridge)
     // Promotion toast after the native dialog (Windows).
     in-out property <bool> ow-promote-visible: false;
@@ -8923,6 +9084,79 @@ export component MainWindow inherits Window {
     in-out property <length> sidebar-width: 210px;
     callback sidebar-place-clicked(string, int);   // (path, kind)
     callback place-open-new-tab(string, int);      // (path, kind) → new tab (active view)
+    // A navigable location dropped on a tab gap or onto a panel. Favorite ids
+    // use kind -1; the bridge resolves their stored path before acting.
+    callback sidebar-item-dropped(string, int, int, int, int);
+    in-out property <bool> sidebar-item-drag-active: false;
+    // True only for sources that designate a directory. A favorite pointing to
+    // a file may still become a tab at an exact gap, but never a panel drop.
+    in-out property <bool> sidebar-item-split-capable: false;
+    property <bool> sidebar-item-panel-drop-valid:
+        root.sidebar-item-drag-active
+        && root.sidebar-item-split-capable
+        && root.drag-target-panel >= 0
+        && root.drag-target-zone > 0
+        && (root.drag-target-zone == 1 || root.can-add-panel);
+    // Mirrors every successful release: exact tab gap, panel center/edge, or
+    // an internal favorite reorder. The no-drop pill therefore cannot conflict
+    // with an insertion line or split preview.
+    property <bool> sidebar-item-drop-will-cancel:
+        root.sidebar-item-drag-active
+        && !(root.drag-target-gap-panel >= 0 && root.drag-target-gap >= 0)
+        && !root.sidebar-item-panel-drop-valid
+        && !(root.fav-drag-active && fav-panel.reorder-hover-panel);
+    // Containers and unavailable favorite locations only support tree
+    // reordering. Once outside that tree, releasing cannot perform an action.
+    property <bool> favorite-reorder-drop-will-cancel:
+        root.fav-drag-active
+        && !root.sidebar-item-drag-active
+        && !fav-panel.reorder-hover-panel;
+    function begin-sidebar-item-drag(
+        abs-x: length, abs-y: length, can-split: bool
+    ) {
+        root.drag-abs-x = abs-x;
+        root.drag-abs-y = abs-y;
+        root.drag-source-panel = -1;
+        root.drag-target-panel = -1;
+        root.drag-target-zone = 0;
+        root.drag-target-gap = -1;
+        root.drag-target-gap-panel = -1;
+        root.sidebar-item-split-capable = can-split;
+        root.sidebar-item-drag-active = true;
+    }
+    function update-sidebar-item-drag(abs-x: length, abs-y: length) {
+        if (!root.sidebar-item-drag-active) { return; }
+        root.drag-abs-x = abs-x;
+        root.drag-abs-y = abs-y;
+    }
+    function cancel-sidebar-item-drag() {
+        root.sidebar-item-drag-active = false;
+        root.sidebar-item-split-capable = false;
+        root.drag-target-panel = -1;
+        root.drag-target-zone = 0;
+        root.drag-target-gap = -1;
+        root.drag-target-gap-panel = -1;
+        root.drag-source-panel = -1;
+    }
+    function finish-sidebar-item-drag(
+        source: string, kind: int, abs-x: length, abs-y: length
+    ) -> bool {
+        if (!root.sidebar-item-drag-active) { return false; }
+        root.update-sidebar-item-drag(abs-x, abs-y);
+        let gap-panel: int = root.drag-target-gap-panel;
+        let gap: int = root.drag-target-gap;
+        let gap-accepted: bool = gap-panel >= 0 && gap >= 0;
+        let panel-accepted: bool = !gap-accepted && root.sidebar-item-panel-drop-valid;
+        let panel: int = gap-accepted ? gap-panel : root.drag-target-panel;
+        let drop-gap: int = gap-accepted ? gap : -1;
+        let drop-zone: int = panel-accepted ? root.drag-target-zone : 0;
+        let accepted: bool = gap-accepted || panel-accepted;
+        root.cancel-sidebar-item-drag();
+        if (accepted) {
+            root.sidebar-item-dropped(source, kind, panel, drop-gap, drop-zone);
+        }
+        return accepted;
+    }
     callback sidebar-refresh();                     // re-scans places
     callback poll-drives();                          // lightweight drive check: rebuilds only if changed
     // Cross-instance IPC init: `true` = initialized (the Timer stops),
@@ -8970,6 +9204,7 @@ export component MainWindow inherits Window {
             root.sidebar-refresh();
         } else {
             root.cancel-sidebar-section-drag();
+            root.cancel-sidebar-item-drag();
         }
     }
     // Auto-expand on drag: restarts the countdown when the
@@ -9025,7 +9260,7 @@ export component MainWindow inherits Window {
     callback fav-copy-path(string);
     // Drag reordering: delegated to the bridge (target/zone computed in f32).
     callback fav-drag-move(int, length, length);   // (row-index, cur-y, row-top)
-    callback fav-drag-drop(int, length, length);
+    callback fav-drag-drop(int, length, length, bool); // final bool: commit tree move
     // Context menu of a favorite node.
     in-out property <bool> fav-menu-open: false;
     in-out property <length> fav-menu-x;
@@ -9487,8 +9722,9 @@ export component MainWindow inherits Window {
                 // go out at once and the release then finds nothing to do. The
                 // pointer stays captured until the button comes up, which is
                 // what every toolkit does.
-                if (root.view-drag-active || root.drag-active || root.file-drag-active
-                        || root.fav-drag-active || root.sidebar-section-drag-active) {
+                if (root.view-drag-active || root.drag-active || root.sidebar-item-drag-active
+                        || root.file-drag-active || root.fav-drag-active
+                        || root.sidebar-section-drag-active) {
                     root.cancel-mouse-gestures();
                     return accept;
                 }
@@ -9688,8 +9924,14 @@ export component MainWindow inherits Window {
                             section-drag-started(section, x, y) => { root.start-sidebar-section-drag(section, x, y); }
                             section-drag-moved(section, x, y) => { root.update-sidebar-section-drag(section, x, y); }
                             section-drag-dropped(section, x, y) => { root.drop-sidebar-section-drag(section, x, y); }
+                            item-drag-active: root.sidebar-item-drag-active;
                             place-clicked(path, kind) => { root.sidebar-place-clicked(path, kind); }
                             place-middle-clicked(path, kind) => { root.place-open-new-tab(path, kind); }
+                            place-drag-started(x, y) => { root.begin-sidebar-item-drag(x, y, true); }
+                            place-drag-moved(x, y) => { root.update-sidebar-item-drag(x, y); }
+                            place-drag-dropped(path, kind, x, y) => {
+                                root.finish-sidebar-item-drag(path, kind, x, y);
+                            }
                             place-right-clicked(path, kind, removable, hotplug, device, x, y) => {
                                 root.open-sidebar-place-context(path, kind, removable, hotplug, device, x, y);
                             }
@@ -9710,8 +9952,14 @@ export component MainWindow inherits Window {
                             section-drag-started(section, x, y) => { root.start-sidebar-section-drag(section, x, y); }
                             section-drag-moved(section, x, y) => { root.update-sidebar-section-drag(section, x, y); }
                             section-drag-dropped(section, x, y) => { root.drop-sidebar-section-drag(section, x, y); }
+                            item-drag-active: root.sidebar-item-drag-active;
                             place-clicked(path, kind) => { root.sidebar-place-clicked(path, kind); }
                             place-middle-clicked(path, kind) => { root.place-open-new-tab(path, kind); }
+                            place-drag-started(x, y) => { root.begin-sidebar-item-drag(x, y, true); }
+                            place-drag-moved(x, y) => { root.update-sidebar-item-drag(x, y); }
+                            place-drag-dropped(path, kind, x, y) => {
+                                root.finish-sidebar-item-drag(path, kind, x, y);
+                            }
                             place-right-clicked(path, kind, removable, hotplug, device, x, y) => {
                                 root.open-sidebar-place-context(path, kind, removable, hotplug, device, x, y);
                             }
@@ -9740,6 +9988,7 @@ export component MainWindow inherits Window {
                             strings: root.strings;
                             selected-id: root.fav-selected-id;
                             drag-active: root.fav-drag-active;
+                            location-drag-active: root.sidebar-item-drag-active;
                             drag-target-index: root.fav-drag-target-index;
                             drag-zone: root.fav-drag-zone;
                             // TAB or FILE drag over the favorites
@@ -9775,8 +10024,33 @@ export component MainWindow inherits Window {
                                 // therefore leaves no persistent highlight.
                                 root.fav-menu-open = true;
                             }
-                            row-drag-move(ri, cy, rt) => { root.fav-drag-move(ri, cy, rt); }
-                            row-drag-drop(ri, cy, rt) => { root.fav-drag-drop(ri, cy, rt); }
+                            row-drag-move(ri, cx, cy, rt) => {
+                                root.fav-drag-move(ri, cy, rt);
+                                if (ri >= 0 && ri < root.fav-nodes.length
+                                        && !root.fav-nodes[ri].is-container
+                                        && root.fav-nodes[ri].available) {
+                                    if (!root.sidebar-item-drag-active) {
+                                        root.begin-sidebar-item-drag(cx, cy, root.fav-nodes[ri].is-dir);
+                                    } else {
+                                        root.update-sidebar-item-drag(cx, cy);
+                                    }
+                                }
+                            }
+                            row-drag-drop(ri, cx, cy, rt, in-favorites) => {
+                                let tab-drop-accepted: bool =
+                                    ri >= 0 && ri < root.fav-nodes.length
+                                    && !root.fav-nodes[ri].is-container
+                                    && root.fav-nodes[ri].available
+                                    && root.finish-sidebar-item-drag(
+                                        root.fav-nodes[ri].id, -1, cx, cy);
+                                if (!tab-drop-accepted && root.sidebar-item-drag-active) {
+                                    root.cancel-sidebar-item-drag();
+                                }
+                                // Every release finalizes the reorder drag, but only
+                                // the visible favorites frame may commit a tree move.
+                                root.fav-drag-drop(
+                                    ri, cy, rt, !tab-drop-accepted && in-favorites);
+                            }
                             can-collapse: root.fav-can-collapse;
                             // Header "+" → root container creation popup.
                             new-container => { root.open-fav-name(false, "", ""); }
@@ -9799,8 +10073,14 @@ export component MainWindow inherits Window {
                             section-drag-started(section, x, y) => { root.start-sidebar-section-drag(section, x, y); }
                             section-drag-moved(section, x, y) => { root.update-sidebar-section-drag(section, x, y); }
                             section-drag-dropped(section, x, y) => { root.drop-sidebar-section-drag(section, x, y); }
+                            item-drag-active: root.sidebar-item-drag-active;
                             place-clicked(path, kind) => { root.sidebar-place-clicked(path, kind); }
                             place-middle-clicked(path, kind) => { root.place-open-new-tab(path, kind); }
+                            place-drag-started(x, y) => { root.begin-sidebar-item-drag(x, y, true); }
+                            place-drag-moved(x, y) => { root.update-sidebar-item-drag(x, y); }
+                            place-drag-dropped(path, kind, x, y) => {
+                                root.finish-sidebar-item-drag(path, kind, x, y);
+                            }
                             place-right-clicked(path, kind, removable, hotplug, device, x, y) => {
                                 root.open-sidebar-place-context(path, kind, removable, hotplug, device, x, y);
                             }
@@ -9815,8 +10095,14 @@ export component MainWindow inherits Window {
                             section-code: -1;
                             title: "";
                             header-visible: false;
+                            item-drag-active: root.sidebar-item-drag-active;
                             place-clicked(path, kind) => { root.sidebar-place-clicked(path, kind); }
                             place-middle-clicked(path, kind) => { root.place-open-new-tab(path, kind); }
+                            place-drag-started(x, y) => { root.begin-sidebar-item-drag(x, y, true); }
+                            place-drag-moved(x, y) => { root.update-sidebar-item-drag(x, y); }
+                            place-drag-dropped(path, kind, x, y) => {
+                                root.finish-sidebar-item-drag(path, kind, x, y);
+                            }
                             place-right-clicked(path, kind, removable, hotplug, device, x, y) => {
                                 root.open-sidebar-place-context(path, kind, removable, hotplug, device, x, y);
                             }
@@ -9978,7 +10264,11 @@ export component MainWindow inherits Window {
                     active: idx == root.active-panel-idx;
                     can-close: root.panels.length > 1;
                     strings: root.strings;
-                    drag-active: root.drag-active;
+                    drag-active: root.drag-active || root.sidebar-item-drag-active;
+                    drag-panel-zones: root.drag-active
+                        || (root.sidebar-item-drag-active
+                            && root.sidebar-item-split-capable);
+                    drag-panel-split-edges: root.drag-active || root.can-add-panel;
                     drag-abs-x: root.drag-abs-x;
                     drag-abs-y: root.drag-abs-y;
                     tab-tooltip-enabled: root.tab-tooltip-enabled;
@@ -9988,6 +10278,9 @@ export component MainWindow inherits Window {
                         if (self.drag-zone > 0) {
                             root.drag-target-panel = idx;
                             root.drag-target-zone = self.drag-zone;
+                        } else if (root.drag-target-panel == idx) {
+                            root.drag-target-panel = -1;
+                            root.drag-target-zone = 0;
                         }
                     }
                     // File drag'n'drop between views ---
@@ -10228,6 +10521,12 @@ export component MainWindow inherits Window {
                     tab-gap-claimed(g) => {
                         root.drag-target-gap = g;
                         root.drag-target-gap-panel = idx;
+                    }
+                    tab-gap-cleared => {
+                        if (root.drag-target-gap-panel == idx) {
+                            root.drag-target-gap = -1;
+                            root.drag-target-gap-panel = -1;
+                        }
                     }
                     request-focus => { key-scope.focus(); }
                     navigate-to(p) => { root.navigate-to(p); }
@@ -10930,8 +11229,8 @@ export component MainWindow inherits Window {
         if root.ow-picker-open : Rectangle {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
-            width: 440px;
-            height: 420px;
+            width: min(440px, parent.width - 24px);
+            height: min(420px, parent.height - 24px);
             background: Theme.background;
             border-radius: 8px;
             border-width: 1px;
@@ -10945,11 +11244,28 @@ export component MainWindow inherits Window {
             VerticalBox {
                 padding: 18px;
                 spacing: 10px;
-                Text {
-                    text: root.strings.ow-choose;
-                    font-size: 16px;
-                    font-weight: 700;
-                    color: Theme.foreground;
+                HorizontalLayout {
+                    spacing: 12px;
+                    Text {
+                        text: root.strings.ow-choose;
+                        font-size: 16px;
+                        font-weight: 700;
+                        color: Theme.foreground;
+                        min-width: 0px;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    if root.platform-linux : CheckBox {
+                        text: root.strings.ow-display-other-apps;
+                        checked <=> root.ow-picker-show-other-apps;
+                        toggled => { root.ow-picker-show-other-apps-changed(self.checked); }
+                    }
+                }
+                picker-search := SearchField {
+                    placeholder-text: root.strings.ow-search-placeholder;
+                    text <=> root.ow-picker-search-text;
+                    edited(value) => { root.ow-picker-search(value); }
                 }
                 Rectangle {
                     vertical-stretch: 1;
@@ -10962,7 +11278,9 @@ export component MainWindow inherits Window {
                             padding: 6px;
                             spacing: 1px;
                             if root.ow-picker-handlers.length == 0 : Text {
-                                text: root.strings.ow-empty;
+                                text: root.ow-picker-search-text == ""
+                                    ? root.strings.ow-empty
+                                    : root.strings.ow-no-results;
                                 font-size: 12px;
                                 color: Theme.foreground.with-alpha(0.45);
                                 height: 40px;
@@ -12474,52 +12792,11 @@ export component MainWindow inherits Window {
                             // Header: search + reset all
                             HorizontalLayout {
                                 spacing: 8px;
-                                Rectangle {
-                                    height: 32px;
+                                SearchField {
                                     horizontal-stretch: 1;
-                                    border-radius: 6px;
-                                    border-width: 1px;
-                                    border-color: Theme.border;
-                                    background: Theme.surface;
-                                    HorizontalLayout {
-                                        padding-left: 8px;
-                                        padding-right: 6px;
-                                        spacing: 6px;
-                                        Image {
-                                            width: 14px;
-                                            height: 14px;
-                                            y: (parent.height - self.height) / 2;
-                                            source: @image-url("../../assets/icons/search.svg");
-                                            colorize: Theme.foreground.with-alpha(0.5);
-                                        }
-                                        sc-search := EditLineEdit {
-                                            placeholder-text: root.strings.shortcut-search-placeholder;
-                                            horizontal-stretch: 1;
-                                            text <=> root.shortcut-search-text;
-                                            edited(t) => { root.shortcut-search(t); }
-                                        }
-                                        if root.shortcut-search-text != "" : Rectangle {
-                                            width: 18px;
-                                            Image {
-                                                width: 12px;
-                                                height: 12px;
-                                                x: (parent.width - self.width) / 2;
-                                                y: (parent.height - self.height) / 2;
-                                                source: @image-url("../../assets/icons/close.svg");
-                                                colorize: Theme.foreground.with-alpha(0.6);
-                                            }
-                                            TouchArea {
-                                                clicked => { root.shortcut-search-text = ""; root.shortcut-search(""); }
-                                                pointer-event(ev) => {
-                                                    // Same rule as the rows: consumed here, so reported here.
-                                                    if (ev.kind == PointerEventKind.down
-                                                            && ev.button == PointerEventButton.left) {
-                                                        Dismiss.serial += 1;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                                    placeholder-text: root.strings.shortcut-search-placeholder;
+                                    text <=> root.shortcut-search-text;
+                                    edited(value) => { root.shortcut-search(value); }
                                 }
                                 if root.shortcut-has-overrides : Rectangle {
                                     height: 32px;
@@ -12826,48 +13103,11 @@ export component MainWindow inherits Window {
                         if root.ow-subtab == 0 : HorizontalLayout {
                             height: 32px;
                             spacing: 8px;
-                            Rectangle {
-                                height: 32px;
+                            SearchField {
                                 horizontal-stretch: 1;
-                                border-radius: 6px;
-                                border-width: 1px;
-                                border-color: Theme.border;
-                                background: Theme.surface;
-                                HorizontalLayout {
-                                    padding-left: 8px;
-                                    padding-right: 6px;
-                                    spacing: 6px;
-                                    Image {
-                                        width: 14px;
-                                        height: 14px;
-                                        y: (parent.height - self.height) / 2;
-                                        source: @image-url("../../assets/icons/search.svg");
-                                        colorize: Theme.foreground.with-alpha(0.5);
-                                    }
-                                    ow-search := EditLineEdit {
-                                        placeholder-text: root.strings.ow-search-placeholder;
-                                        horizontal-stretch: 1;
-                                        text <=> root.opener-search-text;
-                                        edited(t) => { root.opener-search(t); }
-                                    }
-                                    if root.opener-search-text != "" : Rectangle {
-                                        width: 18px;
-                                        Image {
-                                            width: 12px;
-                                            height: 12px;
-                                            x: (parent.width - self.width) / 2;
-                                            y: (parent.height - self.height) / 2;
-                                            source: @image-url("../../assets/icons/close.svg");
-                                            colorize: Theme.foreground.with-alpha(0.6);
-                                        }
-                                        TouchArea {
-                                            clicked => {
-                                                root.opener-search-text = "";
-                                                root.opener-search("");
-                                            }
-                                        }
-                                    }
-                                }
+                                placeholder-text: root.strings.ow-search-placeholder;
+                                text <=> root.opener-search-text;
+                                edited(value) => { root.opener-search(value); }
                             }
                             Rectangle {
                                 width: owadd-txt.preferred-width + 22px;
@@ -14460,18 +14700,39 @@ export component MainWindow inherits Window {
 
         // ===== Drag-and-drop indicator — pill following the cursor =====
         // Icon, tint and label reflect the action in real time. It rides a FILE
-        // drag anywhere, and a TAB drag only while it hovers the favorites (where
-        // the drop bookmarks the tab's folder). Over the favorites, ANY drag reads
-        // as "Add to favorites"; otherwise the file action drives it: open with
-        // the executable target, copy (Ctrl), or move/menu.
-        if root.file-drag-active || (root.drag-active && fav-panel.hover-panel) : drag-pill := Rectangle {
+        // drag anywhere, a TAB drag while it hovers the favorites, and a sidebar
+        // location drag while no tab gap or panel zone can accept it. A
+        // favorite that only supports reordering uses the same forbidden state
+        // outside its tree. Over the favorites, a file/tab drag reads as "Add to
+        // favorites"; otherwise the file action drives it: open with the
+        // executable target, copy (Ctrl), or move/menu.
+        if root.file-drag-active
+                || (root.drag-active && fav-panel.hover-panel)
+                || root.sidebar-item-drop-will-cancel
+                || root.favorite-reorder-drop-will-cancel : drag-pill := Rectangle {
             // A drag over the favorites bookmarks the target — same for a file
             // or a tab drag — which outranks the file-specific move/copy states.
             property <bool> over-fav: fav-panel.hover-panel;
-            // Beside the cursor (not underneath). The file drag carries
-            // `file-drag-abs`, a tab drag carries `drag-abs`; they never overlap.
-            x: (root.file-drag-active ? root.file-drag-abs-x : root.drag-abs-x) + 14px;
-            y: (root.file-drag-active ? root.file-drag-abs-y : root.drag-abs-y) + 12px;
+            // File drags and non-droppable location/reorder drags share the
+            // same compact forbidden state. Valid sidebar and favorite targets
+            // already have an insertion line or panel preview, so this is only
+            // a no-op.
+            property <bool> will-cancel:
+                root.file-drop-will-cancel
+                || root.sidebar-item-drop-will-cancel
+                || root.favorite-reorder-drop-will-cancel;
+            // Beside the cursor (not underneath). File, location and pure
+            // favorite-reorder drags each contribute their live coordinates.
+            x: (root.file-drag-active
+                ? root.file-drag-abs-x
+                : (root.favorite-reorder-drop-will-cancel
+                    ? fav-panel.reorder-drag-abs-x
+                    : root.drag-abs-x)) + 14px;
+            y: (root.file-drag-active
+                ? root.file-drag-abs-y
+                : (root.favorite-reorder-drop-will-cancel
+                    ? fav-panel.reorder-drag-abs-y
+                    : root.drag-abs-y)) + 12px;
             width: drag-feedback-row.preferred-width + 18px;
             height: 26px;
             border-radius: 7px;
@@ -14480,7 +14741,7 @@ export component MainWindow inherits Window {
             // element (no separate floating badge) → lighter display.
             background: drag-pill.over-fav
                 ? Theme.accent-background
-                : (root.file-drop-will-cancel
+                : (drag-pill.will-cancel
                     ? Tokens.danger
                     : (root.file-drag-target-exec
                         ? Tokens.warning
@@ -14502,7 +14763,7 @@ export component MainWindow inherits Window {
                         y: (parent.height - self.height) / 2;
                         source: drag-pill.over-fav
                             ? @image-url("../../assets/icons/bookmark.svg")
-                            : (root.file-drop-will-cancel
+                            : (drag-pill.will-cancel
                                 ? @image-url("../../assets/icons/no-drop.svg")
                                 : (root.file-drag-target-exec
                                     ? @image-url("../../assets/icons/application.svg")
@@ -14515,7 +14776,7 @@ export component MainWindow inherits Window {
                 // Non-droppable zone shows only the "forbidden" icon → no label
                 // (the pill shrinks to a round dot). The favorites case always
                 // labels ("Add to favorites").
-                if drag-pill.over-fav || !root.file-drop-will-cancel : Text {
+                if drag-pill.over-fav || !drag-pill.will-cancel : Text {
                     text: drag-pill.over-fav
                         ? root.strings.drop-favorite
                         : (root.file-drag-target-exec
@@ -14829,6 +15090,7 @@ export component MainWindow inherits Window {
                         { tag: "{file}", hint: root.strings.ow-tag-file },
                         { tag: "{dir}", hint: root.strings.ow-tag-dir },
                         { tag: "{dirname}", hint: root.strings.ow-tag-dirname },
+                        { tag: "{setname}", hint: root.strings.ow-tag-setname },
                         { tag: "{name}", hint: root.strings.ow-tag-name },
                         { tag: "{stem}", hint: root.strings.ow-tag-stem },
                         { tag: "{ext}", hint: root.strings.ow-tag-ext },
@@ -14859,30 +15121,13 @@ export component MainWindow inherits Window {
                             }
                             changed has-hover => {
                                 if (self.has-hover) {
-                                    root.owp-hovered-tag = t.hint;
                                     Tip.text = t.hint;
                                     Tip.x = self.absolute-position.x;
                                     Tip.y = self.absolute-position.y - 26px;
                                 } else if (Tip.text == t.hint) {
-                                    root.owp-hovered-tag = "";
                                     Tip.text = "";
                                 }
                             }
-                        }
-                    }
-                    // The row leaves room to spare: spend it on the hovered
-                    // tag's meaning, so learning the six tags doesn't require
-                    // six separate hovers.
-                    Rectangle {
-                        horizontal-stretch: 1;
-                        Text {
-                            x: 0;
-                            height: parent.height;
-                            text: root.owp-hovered-tag;
-                            font-size: 10px;
-                            color: Theme.foreground.with-alpha(0.55);
-                            vertical-alignment: center;
-                            overflow: elide;
                         }
                     }
                 }

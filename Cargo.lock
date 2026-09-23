@@ -1284,7 +1284,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "favnyr-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "dirs",
  "image",
@@ -1299,7 +1299,7 @@ dependencies = [
 
 [[package]]
 name = "favnyr-gui"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "arboard",

@@ -90,7 +90,7 @@ mod imp {
         }
     }
 
-    pub fn handlers_for_ext(ext: &str) -> Vec<AppHandler> {
+    pub fn handlers_for_ext(ext: &str, _include_without_mime: bool) -> Vec<AppHandler> {
         if ext.is_empty() {
             return Vec::new();
         }
@@ -472,7 +472,8 @@ mod imp {
         pub name: String,
         pub exec: String,
         pub mimes: String,
-        pub nodisplay: bool,
+        /// A higher-priority entry marked as hidden disables this desktop ID.
+        pub hidden: bool,
         /// Theme icon name OR absolute path to an image file — both are legal,
         /// and the two are told apart when resolving, not here.
         pub icon: String,
@@ -514,8 +515,8 @@ mod imp {
                 entry.exec = v.to_string();
             } else if let Some(v) = line.strip_prefix("MimeType=") {
                 entry.mimes = v.to_string();
-            } else if let Some(v) = line.strip_prefix("NoDisplay=") {
-                entry.nodisplay = v.eq_ignore_ascii_case("true");
+            } else if let Some(v) = line.strip_prefix("Hidden=") {
+                entry.hidden = v.eq_ignore_ascii_case("true");
             } else if let Some(v) = line.strip_prefix("Icon=") {
                 entry.icon = v.to_string();
             } else if let Some(v) = line.strip_prefix("Path=") {
@@ -624,7 +625,32 @@ mod imp {
         })
     }
 
-    pub fn handlers_for_ext(ext: &str) -> Vec<AppHandler> {
+    pub(super) fn desktop_matches_mime(
+        entry_mimes: &str,
+        mime: Option<&str>,
+        include_without_mime: bool,
+    ) -> bool {
+        let Some(mime) = mime else {
+            return true;
+        };
+        entry_mimes.split(';').any(|item| item.trim() == mime)
+            || (include_without_mime && entry_mimes.trim().is_empty())
+    }
+
+    pub(super) fn desktop_is_handler(
+        entry: &DesktopEntry,
+        mime: Option<&str>,
+        include_without_mime: bool,
+    ) -> bool {
+        // `NoDisplay` only keeps an entry out of application menus. MIME-specific
+        // launchers legitimately use it while remaining valid for "Open with".
+        !entry.hidden
+            && !entry.name.is_empty()
+            && !entry.exec.is_empty()
+            && desktop_matches_mime(&entry.mimes, mime, include_without_mime)
+    }
+
+    pub fn handlers_for_ext(ext: &str, include_without_mime: bool) -> Vec<AppHandler> {
         let mime = mime_for_ext(ext);
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -647,13 +673,9 @@ mod imp {
                     continue;
                 };
                 let entry = parse_desktop(&content);
-                if entry.nodisplay || entry.name.is_empty() || entry.exec.is_empty() {
-                    continue;
-                }
-                // Filter by MIME type if known; otherwise keep it (fallback).
-                if let Some(m) = mime
-                    && !entry.mimes.split(';').any(|x| x == m)
-                {
+                // Entries without a MIME declaration are optional; entries that
+                // explicitly declare another MIME type remain excluded.
+                if !desktop_is_handler(&entry, mime, include_without_mime) {
                     continue;
                 }
                 out.push(AppHandler {
@@ -684,12 +706,18 @@ mod imp {
             if argv.is_empty() {
                 return Err(anyhow::anyhow!("empty Exec for {key}"));
             }
-            let prog = argv.remove(0);
+            // The specification has no variables in `Exec`, so a strict reader
+            // is left with the literal text `$HOME/…`, which names no file.
+            // Hand-written launchers use them all the same and the desktops
+            // accept them, so the program is resolved the way Favnyr already
+            // resolves a path typed in the address bar. A bare command name
+            // comes back untouched and is still found on `PATH`.
+            let prog = favnyr_core::fs::expand_typed_path(&argv.remove(0));
             // An entry declaring no field code still has to receive the file.
             if !argv.iter().any(|a| a == &file) {
                 argv.push(file);
             }
-            return crate::actions::spawn_program(Path::new(&prog), &argv);
+            return crate::actions::spawn_program(&prog, &argv);
         }
         Err(anyhow::anyhow!("application not found: {key}"))
     }
@@ -720,12 +748,13 @@ mod imp {
         if argv.is_empty() {
             return Err(anyhow::anyhow!("no Exec in {}", path.display()));
         }
-        let program = argv.remove(0);
+        // Variables resolved as in `launch`, and for the same reason.
+        let program = favnyr_core::fs::expand_typed_path(&argv.remove(0));
 
         // `Path=` may be present but empty, which means "no preference".
         let work_dir = Some(entry.work_dir.as_str())
             .filter(|d| !d.is_empty())
-            .map(std::path::PathBuf::from);
+            .map(favnyr_core::fs::expand_typed_path);
 
         if entry.terminal {
             // Best effort: `-e <command>` is the option the usual terminals
@@ -734,7 +763,7 @@ mod imp {
             // all, silently.
             let term = crate::actions::pick_terminal()
                 .ok_or_else(|| anyhow::anyhow!("no terminal detected for {}", path.display()))?;
-            let mut term_argv = vec!["-e".to_string(), program];
+            let mut term_argv = vec!["-e".to_string(), program.display().to_string()];
             term_argv.extend(argv);
             return crate::actions::spawn_program_in(
                 Path::new(&term),
@@ -742,7 +771,7 @@ mod imp {
                 work_dir.as_deref(),
             );
         }
-        crate::actions::spawn_program_in(Path::new(&program), &argv, work_dir.as_deref())
+        crate::actions::spawn_program_in(&program, &argv, work_dir.as_deref())
     }
 
     /// Folders holding icon themes, in priority order: the user's own first, so
@@ -1082,8 +1111,8 @@ pub fn browse_for_exe(lang: Lang) -> Option<String> {
 }
 
 /// OS candidate applications for extension `ext` (no dot).
-pub fn handlers_for_ext(ext: &str) -> Vec<AppHandler> {
-    imp::handlers_for_ext(ext)
+pub fn handlers_for_ext(ext: &str, include_without_mime: bool) -> Vec<AppHandler> {
+    imp::handlers_for_ext(ext, include_without_mime)
 }
 
 /// Launches handler `key` on `path` (`ext` = the file's extension).
@@ -1115,6 +1144,87 @@ mod tests {
         apps.sort_by_key(|a| a.name.to_lowercase());
         let names: Vec<&str> = apps.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, ["Archiver", "EDITOR", "viewer"]);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn optional_mime_less_launchers_do_not_admit_incompatible_apps() {
+        use super::imp::desktop_matches_mime;
+
+        assert!(desktop_matches_mime("image/png;", Some("image/png"), false));
+        assert!(!desktop_matches_mime("", Some("image/png"), false));
+        assert!(desktop_matches_mime("", Some("image/png"), true));
+        assert!(!desktop_matches_mime(
+            "text/plain;",
+            Some("image/png"),
+            true
+        ));
+        assert!(desktop_matches_mime("text/plain;", None, false));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn no_display_mime_handlers_remain_available_but_hidden_entries_do_not() {
+        use super::imp::{desktop_is_handler, parse_desktop};
+
+        let menu_hidden_handler = parse_desktop(
+            "[Desktop Entry]\n\
+             Name=Document Viewer\n\
+             Exec=document-viewer %U\n\
+             MimeType=application/pdf;\n\
+             NoDisplay=true\n",
+        );
+        assert!(desktop_is_handler(
+            &menu_hidden_handler,
+            Some("application/pdf"),
+            false
+        ));
+
+        let disabled_handler = parse_desktop(
+            "[Desktop Entry]\n\
+             Name=Document Viewer\n\
+             Exec=document-viewer %U\n\
+             MimeType=application/pdf;\n\
+             Hidden=true\n",
+        );
+        assert!(!desktop_is_handler(
+            &disabled_handler,
+            Some("application/pdf"),
+            true
+        ));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_launcher_reaching_its_program_through_a_variable_still_starts() {
+        use super::imp::exec_argv;
+
+        // Splitting deliberately leaves the text alone: the Desktop Entry
+        // specification has no variables, so `Exec` is not a shell line.
+        let argv = exec_argv("$HOME/.local/bin/tool.sh --flag %f", Some("/tmp/doc.pdf"));
+        assert_eq!(argv[0], "$HOME/.local/bin/tool.sh");
+        assert_eq!(argv[1], "--flag");
+        assert_eq!(argv[2], "/tmp/doc.pdf");
+
+        // Resolving it is what makes the launcher usable, and it is the same
+        // resolution a path typed in the address bar gets. Hand-written
+        // launchers rely on it and the desktops accept them.
+        let home = dirs::home_dir().expect("a home folder");
+        assert_eq!(
+            favnyr_core::fs::expand_typed_path(argv[0].as_str()),
+            home.join(".local/bin/tool.sh")
+        );
+        assert_eq!(
+            favnyr_core::fs::expand_typed_path("~/tool.sh"),
+            home.join("tool.sh")
+        );
+
+        // A bare command name must come back untouched, or it would stop
+        // being resolved through PATH.
+        assert_eq!(
+            favnyr_core::fs::expand_typed_path("7z"),
+            std::path::PathBuf::from("7z")
+        );
     }
 
     #[cfg(not(windows))]
