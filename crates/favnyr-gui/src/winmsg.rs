@@ -85,6 +85,14 @@ mod imp {
 
     const WM_COPYDATA: u32 = 0x004A;
     const WM_DEVICECHANGE: u32 = 0x0219;
+    const WM_POWERBROADCAST: u32 = 0x0218;
+    /// Resume subtypes of `WM_POWERBROADCAST`. Both are broadcast to every
+    /// top-level window with no prior registration. Two of them because they
+    /// describe different ways back: `RESUMESUSPEND` follows a resume the user
+    /// asked for, `RESUMEAUTOMATIC` one the machine decided on — and a laptop
+    /// waking to its lock screen reports the second.
+    const PBT_APMRESUMESUSPEND: usize = 0x0007;
+    const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
     /// `DBT_DEVNODES_CHANGED`: a device was added to or removed from the
     /// machine. Windows broadcasts it to every top-level window WITHOUT any
     /// prior `RegisterDeviceNotification`, and it carries exactly the
@@ -140,6 +148,11 @@ mod imp {
         /// The set of devices attached to the machine changed → re-scan the
         /// portable devices. Sent by Windows, not by another instance.
         DevicesChanged,
+        /// The machine came back from sleep or hibernation. Sent by Windows.
+        /// Long-lived per-window registrations are re-asserted at this point:
+        /// the drop target survives an ordinary session, but a resume is where
+        /// it has been observed to stop being consulted.
+        PowerResumed,
     }
 
     /// Handler for incoming messages (on the UI thread).
@@ -211,6 +224,14 @@ mod imp {
             // this window must still receive it.
             if msg == WM_DEVICECHANGE && wparam == DBT_DEVNODES_CHANGED {
                 dispatch(Incoming::DevicesChanged);
+                return DefSubclassProc(hwnd, msg, wparam, lparam);
+            }
+            // Resume from sleep. Observed, never consumed, for the same reason
+            // as the device broadcast above.
+            if msg == WM_POWERBROADCAST
+                && (wparam == PBT_APMRESUMESUSPEND || wparam == PBT_APMRESUMEAUTOMATIC)
+            {
+                dispatch(Incoming::PowerResumed);
                 return DefSubclassProc(hwnd, msg, wparam, lparam);
             }
             if msg == WM_COPYDATA {
@@ -392,6 +413,7 @@ mod imp {
         Hover(i32, i32),
         HoverEnd,
         DevicesChanged,
+        PowerResumed,
     }
     /// No-op outside Windows (`true` = don't retry). Cross-instance IPC is
     /// Windows-only for now (Linux: window detection + IPC still to be defined).

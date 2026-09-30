@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Result, anyhow};
+use favnyr_core::fs as rfs;
 use favnyr_core::openers::{Opener, TagContext};
 use tracing::{debug, info};
 
@@ -447,14 +448,11 @@ pub fn run_opener(opener: &Opener, paths: &[PathBuf]) -> Result<()> {
         }
         return Ok(());
     }
-    // Same rule as the editor's validation: an absolute path, or (outside
-    // Windows) a bare command resolved through PATH. Testing `is_file()` here
-    // would reject `7z` — a name accepted at save time, and one `Command` knows
-    // how to resolve on its own.
-    if !program_is_valid(&opener.program) {
+    // Resolve exactly as the editor validates it. Keeping the stored text
+    // untouched lets environment changes apply to later launches.
+    let Some(program) = launchable_program_path(&opener.program) else {
         return Err(anyhow!("program not found: {}", opener.program));
-    }
-    let program = PathBuf::from(&opener.program);
+    };
     if paths.is_empty() {
         return spawn_detached(&program, opener.args.clone(), opener.elevated);
     }
@@ -510,14 +508,9 @@ pub fn run_opener_dir(opener: &Opener, dir: &Path) -> Result<()> {
     if let Some(assoc) = &opener.assoc {
         return crate::openwith::launch(assoc, "", dir);
     }
-    // Same rule as the editor's validation: an absolute path, or (outside
-    // Windows) a bare command resolved through PATH. Testing `is_file()` here
-    // would reject `7z` — a name accepted at save time, and one `Command` knows
-    // how to resolve on its own.
-    if !program_is_valid(&opener.program) {
+    let Some(program) = launchable_program_path(&opener.program) else {
         return Err(anyhow!("program not found: {}", opener.program));
-    }
-    let program = PathBuf::from(&opener.program);
+    };
     let mut ctx = TagContext::from_path(dir);
     ctx.dir = ctx.file.clone();
     spawn_detached(&program, opener.render_for_file(&ctx), opener.elevated)
@@ -1125,29 +1118,38 @@ pub fn resolve_program(candidates: &[&str]) -> Option<String> {
         .map(|c| (*c).to_string())
 }
 
-/// Is an opener's "Program" field launchable? An EXISTING file path
-/// (Windows case, where one browses to an `.exe`), OR — especially on
-/// Linux — a simple COMMAND resolvable via `PATH` (`viewer`, `editor`…).
-///
-/// A valid program isn't always a file path: a PATH command
-/// entered as-is (`viewer`, `editor`) is valid on Linux without
-/// being an existing file, unlike a Windows executable which is always
-/// resolved to an absolute path.
-pub fn program_is_valid(program: &str) -> bool {
-    let p = program.trim();
-    if p.is_empty() {
-        return false;
+/// Expands the platform's user-facing path syntax without changing the value
+/// persisted in the custom command.
+pub(crate) fn expand_program_path(program: &str) -> PathBuf {
+    rfs::expand_typed_path(program.trim())
+}
+
+/// Resolves a custom command's executable to the exact path passed to the OS.
+/// Outside Windows, a bare command may deliberately remain relative so
+/// [`Command`] can resolve it through `PATH`.
+fn launchable_program_path(program: &str) -> Option<PathBuf> {
+    let expanded = expand_program_path(program);
+    if expanded.as_os_str().is_empty() {
+        return None;
     }
-    if Path::new(p).is_file() {
-        return true;
+    if expanded.is_file() {
+        return Some(expanded);
     }
-    // Bare name (no path separator) → resolved via PATH, outside Windows
-    // (where an opener command is, by convention, an absolute path to the exe).
     #[cfg(not(windows))]
-    if !p.contains('/') {
-        return which(p);
+    if let Some(command) = expanded.to_str()
+        && !command.contains('/')
+        && which(command)
+    {
+        return Some(expanded);
     }
-    false
+    None
+}
+
+/// Is an opener's "Program" field launchable? An existing file path after
+/// expanding `~` and platform environment variables, or — especially on Linux
+/// — a simple command resolvable through `PATH` (`viewer`, `editor`…).
+pub fn program_is_valid(program: &str) -> bool {
+    launchable_program_path(program).is_some()
 }
 
 /// Is `ffmpeg` available to generate video thumbnails? On Windows,
@@ -1164,39 +1166,86 @@ pub fn ffmpeg_available() -> bool {
     }
 }
 
-/// State of `ffmpeg` for the Linux "Video thumbnails" settings section.
-/// `detected_distro`: index of the install command to highlight
-/// (0 Debian/Ubuntu · 1 Fedora · 2 Arch/Manjaro · 3 Alpine · -1 unknown).
 #[derive(Clone, Debug, Default)]
-pub struct FfmpegInfo {
+pub struct ToolInfo {
     pub available: bool,
     pub version: String,
-    pub flatpak: bool,
-    pub detected_distro: i32,
 }
 
-/// Detects `ffmpeg` (presence + version), the Flatpak sandbox, and the
-/// distribution family. Near-instant computations (a `which`, a `-version`, reading
-/// `/etc/os-release`) → can be called when settings open and on the
-/// "Recheck" button. On Windows, `ffmpeg` is never used: `available`
-/// stays true and the rest is empty (the section isn't shown there anyway).
-pub fn ffmpeg_info() -> FfmpegInfo {
-    let available = ffmpeg_available();
-    FfmpegInfo {
-        available,
-        version: if available {
-            ffmpeg_version().unwrap_or_default()
-        } else {
-            String::new()
-        },
-        flatpak: in_flatpak(),
-        detected_distro: detect_distro_index(),
+#[derive(Clone, Debug, Default)]
+pub struct OptionalToolsInfo {
+    pub ffmpeg: ToolInfo,
+    pub poppler: ToolInfo,
+    pub seven_zip: ToolInfo,
+    pub flatpak: bool,
+}
+
+/// Detects the optional Linux command-line tools only when the expandable
+/// settings card requests it. Windows uses native preview providers and does
+/// not display this card.
+pub fn optional_tools_info() -> OptionalToolsInfo {
+    #[cfg(windows)]
+    {
+        OptionalToolsInfo::default()
     }
+    #[cfg(not(windows))]
+    {
+        let ffmpeg = ffmpeg_available();
+        let poppler_program = resolve_program(&["pdftoppm", "pdftocairo"]);
+        let seven_zip_program = resolve_program(&["7zz", "7z", "7za"]);
+        OptionalToolsInfo {
+            ffmpeg: ToolInfo {
+                available: ffmpeg,
+                version: ffmpeg.then(ffmpeg_version).flatten().unwrap_or_default(),
+            },
+            poppler: tool_info(poppler_program.as_deref(), &["-v"]),
+            seven_zip: tool_info(seven_zip_program.as_deref(), &["i"]),
+            flatpak: in_flatpak(),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn tool_info(program: Option<&str>, args: &[&str]) -> ToolInfo {
+    let Some(program) = program else {
+        return ToolInfo::default();
+    };
+    let version = Command::new(program)
+        .args(args)
+        .output()
+        .ok()
+        .and_then(|output| {
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            version_token(&text)
+        })
+        .unwrap_or_default();
+    ToolInfo {
+        available: true,
+        version,
+    }
+}
+
+#[cfg(not(windows))]
+fn version_token(text: &str) -> Option<String> {
+    text.split_whitespace().find_map(|token| {
+        let token = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.');
+        let token = token.strip_prefix(['n', 'v']).unwrap_or(token);
+        (token.starts_with(|c: char| c.is_ascii_digit()) && token.contains('.')).then(|| {
+            token
+                .trim_end_matches(|c: char| !c.is_ascii_digit())
+                .to_string()
+        })
+    })
 }
 
 /// `ffmpeg` version cleaned up for display ("8.1.2"), read via
 /// `ffmpeg -version`. Tolerates distro package prefixes/suffixes
 /// ("n7.0.2" → "7.0.2", "4.4.2-0ubuntu…" → "4.4.2"). `None` if absent.
+#[cfg(not(windows))]
 fn ffmpeg_version() -> Option<String> {
     // Windows never uses ffmpeg → no spawn (settings also open on
     // Windows and trigger re-detection).
@@ -1227,42 +1276,11 @@ fn ffmpeg_version() -> Option<String> {
     }
 }
 
-/// Is Favnyr running inside a **Flatpak** sandbox? In that case, `ffmpeg`
-/// comes from the runtime: suggesting `apt`/`dnf`… on the host would be misleading.
+/// Is Favnyr running inside a **Flatpak** sandbox? Optional tools are then
+/// resolved inside its runtime rather than from the host.
+#[cfg(not(windows))]
 fn in_flatpak() -> bool {
     std::env::var_os("FLATPAK_ID").is_some() || Path::new("/.flatpak-info").exists()
-}
-
-/// Distribution family via `/etc/os-release` → install command index,
-/// or -1 if unrecognized. Usefully a no-op outside Linux (file absent).
-fn detect_distro_index() -> i32 {
-    distro_index_from(&std::fs::read_to_string("/etc/os-release").unwrap_or_default())
-}
-
-/// Resolves an `os-release`'s content into a command index (0 Debian · 1 Fedora ·
-/// 2 Arch · 3 Alpine · -1 unknown). Tests `ID` first, then the `ID_LIKE`
-/// tokens IN ORDER → Linux Mint (`ID_LIKE="ubuntu debian"`) lands on apt.
-/// Pure (testable), separate from the disk read.
-fn distro_index_from(content: &str) -> i32 {
-    let field = |key: &str| -> String {
-        content
-            .lines()
-            .find_map(|l| l.strip_prefix(key))
-            .map(|v| v.trim().trim_matches('"').to_ascii_lowercase())
-            .unwrap_or_default()
-    };
-    let id = field("ID=");
-    let id_like = field("ID_LIKE=");
-    for tok in std::iter::once(id.as_str()).chain(id_like.split_whitespace()) {
-        match tok {
-            "debian" | "ubuntu" => return 0,
-            "fedora" | "rhel" | "centos" => return 1,
-            "arch" | "manjaro" => return 2,
-            "alpine" => return 3,
-            _ => {}
-        }
-    }
-    -1
 }
 
 /// Offset (seconds) between LOCAL time and UTC, current DST included — to
@@ -1352,29 +1370,47 @@ pub fn local_utc_offset_secs() -> i64 {
 }
 
 #[cfg(test)]
-mod ffmpeg_tests {
-    use super::distro_index_from;
+mod opener_program_path_tests {
+    use super::expand_program_path;
+    #[cfg(not(windows))]
+    use super::version_token;
+    use std::path::PathBuf;
 
     #[test]
-    fn distro_resolution_covers_id_and_id_like() {
-        // Direct ID.
-        assert_eq!(distro_index_from("ID=ubuntu\n"), 0);
-        assert_eq!(distro_index_from("ID=fedora\n"), 1);
-        assert_eq!(distro_index_from("ID=arch\n"), 2);
-        assert_eq!(distro_index_from("ID=alpine\n"), 3);
-        assert_eq!(distro_index_from("ID=manjaro\n"), 2);
-        // Derivatives via ID_LIKE (Mint -> apt, Nobara -> dnf).
+    fn custom_programs_reuse_typed_path_expansion() {
+        let home = dirs::home_dir().unwrap_or_else(std::env::temp_dir);
+        assert_eq!(expand_program_path("~/bin/tool"), home.join("bin/tool"));
+        assert_eq!(expand_program_path("  tool  "), PathBuf::from("tool"));
+
+        #[cfg(not(windows))]
+        if let Ok(value) = std::env::var("HOME") {
+            assert_eq!(
+                expand_program_path("$HOME/bin/tool"),
+                PathBuf::from(value).join("bin/tool")
+            );
+        }
+        #[cfg(windows)]
+        if let Ok(value) = std::env::var("TEMP") {
+            assert_eq!(
+                expand_program_path(r"%TEMP%\bin\tool.exe"),
+                PathBuf::from(value).join("bin").join("tool.exe")
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn optional_tool_versions_are_read_from_their_native_output() {
         assert_eq!(
-            distro_index_from("ID=linuxmint\nID_LIKE=\"ubuntu debian\"\n"),
-            0
+            version_token("ffmpeg version n7.0.2-static"),
+            Some("7.0.2".into())
         );
-        assert_eq!(distro_index_from("ID=nobara\nID_LIKE=fedora\n"), 1);
-        assert_eq!(distro_index_from("ID=\"endeavouros\"\nID_LIKE=arch\n"), 2);
-        // Quotes, case, ID priority over ID_LIKE.
-        assert_eq!(distro_index_from("ID=Debian\nID_LIKE=whatever\n"), 0);
-        // Unknown / empty.
-        assert_eq!(distro_index_from("ID=void\n"), -1);
-        assert_eq!(distro_index_from(""), -1);
+        assert_eq!(
+            version_token("pdftoppm version 25.06.0"),
+            Some("25.06.0".into())
+        );
+        assert_eq!(version_token("7-Zip (z) 24.09 (x64)"), Some("24.09".into()));
+        assert_eq!(version_token("version unavailable"), None);
     }
 }
 

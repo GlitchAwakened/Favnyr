@@ -605,13 +605,16 @@ impl SortOrder {
 }
 
 /// Grouping by type, orthogonal to the sort criterion (column + direction).
-/// - `FoldersFirst` : folders on top, then files (default mode).
-/// - `FilesFirst`   : files on top, then folders.
-/// - `Mixed`        : no grouping, everything is sorted together by the criterion.
+/// - `FoldersFirst`        : folders on top, then files (default mode).
+/// - `ColoredFoldersFirst` : folders stay ahead of files; the GUI subdivides
+///   them into coloured and uncoloured blocks after resolving annotations.
+/// - `FilesFirst`          : files on top, then folders.
+/// - `Mixed`               : no grouping, everything is sorted together by the criterion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GroupMode {
     FoldersFirst,
+    ColoredFoldersFirst,
     FilesFirst,
     Mixed,
 }
@@ -620,6 +623,7 @@ impl GroupMode {
     pub fn code(self) -> &'static str {
         match self {
             GroupMode::FoldersFirst => "folders",
+            GroupMode::ColoredFoldersFirst => "colored",
             GroupMode::FilesFirst => "files",
             GroupMode::Mixed => "mixed",
         }
@@ -628,6 +632,7 @@ impl GroupMode {
     pub fn from_code(s: &str) -> Option<GroupMode> {
         Some(match s {
             "folders" => GroupMode::FoldersFirst,
+            "colored" => GroupMode::ColoredFoldersFirst,
             "files" => GroupMode::FilesFirst,
             "mixed" => GroupMode::Mixed,
             _ => return None,
@@ -637,10 +642,9 @@ impl GroupMode {
 
 /// Sorts in place according to the criterion (`column` + `order`) and the
 /// grouping by type (`group`). Grouping takes **priority** over the criterion:
-/// in `FoldersFirst`/`FilesFirst` mode, one group always precedes the other
-/// regardless of sort direction; the criterion only breaks ties within a
-/// group. In `Mixed` mode, folders and files are sorted together by the
-/// criterion alone.
+/// in every grouped mode, one group always precedes the other regardless of
+/// sort direction; the criterion only breaks ties within a group. In `Mixed`
+/// mode, folders and files are sorted together by the criterion alone.
 ///
 /// Sort by name: case-insensitive (consistent with the visual sort).
 pub fn sort(entries: &mut [Entry], column: SortColumn, order: SortOrder, group: GroupMode) {
@@ -652,7 +656,7 @@ pub fn sort(entries: &mut [Entry], column: SortColumn, order: SortOrder, group: 
     // descending). `Mixed` puts everything in one block.
     let rank = |e: &Entry| -> u8 {
         match group {
-            GroupMode::FoldersFirst => u8::from(!e.is_dir),
+            GroupMode::FoldersFirst | GroupMode::ColoredFoldersFirst => u8::from(!e.is_dir),
             GroupMode::FilesFirst => u8::from(e.is_dir),
             GroupMode::Mixed => 0,
         }
@@ -1373,6 +1377,24 @@ mod tests {
         let names: Vec<_> = v.iter().map(|e| e.name.as_str()).collect();
         // Files (alpha) then folders (alpha).
         assert_eq!(names, ["Bravo.png", "zeta.txt", "aaa-dir", "alpha-dir"]);
+    }
+
+    #[test]
+    fn sort_colored_folders_first_prepares_folder_and_file_blocks() {
+        let mut v = vec![
+            make_entry("zeta.txt", false),
+            make_entry("alpha-dir", true),
+            make_entry("Bravo.png", false),
+            make_entry("aaa-dir", true),
+        ];
+        sort(
+            &mut v,
+            SortColumn::Name,
+            SortOrder::Asc,
+            GroupMode::ColoredFoldersFirst,
+        );
+        let names: Vec<_> = v.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["aaa-dir", "alpha-dir", "Bravo.png", "zeta.txt"]);
     }
 
     #[test]

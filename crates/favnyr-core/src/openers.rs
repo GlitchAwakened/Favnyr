@@ -70,8 +70,10 @@ pub struct Opener {
     pub id: String,
     /// Displayed label ("Image Editor", "Text Editor"…).
     pub label: String,
-    /// ABSOLUTE path of the executable (never interpreted by a shell). Can be
-    /// empty if `assoc` is set (OS app with no directly launchable exe).
+    /// Executable as entered by the user (never interpreted by a shell). It may
+    /// use `~` and platform environment-variable syntax; the GUI expands those
+    /// only for validation and launch. Can be empty if `assoc` is set (OS app
+    /// with no directly launchable executable).
     pub program: String,
     /// Key of an OS association handler (Windows: ProgID/AUMID of a
     /// UWP/Store app; Linux: `.desktop` id) for apps WITHOUT a classic exe.
@@ -83,6 +85,10 @@ pub struct Opener {
     /// on execution and is omitted for ordinary custom commands.
     #[serde(default, skip_serializing_if = "OpenerIcon::is_none")]
     pub icon: OpenerIcon,
+    /// Opens the managed 7-Zip compression dialog instead of executing the
+    /// argument template. Passwords and per-run options are never persisted.
+    #[serde(default)]
+    pub archive_dialog: bool,
     /// Argument templates BEFORE substitution (one element = one argument).
     /// Empty → `{file}` added at execution time.
     #[serde(default)]
@@ -449,6 +455,7 @@ impl OpenerStore {
             program: program.trim().to_string(),
             assoc: None,
             icon: OpenerIcon::None,
+            archive_dialog: false,
             args,
             default_exts: Vec::new(),
             used_exts: Vec::new(),
@@ -472,6 +479,7 @@ impl OpenerStore {
             program: String::new(),
             assoc: Some(assoc.trim().to_string()),
             icon: OpenerIcon::None,
+            archive_dialog: false,
             args: Vec::new(),
             default_exts: Vec::new(),
             used_exts: Vec::new(),
@@ -517,6 +525,16 @@ impl OpenerStore {
     pub fn set_icon(&mut self, id: &str, icon: OpenerIcon) -> bool {
         if let Some(o) = self.openers.iter_mut().find(|o| o.id == id) {
             o.icon = icon;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Selects the managed compression dialog independently of the recipe label.
+    pub fn set_archive_dialog(&mut self, id: &str, enabled: bool) -> bool {
+        if let Some(opener) = self.openers.iter_mut().find(|opener| opener.id == id) {
+            opener.archive_dialog = enabled;
             true
         } else {
             false
@@ -569,6 +587,7 @@ impl OpenerStore {
             program: src.program.clone(),
             assoc: src.assoc.clone(),
             icon: src.icon,
+            archive_dialog: src.archive_dialog,
             args: src.args.clone(),
             default_exts: Vec::new(),
             used_exts: src.used_exts.clone(),
@@ -784,17 +803,22 @@ mod tests {
         let id = store.add("Compress", "/usr/bin/7z", vec!["a".into()]);
         assert_eq!(store.get(&id).unwrap().icon, OpenerIcon::None);
         assert!(store.set_icon(&id, OpenerIcon::SevenZip));
+        assert!(store.set_archive_dialog(&id, true));
+        assert!(!store.set_archive_dialog("unknown-id", true));
 
         let duplicate = store.duplicate(&id).unwrap();
         assert_eq!(store.get(&duplicate).unwrap().icon, OpenerIcon::SevenZip);
+        assert!(store.get(&duplicate).unwrap().archive_dialog);
 
         let serialized = toml::to_string_pretty(&store).unwrap();
         let restored: OpenerStore = toml::from_str(&serialized).unwrap();
         assert_eq!(restored.get(&id).unwrap().icon, OpenerIcon::SevenZip);
+        assert!(restored.get(&id).unwrap().archive_dialog);
 
         let legacy = "[[openers]]\nid = \"x\"\nlabel = \"X\"\nprogram = \"/bin/x\"\n";
         let restored_legacy: OpenerStore = toml::from_str(legacy).unwrap();
         assert_eq!(restored_legacy.get("x").unwrap().icon, OpenerIcon::None);
+        assert!(!restored_legacy.get("x").unwrap().archive_dialog);
         assert_eq!(OpenerIcon::from_i32(99), OpenerIcon::None);
     }
 
@@ -806,6 +830,7 @@ mod tests {
             program: "/usr/bin/7z".into(),
             assoc: None,
             icon: OpenerIcon::None,
+            archive_dialog: false,
             args: vec![],
             default_exts: vec![],
             used_exts: vec![],
@@ -874,6 +899,7 @@ mod tests {
             program: "/usr/bin/7z".into(),
             assoc: None,
             icon: OpenerIcon::None,
+            archive_dialog: false,
             args: vec!["a".into(), "{dir}/{setname}.zip".into(), "{files}".into()],
             default_exts: vec![],
             used_exts: vec![],
@@ -945,6 +971,7 @@ mod tests {
             program: "/usr/bin/7z".into(),
             assoc: None,
             icon: OpenerIcon::None,
+            archive_dialog: false,
             args: vec!["a".into(), "{dir}/{dirname}.7z".into(), "{files}".into()],
             default_exts: vec![],
             used_exts: vec![],
@@ -1010,6 +1037,7 @@ mod tests {
             program: "tar".into(),
             assoc: None,
             icon: OpenerIcon::None,
+            archive_dialog: false,
             args: vec![
                 "-czf".into(),
                 "{dir}/{dirname}.tar.gz".into(),

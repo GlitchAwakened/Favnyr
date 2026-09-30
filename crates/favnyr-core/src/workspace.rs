@@ -41,8 +41,8 @@ pub struct TabState {
     /// absent, `#[serde(default)]` hides hidden files.
     #[serde(default)]
     pub show_hidden: bool,
-    /// Grouping by type for this tab. When the field is absent, the
-    /// default value is "folders first".
+    /// Grouping mode for this tab. When the field is absent, the default value
+    /// is "folders first".
     #[serde(default = "default_group_mode")]
     pub group_mode: GroupMode,
     /// Thumbnail/row zoom level for this tab (Ctrl+wheel).
@@ -555,6 +555,21 @@ mod tests {
         let text = toml::to_string_pretty(&current).unwrap();
         let back: WorkspaceState = toml::from_str(&text).unwrap();
         assert_eq!(back.panels[0].tabs[0].zoom, Some(5));
+    }
+
+    #[test]
+    fn colored_folder_grouping_is_persisted() {
+        let mut workspace = sample();
+        workspace.panels[0].tabs[0].group_mode = GroupMode::ColoredFoldersFirst;
+
+        let serialized = toml::to_string_pretty(&workspace).unwrap();
+        assert!(serialized.contains("group_mode = \"coloredfoldersfirst\""));
+
+        let restored: WorkspaceState = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            restored.panels[0].tabs[0].group_mode,
+            GroupMode::ColoredFoldersFirst
+        );
     }
 
     #[test]

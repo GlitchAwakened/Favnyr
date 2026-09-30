@@ -197,6 +197,41 @@ impl FavStore {
         }
     }
 
+    /// Carries every favorite targeting an item in a renamed directory tree
+    /// to its new path. A default label attached directly to the renamed item
+    /// follows its new file name, while custom aliases and descendant labels
+    /// remain untouched.
+    pub fn relocate_paths(&mut self, from: &Path, to: &Path) -> bool {
+        let mut changed = false;
+        let renamed_default_label =
+            from.file_name()
+                .zip(to.file_name())
+                .map(|(old_name, new_name)| {
+                    (
+                        old_name.to_string_lossy().into_owned(),
+                        new_name.to_string_lossy().into_owned(),
+                    )
+                });
+        for node in &mut self.nodes {
+            let Some(path) = node.path.as_deref() else {
+                continue;
+            };
+            let path = Path::new(path);
+            if let Some(relocated) = crate::fs::ops::relocated_path(path, from, to) {
+                let targets_renamed_item = path.components().count() == from.components().count();
+                if targets_renamed_item
+                    && let Some((old_name, new_name)) = &renamed_default_label
+                    && node.name == *old_name
+                {
+                    node.name.clone_from(new_name);
+                }
+                node.path = Some(relocated.to_string_lossy().into_owned());
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Expands / collapses a container.
     pub fn set_expanded(&mut self, id: &str, expanded: bool) {
         if let Some(n) = self
@@ -406,6 +441,47 @@ mod tests {
         // Same path but a DIFFERENT container → absent (per-container dedup).
         let c2 = s.add_container("", "C2").unwrap();
         assert!(!s.container_has_path(&c2, "/home/u/proj"));
+    }
+
+    #[test]
+    fn relocating_favorites_preserves_aliases_and_unrelated_paths() {
+        let mut store = FavStore::default();
+        let container = store.add_container("", "Collection").unwrap();
+        store
+            .add_favorite(&container, "directory_a", "root/directory_a")
+            .unwrap();
+        store
+            .add_favorite(&container, "Custom alias", "root/directory_a")
+            .unwrap();
+        store
+            .add_favorite(&container, "Nested alias", "root/directory_a/nested")
+            .unwrap();
+        store
+            .add_favorite(&container, "Other", "root/directory_ab")
+            .unwrap();
+
+        assert!(store.relocate_paths(Path::new("root/directory_a"), Path::new("root/directory_b")));
+        // Compared as PATHS, not as text: relocation rebuilds them with the
+        // platform's own separator, which is not a fact about the relocation.
+        let favorites = store
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                node.path
+                    .as_deref()
+                    .map(|path| (node.name.as_str(), Path::new(path)))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            favorites,
+            vec![
+                ("directory_b", Path::new("root/directory_b")),
+                ("Custom alias", Path::new("root/directory_b")),
+                ("Nested alias", Path::new("root/directory_b/nested")),
+                ("Other", Path::new("root/directory_ab")),
+            ]
+        );
+        assert!(!store.relocate_paths(Path::new("root/missing"), Path::new("root/replacement")));
     }
 
     #[test]

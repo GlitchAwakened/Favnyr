@@ -21,14 +21,16 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 use windows::Win32::Foundation::{HGLOBAL, HWND, POINTL};
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+use windows::Win32::System::Com::StructuredStorage::{IStorage, StgCreateDocfile};
 use windows::Win32::System::Com::{
-    CoTaskMemFree, DVASPECT_CONTENT, FORMATETC, IDataObject, IStream, TYMED_HGLOBAL, TYMED_ISTREAM,
+    CoTaskMemFree, DVASPECT_CONTENT, FORMATETC, IDataObject, IStream, STGC_DEFAULT, STGM_CREATE,
+    STGM_READWRITE, STGM_SHARE_EXCLUSIVE, TYMED_HGLOBAL, TYMED_ISTORAGE, TYMED_ISTREAM,
 };
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Ole::{
-    CF_HDROP, DROPEFFECT_COPY, DROPEFFECT_NONE, IDropTarget, IDropTarget_Impl, OleInitialize,
-    RegisterDragDrop, ReleaseStgMedium, RevokeDragDrop,
+    CF_HDROP, DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE, IDropTarget, IDropTarget_Impl,
+    OleInitialize, RegisterDragDrop, ReleaseStgMedium, RevokeDragDrop,
 };
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
@@ -80,6 +82,9 @@ struct FavnyrDropTarget {
     /// Cheap format classification retained between `DragEnter` and `Drop`.
     /// No source-owned data is rendered until the user actually drops it.
     incoming_kind: Cell<IncomingDataKind>,
+    /// Original `DoDragDrop` effect mask captured before live feedback replaces
+    /// the in/out value with one selected effect.
+    allowed_effects: Cell<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -119,15 +124,66 @@ impl FavnyrDropTarget {
         }
     }
 
-    /// Selects COPY only when the source actually offered it. `pdwEffect` is
-    /// an input/output parameter: returning an effect outside the input mask
-    /// violates the OLE contract and can produce misleading cursor feedback.
-    fn set_effect(effect: *mut windows::Win32::System::Ole::DROPEFFECT, accepted: bool) -> bool {
+    /// Chooses the effect used only for live cursor feedback. Physical Shell
+    /// paths advertise MOVE by default so the native cursor and Favnyr's pill
+    /// agree with the menu that will open on release. Copy-only providers and
+    /// an explicit Ctrl modifier remain COPY.
+    fn choose_hover_effect(
+        allowed: windows::Win32::System::Ole::DROPEFFECT,
+        kind: IncomingDataKind,
+        copy_requested: bool,
+    ) -> windows::Win32::System::Ole::DROPEFFECT {
+        // The deferred Favnyr menu takes ownership of path strings only after
+        // OLE returns, so the final handoff must remain COPY. Reject a source
+        // that cannot support that safe handoff instead of advertising MOVE
+        // and then failing on release.
+        if !kind.accepted() || allowed.0 & DROPEFFECT_COPY.0 == 0 {
+            return DROPEFFECT_NONE;
+        }
+        if kind.copy_only() || copy_requested {
+            return Self::choose_copy_effect(allowed, true);
+        }
+        if allowed.0 & DROPEFFECT_MOVE.0 != 0 {
+            DROPEFFECT_MOVE
+        } else {
+            Self::choose_copy_effect(allowed, true)
+        }
+    }
+
+    /// Updates OLE's live feedback and returns whether Favnyr should render
+    /// the copy variant of its own drag indicator. `None` rejects the drop.
+    fn set_hover_effect(
+        effect: *mut windows::Win32::System::Ole::DROPEFFECT,
+        allowed: windows::Win32::System::Ole::DROPEFFECT,
+        kind: IncomingDataKind,
+        copy_requested: bool,
+    ) -> Option<bool> {
+        if effect.is_null() {
+            return None;
+        }
+        unsafe {
+            *effect = Self::choose_hover_effect(allowed, kind, copy_requested);
+            if *effect == DROPEFFECT_NONE {
+                None
+            } else {
+                Some(*effect == DROPEFFECT_COPY)
+            }
+        }
+    }
+
+    /// Final OLE handoff remains COPY because Favnyr opens its own action menu
+    /// after `Drop` returns. This prevents the source from deleting anything
+    /// before Favnyr executes the user's later Move/Copy/Link choice.
+    fn set_copy_effect(
+        effect: *mut windows::Win32::System::Ole::DROPEFFECT,
+        allowed: windows::Win32::System::Ole::DROPEFFECT,
+        accepted: bool,
+    ) -> bool {
         if effect.is_null() {
             return false;
         }
         unsafe {
-            *effect = Self::choose_copy_effect(*effect, accepted);
+            *effect = Self::choose_copy_effect(allowed, accepted);
             *effect == DROPEFFECT_COPY
         }
     }
@@ -154,12 +210,30 @@ impl IDropTarget_Impl for FavnyrDropTarget_Impl {
             .map(classify_incoming_data)
             .unwrap_or_default();
         self.incoming_kind.set(kind);
-        let accepted = FavnyrDropTarget::set_effect(effect, kind.accepted());
-        if accepted {
+        let allowed = FavnyrDropTarget::effect_value(effect);
+        self.allowed_effects.set(allowed);
+        let copy_requested = FavnyrDropTarget::ctrl_down(keys);
+        // One line per drag, not per move: `DragOver` is the chatty one. It
+        // records that Favnyr's own target WAS consulted and what it made of
+        // the source — the two questions a refused drag raises, and which
+        // cannot be told apart from the outside, the pointer showing the
+        // system's refusal either way.
+        debug!(
+            ?kind,
+            allowed = format!("0x{allowed:X}"),
+            copy_requested,
+            "OLE drag entered Favnyr"
+        );
+        if let Some(copy) = FavnyrDropTarget::set_hover_effect(
+            effect,
+            windows::Win32::System::Ole::DROPEFFECT(allowed),
+            kind,
+            copy_requested,
+        ) {
             (self.handler)(IncomingFileDrag::Hover {
                 screen_x: point.x,
                 screen_y: point.y,
-                copy: kind.copy_only() || FavnyrDropTarget::ctrl_down(keys),
+                copy,
             });
         }
         Ok(())
@@ -172,12 +246,15 @@ impl IDropTarget_Impl for FavnyrDropTarget_Impl {
         effect: *mut windows::Win32::System::Ole::DROPEFFECT,
     ) -> windows::core::Result<()> {
         let kind = self.incoming_kind.get();
-        let accepted = FavnyrDropTarget::set_effect(effect, kind.accepted());
-        if accepted {
+        let allowed = windows::Win32::System::Ole::DROPEFFECT(self.allowed_effects.get());
+        let copy_requested = FavnyrDropTarget::ctrl_down(keys);
+        if let Some(copy) =
+            FavnyrDropTarget::set_hover_effect(effect, allowed, kind, copy_requested)
+        {
             (self.handler)(IncomingFileDrag::Hover {
                 screen_x: point.x,
                 screen_y: point.y,
-                copy: kind.copy_only() || FavnyrDropTarget::ctrl_down(keys),
+                copy,
             });
         }
         Ok(())
@@ -185,6 +262,7 @@ impl IDropTarget_Impl for FavnyrDropTarget_Impl {
 
     fn DragLeave(&self) -> windows::core::Result<()> {
         self.incoming_kind.set(IncomingDataKind::None);
+        self.allowed_effects.set(0);
         (self.handler)(IncomingFileDrag::Leave);
         Ok(())
     }
@@ -196,7 +274,7 @@ impl IDropTarget_Impl for FavnyrDropTarget_Impl {
         point: &POINTL,
         effect: *mut windows::Win32::System::Ole::DROPEFFECT,
     ) -> windows::core::Result<()> {
-        let allowed_effect = FavnyrDropTarget::effect_value(effect);
+        let allowed_effect = self.allowed_effects.replace(0);
         let kind = self.incoming_kind.replace(IncomingDataKind::None);
         let mut paths = Vec::new();
         let mut staging = None;
@@ -242,13 +320,20 @@ impl IDropTarget_Impl for FavnyrDropTarget_Impl {
                 });
             }
         }
-        let accepted = FavnyrDropTarget::set_effect(effect, !paths.is_empty());
+        let accepted = FavnyrDropTarget::set_copy_effect(
+            effect,
+            windows::Win32::System::Ole::DROPEFFECT(allowed_effect),
+            !paths.is_empty(),
+        );
         if accepted {
+            let copy = kind.copy_only()
+                || FavnyrDropTarget::ctrl_down(keys)
+                || allowed_effect & DROPEFFECT_MOVE.0 == 0;
             (self.handler)(IncomingFileDrag::Drop {
                 paths,
                 screen_x: point.x,
                 screen_y: point.y,
-                copy: kind.copy_only() || FavnyrDropTarget::ctrl_down(keys),
+                copy,
                 staging,
             });
         } else if copy_allowed && kind.copy_only() {
@@ -395,6 +480,7 @@ pub fn init_drop_target(hwnd: isize, handler: impl Fn(IncomingFileDrag) + 'stati
         let target: IDropTarget = FavnyrDropTarget {
             handler: Box::new(handler),
             incoming_kind: Cell::new(IncomingDataKind::None),
+            allowed_effects: Cell::new(0),
         }
         .into();
         match unsafe { RegisterDragDrop(HWND(hwnd as *mut c_void), &target) } {
@@ -451,25 +537,46 @@ pub fn rebind_drop_target(hwnd: isize) -> bool {
 /// extract files merely because the pointer crossed the window.
 fn classify_incoming_data(data: &IDataObject) -> IncomingDataKind {
     let has_hdrop = has_hdrop(data);
-    let has_stream_hdrop = has_stream_hdrop(data);
+    // The stream answer is a signal only from a provider that reads the
+    // medium it is asked about. See `provider_reads_the_medium`.
+    let synthesized_hdrop = has_stream_hdrop(data) && provider_reads_the_medium(data);
     let has_shell_id_list = has_shell_id_list(data);
     let has_virtual_files = has_virtual_files(data);
     classify_formats(
         has_hdrop,
-        has_stream_hdrop,
+        synthesized_hdrop,
         has_shell_id_list,
         has_virtual_files,
     )
 }
 
+/// Does this provider actually look at the storage medium it is asked about?
+///
+/// It is asked for a file list carried as a compound file, which nothing can
+/// answer honestly: a list of paths is not structured storage. A provider that
+/// inspects the request refuses it. One that accepts is answering on the format
+/// alone and ignoring the medium — the Shell does exactly that, accepting every
+/// value including GDI handles — so nothing it says about a medium carries any
+/// information, and reading its answer as a signal misclassifies it.
+fn provider_reads_the_medium(data: &IDataObject) -> bool {
+    let format = FORMATETC {
+        cfFormat: CF_HDROP.0,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_ISTORAGE.0 as u32,
+    };
+    unsafe { data.QueryGetData(&format).is_err() }
+}
+
 fn classify_formats(
     has_paths: bool,
-    has_stream_hdrop: bool,
+    synthesized_hdrop: bool,
     has_shell_id_list: bool,
     has_virtual_files: bool,
 ) -> IncomingDataKind {
     if has_paths {
-        if has_shell_id_list && !has_stream_hdrop {
+        if has_shell_id_list && !synthesized_hdrop {
             IncomingDataKind::ShellPaths
         } else {
             // Standard CF_HDROP uses HGLOBAL. Some application data objects
@@ -499,8 +606,10 @@ fn has_hdrop(data: &IDataObject) -> bool {
 
 /// Detects a non-standard, application-provided CF_HDROP representation.
 /// Microsoft's CF_HDROP contract uses TYMED_HGLOBAL; accepting IStream as well
-/// is a useful provider-level signal that the paths are synthesized rather
-/// than a normal Shell filesystem selection. QueryGetData never renders them.
+/// marks paths that are synthesized rather than a normal Shell filesystem
+/// selection — but only from a provider that reads the medium at all, which is
+/// why the caller pairs this with `provider_reads_the_medium`. QueryGetData
+/// never renders them.
 fn has_stream_hdrop(data: &IDataObject) -> bool {
     let format = FORMATETC {
         cfFormat: CF_HDROP.0,
@@ -715,15 +824,21 @@ fn read_file_descriptor_names(data: &IDataObject) -> Option<Vec<String>> {
 /// Requests one supported storage medium for an indexed `FILECONTENTS` item.
 /// Individual requests come first because some real-world OLE providers reject
 /// a standards-compliant bitmask even though they support one of its members.
+///
+/// All three media the format allows are tried. A provider picks the one that
+/// matches its own storage: a mail client hands over an attachment as a byte
+/// stream, but a whole message as a compound file — that one only ever answers
+/// to `TYMED_ISTORAGE`, and asking for streams alone is refused outright.
 fn file_contents_medium(
     data: &IDataObject,
     index: i32,
 ) -> Option<windows::Win32::System::Com::STGMEDIUM> {
-    let mut failures = Vec::with_capacity(3);
+    let mut failures = Vec::with_capacity(4);
     for requested in [
         TYMED_ISTREAM.0 as u32,
+        TYMED_ISTORAGE.0 as u32,
         TYMED_HGLOBAL.0 as u32,
-        (TYMED_ISTREAM.0 | TYMED_HGLOBAL.0) as u32,
+        (TYMED_ISTREAM.0 | TYMED_ISTORAGE.0 | TYMED_HGLOBAL.0) as u32,
     ] {
         let format = FORMATETC {
             cfFormat: clip_format(CFSTR_FILECONTENTS),
@@ -753,6 +868,11 @@ fn write_file_contents(data: &IDataObject, index: i32, path: &Path) -> Result<()
                 .as_ref()
                 .ok_or_else(|| "the source returned a null IStream".to_string())
                 .and_then(|stream| write_istream(stream, path))
+        } else if medium.tymed == TYMED_ISTORAGE.0 as u32 {
+            (*medium.u.pstg)
+                .as_ref()
+                .ok_or_else(|| "the source returned a null IStorage".to_string())
+                .and_then(|storage| write_istorage(storage, path))
         } else if medium.tymed == TYMED_HGLOBAL.0 as u32 {
             write_hglobal(medium.u.hGlobal, path)
         } else {
@@ -795,6 +915,27 @@ fn write_istream(stream: &IStream, path: &Path) -> Result<(), String> {
             return Ok(());
         }
     }
+}
+
+/// Writes an `IStorage` to a compound file. A structured-storage item is a
+/// whole file system in miniature rather than a byte sequence, so it is copied
+/// as such: the destination is created as a compound file and the source
+/// duplicates its own streams and substorages into it. This is what produces a
+/// mail message the rest of the desktop can reopen.
+fn write_istorage(storage: &IStorage, path: &Path) -> Result<(), String> {
+    let wide_path = wide(path);
+    let destination = unsafe {
+        StgCreateDocfile(
+            PCWSTR(wide_path.as_ptr()),
+            STGM_CREATE | STGM_READWRITE | STGM_SHARE_EXCLUSIVE,
+            None,
+        )
+    }
+    .map_err(|err| format!("StgCreateDocfile failed: {err}"))?;
+    unsafe { storage.CopyTo(None, None, &destination) }
+        .map_err(|err| format!("IStorage::CopyTo failed: {err}"))?;
+    unsafe { destination.Commit(STGC_DEFAULT.0 as u32) }
+        .map_err(|err| format!("IStorage::Commit failed: {err}"))
 }
 
 /// Writes the bytes held by an `HGLOBAL` without an intermediate allocation.
@@ -971,7 +1112,7 @@ mod tests {
 
     #[test]
     fn copy_effect_never_exceeds_the_source_mask() {
-        use windows::Win32::System::Ole::{DROPEFFECT_LINK, DROPEFFECT_MOVE};
+        use windows::Win32::System::Ole::DROPEFFECT_LINK;
 
         assert_eq!(
             FavnyrDropTarget::choose_copy_effect(DROPEFFECT_COPY | DROPEFFECT_MOVE, true),
@@ -983,6 +1124,51 @@ mod tests {
         );
         assert_eq!(
             FavnyrDropTarget::choose_copy_effect(DROPEFFECT_COPY, false),
+            DROPEFFECT_NONE
+        );
+    }
+
+    #[test]
+    fn shell_hover_prefers_move_while_copy_only_sources_stay_copy() {
+        let both = DROPEFFECT_COPY | DROPEFFECT_MOVE;
+        assert_eq!(
+            FavnyrDropTarget::choose_hover_effect(both, IncomingDataKind::ShellPaths, false),
+            DROPEFFECT_MOVE
+        );
+        assert_eq!(
+            FavnyrDropTarget::choose_hover_effect(both, IncomingDataKind::ShellPaths, true),
+            DROPEFFECT_COPY
+        );
+        assert_eq!(
+            FavnyrDropTarget::choose_hover_effect(
+                DROPEFFECT_COPY,
+                IncomingDataKind::ShellPaths,
+                false,
+            ),
+            DROPEFFECT_COPY
+        );
+        assert_eq!(
+            FavnyrDropTarget::choose_hover_effect(
+                DROPEFFECT_MOVE,
+                IncomingDataKind::ShellPaths,
+                false,
+            ),
+            DROPEFFECT_NONE
+        );
+        assert_eq!(
+            FavnyrDropTarget::choose_hover_effect(both, IncomingDataKind::ApplicationPaths, false),
+            DROPEFFECT_COPY
+        );
+        assert_eq!(
+            FavnyrDropTarget::choose_hover_effect(
+                DROPEFFECT_MOVE,
+                IncomingDataKind::ApplicationPaths,
+                false,
+            ),
+            DROPEFFECT_NONE
+        );
+        assert_eq!(
+            FavnyrDropTarget::choose_hover_effect(both, IncomingDataKind::None, false),
             DROPEFFECT_NONE
         );
     }
@@ -1027,6 +1213,203 @@ mod tests {
         assert!(capture_application_paths(&[valid, source_root.join("missing.txt")]).is_none());
         assert_eq!(application_drop_directories(), before);
         std::fs::remove_dir_all(source_root).expect("remove source root");
+    }
+
+    /// A structured-storage item must survive the copy as a structured-storage
+    /// item: nested substorages included, and reopenable by any decoder. This
+    /// is the shape a mail message arrives in, where a byte-for-byte stream
+    /// copy would produce an unusable file.
+    #[test]
+    fn a_compound_file_is_copied_with_its_whole_tree() {
+        use windows::Win32::System::Com::STGM_READ;
+        use windows::Win32::System::Com::StructuredStorage::StgOpenStorage;
+
+        let _guard = FILE_TEST_LOCK.lock().expect("file test lock");
+        let root = std::env::temp_dir().join(format!("favnyr-stg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create test root");
+        let source_path = root.join("source.bin");
+        let target_path = root.join("target.bin");
+
+        let source_wide = wide(&source_path);
+        let source: IStorage = unsafe {
+            StgCreateDocfile(
+                PCWSTR(source_wide.as_ptr()),
+                STGM_CREATE | STGM_READWRITE | STGM_SHARE_EXCLUSIVE,
+                None,
+            )
+        }
+        .expect("create source compound file");
+        write_stream(&source, "stream01", b"top level payload");
+        let nested = unsafe {
+            source.CreateStorage(
+                PCWSTR(wide_str(std::ffi::OsStr::new("folder01")).as_ptr()),
+                STGM_CREATE | STGM_READWRITE | STGM_SHARE_EXCLUSIVE,
+                0,
+                0,
+            )
+        }
+        .expect("create substorage");
+        write_stream(&nested, "stream02", b"nested payload");
+        unsafe { nested.Commit(STGC_DEFAULT.0 as u32) }.expect("commit substorage");
+        unsafe { source.Commit(STGC_DEFAULT.0 as u32) }.expect("commit source");
+
+        write_istorage(&source, &target_path).expect("copy the compound file");
+        drop(nested);
+        drop(source);
+
+        let target_wide = wide(&target_path);
+        let reopened: IStorage = unsafe {
+            StgOpenStorage(
+                PCWSTR(target_wide.as_ptr()),
+                None,
+                STGM_READ | STGM_SHARE_EXCLUSIVE,
+                None,
+                0,
+            )
+        }
+        .expect("reopen the copy as a compound file");
+        assert_eq!(read_stream(&reopened, "stream01"), b"top level payload");
+        let nested_copy = unsafe {
+            reopened.OpenStorage(
+                PCWSTR(wide_str(std::ffi::OsStr::new("folder01")).as_ptr()),
+                None,
+                STGM_READ | STGM_SHARE_EXCLUSIVE,
+                std::ptr::null_mut(),
+                0,
+            )
+        }
+        .expect("reopen the substorage");
+        assert_eq!(read_stream(&nested_copy, "stream02"), b"nested payload");
+        drop(nested_copy);
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn write_stream(storage: &IStorage, name: &str, bytes: &[u8]) {
+        let wide_name = wide_str(std::ffi::OsStr::new(name));
+        let stream = unsafe {
+            storage.CreateStream(
+                PCWSTR(wide_name.as_ptr()),
+                STGM_CREATE | STGM_READWRITE | STGM_SHARE_EXCLUSIVE,
+                0,
+                0,
+            )
+        }
+        .expect("create stream");
+        let mut written: u32 = 0;
+        unsafe {
+            stream.Write(
+                bytes.as_ptr() as *const c_void,
+                bytes.len() as u32,
+                Some(&mut written),
+            )
+        }
+        .ok()
+        .expect("write stream");
+        assert_eq!(written as usize, bytes.len());
+        unsafe { stream.Commit(STGC_DEFAULT) }.expect("commit stream");
+    }
+
+    fn read_stream(storage: &IStorage, name: &str) -> Vec<u8> {
+        use windows::Win32::System::Com::STGM_READ;
+        let wide_name = wide_str(std::ffi::OsStr::new(name));
+        let stream = unsafe {
+            storage.OpenStream(
+                PCWSTR(wide_name.as_ptr()),
+                None,
+                STGM_READ | STGM_SHARE_EXCLUSIVE,
+                0,
+            )
+        }
+        .expect("open stream");
+        let mut out = vec![0u8; 256];
+        let mut read: u32 = 0;
+        unsafe {
+            stream.Read(
+                out.as_mut_ptr() as *mut c_void,
+                out.len() as u32,
+                Some(&mut read),
+            )
+        }
+        .ok()
+        .expect("read stream");
+        out.truncate(read as usize);
+        out
+    }
+
+    /// The Shell's own data object must be recognised as a Shell selection.
+    /// It decides the whole route: a Shell selection keeps the Move/Copy/Link
+    /// menu, where a synthesized one is captured and copied. The object is
+    /// built exactly as Explorer builds it, so the answer is measured on the
+    /// real thing rather than assumed from the formats it is expected to carry.
+    #[test]
+    fn a_shell_selection_is_recognised_as_one() {
+        let _guard = FILE_TEST_LOCK.lock().expect("file test lock");
+        let root = std::env::temp_dir().join(format!("favnyr-shellobj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("folder01")).expect("create test folder");
+        std::fs::write(root.join("my_file.txt"), b"payload").expect("create test file");
+
+        let data = shell_data_object(&root, &["folder01", "my_file.txt"]);
+        assert_eq!(classify_incoming_data(&data), IncomingDataKind::ShellPaths);
+        assert!(has_hdrop(&data));
+        assert!(has_shell_id_list(&data));
+        // The Shell answers on the format alone: it accepts a file list carried
+        // as a compound file, which is impossible. Its answer about streams is
+        // therefore not a signal, and taking it for one sent every Explorer
+        // selection down the capture route — losing its Move/Copy/Link menu.
+        assert!(
+            has_stream_hdrop(&data),
+            "the Shell is expected to accept a stream it does not use"
+        );
+        assert!(
+            !provider_reads_the_medium(&data),
+            "the Shell is expected to ignore the requested medium"
+        );
+
+        drop(data);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The `IDataObject` the Shell produces for a selection inside `parent`.
+    fn shell_data_object(parent: &Path, names: &[&str]) -> IDataObject {
+        unsafe {
+            let _ = OleInitialize(None);
+            let desktop: IShellFolder = SHGetDesktopFolder().expect("desktop folder");
+            let parent_w = wide(parent);
+            let mut parent_pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+            SHParseDisplayName(PCWSTR(parent_w.as_ptr()), None, &mut parent_pidl, 0, None)
+                .expect("parse the parent folder");
+            let folder: IShellFolder = desktop
+                .BindToObject(parent_pidl, None)
+                .expect("bind the parent folder");
+            let mut children: Vec<*mut ITEMIDLIST> = Vec::new();
+            for name in names {
+                let name_w = wide_str(std::ffi::OsStr::new(name));
+                let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
+                folder
+                    .ParseDisplayName(
+                        HWND::default(),
+                        None,
+                        PCWSTR(name_w.as_ptr()),
+                        None,
+                        &mut child,
+                        std::ptr::null_mut(),
+                    )
+                    .expect("parse a child name");
+                children.push(child);
+            }
+            let ptrs: Vec<*const ITEMIDLIST> = children.iter().map(|p| *p as *const _).collect();
+            let data: IDataObject = folder
+                .GetUIObjectOf(HWND::default(), &ptrs, None)
+                .expect("build the Shell data object");
+            for child in &children {
+                CoTaskMemFree(Some(*child as *const c_void));
+            }
+            CoTaskMemFree(Some(parent_pidl as *const c_void));
+            data
+        }
     }
 
     fn application_drop_directories() -> HashSet<OsString> {

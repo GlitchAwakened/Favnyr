@@ -56,6 +56,8 @@ use crate::{
 /// Minimum ratio for one side of a split (guards against degenerate panels).
 const MIN_SPLIT_RATIO: f32 = 0.08;
 
+mod archive;
+
 /// Context remembered for the "Open with" picker between enumeration
 /// (opening) and the user's choice.
 struct OwPickCtx {
@@ -74,16 +76,13 @@ enum ClipOp {
     Cut,
 }
 
-/// Owns the private staging directory created for an incoming transient drop.
+/// Owns a private staging directory from an incoming drop or archive job.
 /// Keeping the guard in the paste/operation state guarantees cleanup on
 /// success, error, conflict cancellation, or an early return.
 struct TransientDropGuard(Option<PathBuf>);
 
 impl TransientDropGuard {
-    /// Only an OLE drop creates a staging directory, and that path is Windows
-    /// only. The guard type itself stays unconditional: it is a field of state
-    /// shared by both platforms, holding `None` elsewhere.
-    #[cfg(windows)]
+    /// Transfers an exclusively owned temporary tree into the paste lifecycle.
     fn new(path: PathBuf) -> Self {
         Self(Some(path))
     }
@@ -220,6 +219,17 @@ impl NavHistory {
         self.cursor += 1;
         Some(self.stack[self.cursor].clone())
     }
+
+    fn relocate(&mut self, from: &Path, to: &Path) -> bool {
+        let mut changed = false;
+        for path in &mut self.stack {
+            if let Some(relocated) = ops::relocated_path(path, from, to) {
+                *path = relocated;
+                changed = true;
+            }
+        }
+        changed
+    }
 }
 
 // ---------- Sort state ----------
@@ -265,7 +275,7 @@ struct Tab {
     /// Whether hidden files are shown (dotfiles + Windows HIDDEN attribute).
     /// `false` by default. Persisted per tab in the workspace TOML.
     show_hidden: bool,
-    /// Grouping by type (folders first / files first / mixed).
+    /// Grouping mode (folders, coloured folders or files first, or mixed).
     /// Persisted per tab in the workspace TOML.
     group_mode: GroupMode,
     /// "Cursor" row (head of arrow-key keyboard navigation). `-1`
@@ -282,16 +292,21 @@ struct Tab {
 }
 
 impl Tab {
-    fn new(initial: PathBuf) -> Self {
+    fn new(initial: PathBuf, preview: bool) -> Self {
         let mut h = NavHistory::default();
         h.push(initial.clone());
+        let zoom = if preview {
+            THUMB_DEFAULT_ZOOM
+        } else {
+            LIST_DEFAULT_ZOOM
+        };
         Self {
             current_path: initial,
             history: h,
             sort: SortState::default(),
             selection_anchor: -1,
-            preview: false,
-            zoom: LIST_DEFAULT_ZOOM,
+            preview,
+            zoom,
             show_hidden: false,
             group_mode: GroupMode::FoldersFirst,
             cursor: -1,
@@ -384,8 +399,8 @@ impl TabBook {
         at
     }
 
-    fn open(&mut self, path: PathBuf) -> usize {
-        self.insert_tab_at(self.tabs.len(), Tab::new(path))
+    fn open(&mut self, path: PathBuf, preview: bool) -> usize {
+        self.insert_tab_at(self.tabs.len(), Tab::new(path, preview))
     }
 
     /// Inserts `tab` right after tab `idx` and activates the new entry.
@@ -399,11 +414,11 @@ impl TabBook {
 
     /// Opens a target right after the active tab. A `TabBook` always has
     /// at least one tab; the fallback at the end nonetheless protects this invariant.
-    fn open_after_active(&mut self, path: PathBuf) -> usize {
+    fn open_after_active(&mut self, path: PathBuf, preview: bool) -> usize {
         if self.active >= self.tabs.len() {
-            return self.open(path);
+            return self.open(path, preview);
         }
-        self.insert_after(self.active, Tab::new(path))
+        self.insert_after(self.active, Tab::new(path, preview))
             .expect("active tab was validated")
     }
 
@@ -548,8 +563,13 @@ struct Panel {
 impl Panel {
     /// New panel with an explicit tab bar position (settings
     /// default, inherited on split, instance detached via tear-off).
-    fn with_mode(initial: PathBuf, columns: Vec<ColumnSpec>, tab_bar_mode: u8) -> Self {
-        Self::from_tab(Tab::new(initial), columns, tab_bar_mode, 0.0)
+    fn with_mode(
+        initial: PathBuf,
+        columns: Vec<ColumnSpec>,
+        tab_bar_mode: u8,
+        preview: bool,
+    ) -> Self {
+        Self::from_tab(Tab::new(initial, preview), columns, tab_bar_mode, 0.0)
     }
 
     /// Shared panel initialization for a new location and a tab moved by drag.
@@ -946,6 +966,7 @@ pub struct AppState {
     pending_file_drop: Rc<RefCell<Option<PendingFileDrop>>>,
     /// Paste in progress (resolving name conflicts). `None` at rest.
     paste_job: Rc<RefCell<Option<PasteJob>>>,
+    archive: Rc<archive::State>,
     /// Exact source of the rename popup. A path, not the visual row
     /// index: a watcher/re-sort can rebuild the model while the
     /// dialog is open without ever causing a different entry to be renamed.
@@ -985,6 +1006,9 @@ pub struct AppState {
     /// `annotations_for_update` to write, so the file is re-read first when
     /// another instance has touched it.
     annotations: Rc<RefCell<favnyr_core::annotations::AnnotationStore>>,
+    /// Set by both local edits and shared-store reloads. Reading the store
+    /// during navigation must not consume a pending cosmetic refresh.
+    annotations_dirty: Rc<Cell<bool>>,
     /// The way back from the last "even out the views": where it was applied,
     /// the ratios it replaced, and the ones it wrote.
     ///
@@ -1139,9 +1163,10 @@ impl AppState {
         if dirs.is_empty() {
             return;
         }
+        let default_preview = self.config.borrow().default_preview_mode;
         self.with_tabs_mut(|book| {
             for dir in dirs {
-                book.open(dir.clone());
+                book.open(dir.clone(), default_preview);
             }
             book.active = 0;
         });
@@ -1155,6 +1180,7 @@ impl AppState {
         let (rmtime_tx, rmtime_rx) = mpsc::channel();
         let (imgmeta_tx, imgmeta_rx) = mpsc::channel();
         let default_cols = config.default_columns.clone();
+        let default_preview = config.default_preview_mode;
         let keymap = shortcuts::Keymap::build(&config.shortcut_overrides);
         Self {
             config: Rc::new(RefCell::new(config)),
@@ -1162,6 +1188,7 @@ impl AppState {
                 initial,
                 default_cols,
                 tab_bar_mode,
+                default_preview,
             )])),
             active_panel: Rc::new(RefCell::new(0)),
             layout: Rc::new(RefCell::new(LayoutNode::Leaf { panel: 0 })),
@@ -1173,6 +1200,7 @@ impl AppState {
             external_drop_paths: Rc::new(RefCell::new(Vec::new())),
             pending_file_drop: Rc::new(RefCell::new(None)),
             paste_job: Rc::new(RefCell::new(None)),
+            archive: Rc::new(archive::State::default()),
             rename_source: Rc::new(RefCell::new(None)),
             delete_pending: Rc::new(RefCell::new(Vec::new())),
             last_trashed: Rc::new(RefCell::new(None)),
@@ -1186,6 +1214,7 @@ impl AppState {
                 favnyr_core::annotations::AnnotationStore::load(&paths::annotations_path()),
             )),
             annotations_stamp: Rc::new(RefCell::new(annotations_stamp())),
+            annotations_dirty: Rc::new(Cell::new(false)),
             favorites_stamp: Rc::new(RefCell::new(favorites_stamp())),
             equalize_undo: Rc::new(RefCell::new(None)),
             pending_open: Rc::new(RefCell::new(Vec::new())),
@@ -1256,6 +1285,7 @@ impl AppState {
             external_drop_paths: Rc::new(RefCell::new(Vec::new())),
             pending_file_drop: Rc::new(RefCell::new(None)),
             paste_job: Rc::new(RefCell::new(None)),
+            archive: Rc::new(archive::State::default()),
             rename_source: Rc::new(RefCell::new(None)),
             delete_pending: Rc::new(RefCell::new(Vec::new())),
             last_trashed: Rc::new(RefCell::new(None)),
@@ -1269,6 +1299,7 @@ impl AppState {
                 favnyr_core::annotations::AnnotationStore::load(&paths::annotations_path()),
             )),
             annotations_stamp: Rc::new(RefCell::new(annotations_stamp())),
+            annotations_dirty: Rc::new(Cell::new(false)),
             favorites_stamp: Rc::new(RefCell::new(favorites_stamp())),
             equalize_undo: Rc::new(RefCell::new(None)),
             pending_open: Rc::new(RefCell::new(Vec::new())),
@@ -1349,7 +1380,13 @@ impl AppState {
         // config (user settings).
         let default_cols = self.config.borrow().default_columns.clone();
         let default_mode = self.config.borrow().default_tab_bar_mode.min(2);
-        *self.panels.borrow_mut() = vec![Panel::with_mode(home_dir(), default_cols, default_mode)];
+        let default_preview = self.config.borrow().default_preview_mode;
+        *self.panels.borrow_mut() = vec![Panel::with_mode(
+            home_dir(),
+            default_cols,
+            default_mode,
+            default_preview,
+        )];
         *self.layout.borrow_mut() = LayoutNode::Leaf { panel: 0 };
         *self.active_panel.borrow_mut() = 0;
         self.closed_tabs.borrow_mut().clear();
@@ -1538,6 +1575,7 @@ fn remember_closed_panel(state: &AppState, mut panel: Panel) {
 // ---------- Callback installation ----------
 
 pub fn install(window: &MainWindow, state: AppState) {
+    archive::install(window, &state);
     // (The row model of the active panel no longer needs to be pushed as a
     // global `rows` — each panel carries its own model in
     // its PanelView via update_panels_ui.)
@@ -1562,6 +1600,8 @@ pub fn install(window: &MainWindow, state: AppState) {
     });
     // Default tab bar position (settings).
     window.set_tabbar_default_pref(cfg.default_tab_bar_mode.min(2) as i32);
+    // Display mode for newly created tabs and views (settings).
+    window.set_default_view_mode_index(if cfg.default_preview_mode { 1 } else { 0 });
     // Tab path tooltip (settings) — unchecked by default.
     window.set_tab_tooltip_enabled(cfg.tab_path_tooltip);
     // "Unsaved changes" guard before loading, checked by
@@ -1747,8 +1787,9 @@ pub fn install(window: &MainWindow, state: AppState) {
             let Some(p) = resolve_sidebar_place_dir(path.as_str()) else {
                 return;
             };
+            let default_preview = st.config.borrow().default_preview_mode;
             let opened = st.with_tabs_mut(|book| {
-                let a = book.open_after_active(p);
+                let a = book.open_after_active(p, default_preview);
                 book.tabs[a].current_path.clone()
             });
             load_directory(&w, &st, &opened, false);
@@ -1795,6 +1836,18 @@ pub fn install(window: &MainWindow, state: AppState) {
                     crate::winmsg::Incoming::DevicesChanged => {
                         #[cfg(windows)]
                         crate::winportable::request_refresh();
+                    }
+                    // Coming back from sleep, Favnyr's OLE drop target has been
+                    // observed to stop being consulted: the pointer carrying a
+                    // drag gets the system's own refusal, and only restarting
+                    // the application brought it back. Re-asserting the
+                    // registration is idempotent and costs one call, so it is
+                    // done here rather than diagnosed after the fact.
+                    crate::winmsg::Incoming::PowerResumed => {
+                        #[cfg(windows)]
+                        if let Some(hwnd) = crate::winmsg::self_hwnd() {
+                            crate::winddrag::rebind_drop_target(hwnd);
+                        }
                     }
                 }
             });
@@ -1979,6 +2032,16 @@ pub fn install(window: &MainWindow, state: AppState) {
         });
     }
 
+    // Shared colours and notes also update idle windows with a closed sidebar.
+    {
+        let st = state.clone();
+        let weak = window.as_weak();
+        window.on_poll_annotations(move || {
+            let Some(w) = weak.upgrade() else { return };
+            refresh_annotations_ui(&w, &st);
+        });
+    }
+
     // A swatch was clicked in the "Colour & note" flyout.
     {
         let st = state.clone();
@@ -1997,9 +2060,7 @@ pub fn install(window: &MainWindow, state: AppState) {
                 // the view updates anyway.
                 save_annotations(&st, &annotations);
             }
-            // The colour is baked into every view's rows, not just the active
-            // one — the same folder may be open in several panels.
-            refresh_all_panels(&w, &st);
+            refresh_annotations_ui(&w, &st);
         });
     }
 
@@ -2035,7 +2096,7 @@ pub fn install(window: &MainWindow, state: AppState) {
                 annotations.set_note(&path, text.as_str());
                 save_annotations(&st, &annotations);
             }
-            refresh_all_panels(&w, &st);
+            refresh_annotations_ui(&w, &st);
         });
     }
 
@@ -2374,7 +2435,13 @@ pub fn install(window: &MainWindow, state: AppState) {
                 .get(index.max(0) as usize)
                 .cloned()
                 .unwrap_or_default();
-            let paths = std::mem::take(&mut *st.fav_save_pending.borrow_mut());
+            let mut paths = std::mem::take(&mut *st.fav_save_pending.borrow_mut());
+            // Recheck at commit time as the filesystem may have changed while
+            // the popup was open.
+            paths.retain(|path| favorite_path_is_directory(path));
+            if paths.is_empty() {
+                return;
+            }
             let multi = paths.len() > 1;
             // Deduplication: we do NOT add a path already present in the
             // target container (otherwise a silent duplicate). We count the additions
@@ -2511,8 +2578,9 @@ pub fn install(window: &MainWindow, state: AppState) {
             save_favorites(&st);
             crow.expanded = true;
             vm.set_row_data(ti, crow);
+            let annotations = annotations_now(&st);
             for (k, fc) in children.iter().enumerate() {
-                vm.insert(ti + 1 + k, flat_to_favnode(fc));
+                vm.insert(ti + 1 + k, flat_to_favnode(fc, &annotations));
             }
             w.set_fav_drag_hover_container(SharedString::new());
         });
@@ -2788,8 +2856,8 @@ pub fn install(window: &MainWindow, state: AppState) {
             }
         });
     }
-    // "Video thumbnails (ffmpeg)" section (Linux): initial detection + button
-    // "Recheck" + "copy" button for an install command.
+    // Optional Linux tools are detected only when their expandable settings
+    // card opens, and again on explicit request.
     // Which annotations point at something that is gone. A filesystem walk, so
     // it is taken when the settings panel opens rather than kept live — and
     // taken ONCE: the badge reads its length, and the cleanup list reads the
@@ -2882,22 +2950,14 @@ pub fn install(window: &MainWindow, state: AppState) {
             push_orphan_count(&w, &st);
             let lang = st.snapshot_config().language;
             show_notice_ok(&w, annotations_cleaned_text(lang, removed));
-            refresh_all_panels(&w, &st);
+            refresh_annotations_ui(&w, &st);
         });
     }
-    apply_ffmpeg_info(window);
     {
         let weak = window.as_weak();
-        window.on_ffmpeg_recheck(move || {
+        window.on_optional_tools_recheck(move || {
             if let Some(w) = weak.upgrade() {
-                apply_ffmpeg_info(&w);
-            }
-        });
-    }
-    {
-        window.on_settings_copy(move |text: SharedString| {
-            if let Err(err) = actions::copy_to_clipboard(&text) {
-                error!(error = %err, "clipboard copy (setting) failed");
+                apply_optional_tools_info(&w);
             }
         });
     }
@@ -2911,6 +2971,16 @@ pub fn install(window: &MainWindow, state: AppState) {
             let mode = idx.clamp(0, 2) as u8;
             info!(mode, "default tab bar position changed");
             st.persist_config(|c| c.default_tab_bar_mode = mode);
+        });
+    }
+    // Display mode for newly created tabs and views. Existing tabs keep their
+    // per-tab mode until the user changes it directly.
+    {
+        let st = state.clone();
+        window.on_default_view_mode_changed(move |idx: i32| {
+            let preview = idx == 1;
+            info!(preview, "default view mode changed");
+            st.persist_config(|c| c.default_preview_mode = preview);
         });
     }
     // Tab path tooltip (settings): opt-in, persisted.
@@ -3042,7 +3112,7 @@ pub fn install(window: &MainWindow, state: AppState) {
                 // used to ignore the Favnyr default, which made the Settings field
                 // look like it did nothing.) A folder .lnk shortcut has already
                 // been opened as a tab above.
-                open_file_default(&st, &[target]);
+                open_file_default(&w, &st, &[target]);
             }
         });
     }
@@ -3285,7 +3355,9 @@ pub fn install(window: &MainWindow, state: AppState) {
             // item: a selection whose first entry happens to be a file may
             // still hold folders worth colouring.
             let has_dir = sel.iter().any(|p| acts_as_dir(p));
+            let has_favorite_dir = sel.iter().any(|p| favorite_path_is_directory(p));
             w.set_ctx_selection_has_dir(has_dir);
+            w.set_ctx_selection_has_favorite_dir(has_favorite_dir);
             // Slot already applied, so the strip can point at it. Taken from
             // the primary item: with a mixed selection the strip shows what the
             // first folder carries and assigns to all of them.
@@ -3310,9 +3382,10 @@ pub fn install(window: &MainWindow, state: AppState) {
             // a base holding every row that is always there, then one term per
             // row that can be hidden, on the very condition that renders it.
             // The two sides have to be changed together.
-            let h = 376.0
+            let h = 350.0
                 + if primary_dir { 0.0 } else { 26.0 }
                 + if sel.len() == 1 { 26.0 } else { 0.0 }
+                + if has_favorite_dir { 26.0 } else { 0.0 }
                 + if has_dir || sel.len() == 1 { 26.0 } else { 0.0 }
                 + if n_custom > 0 {
                     n_custom as f32 * 26.0 + 1.0
@@ -3355,9 +3428,13 @@ pub fn install(window: &MainWindow, state: AppState) {
                 return;
             };
             let result = if w.get_ctx_custom_bg() {
-                actions::run_opener_dir(&op, &st.current_path())
+                if crate::archives::action(&op).is_some() {
+                    archive::run_opener(&w, &st, &op, &[st.current_path()])
+                } else {
+                    actions::run_opener_dir(&op, &st.current_path())
+                }
             } else {
-                actions::run_opener(&op, &selected_paths(&st))
+                archive::run_opener(&w, &st, &op, &selected_paths(&st))
             };
             if let Err(err) = result {
                 error!(error = %err, label = op.label, "pinned context command failed");
@@ -3480,15 +3557,17 @@ pub fn install(window: &MainWindow, state: AppState) {
                 // The FIRST item only: getting here with several selected means
                 // a folder is among them, and handing that folder to the system
                 // would open a window outside Favnyr.
-                open_file_default(&st, std::slice::from_ref(first));
+                open_file_default(&w, &st, std::slice::from_ref(first));
             }
         });
     }
     {
         let st = state.clone();
+        let weak = window.as_weak();
         window.on_open_many_confirmed(move || {
+            let Some(w) = weak.upgrade() else { return };
             let paths = std::mem::take(&mut *st.pending_open.borrow_mut());
-            open_file_default(&st, &paths);
+            open_file_default(&w, &st, &paths);
         });
     }
     // Open in a new tab (of the ACTIVE panel). The selected folder
@@ -3507,8 +3586,9 @@ pub fn install(window: &MainWindow, state: AppState) {
                     .unwrap_or_else(|| st.current_path()),
                 None => st.current_path(),
             };
+            let default_preview = st.config.borrow().default_preview_mode;
             let opened = st.with_tabs_mut(|book| {
-                let a = book.open_after_active(target);
+                let a = book.open_after_active(target, default_preview);
                 book.tabs[a].current_path.clone()
             });
             load_directory(&w, &st, &opened, false);
@@ -3595,7 +3675,7 @@ pub fn install(window: &MainWindow, state: AppState) {
                     p.extension()
                         .map(|e| e.to_string_lossy().to_ascii_lowercase())
                 });
-                match actions::run_opener(&op, &paths) {
+                match archive::run_opener(&w, &st, &op, &paths) {
                     Ok(()) => {
                         st.openers.borrow_mut().record_use(&op.id, ext.as_deref());
                         save_openers(&st);
@@ -3643,6 +3723,7 @@ pub fn install(window: &MainWindow, state: AppState) {
             let lang = st.snapshot_config().language;
             open_ow_create(&w, &st, &program, &recipe.label(lang));
             w.set_ow_popup_icon_kind(recipe.icon.as_i32());
+            w.set_ow_popup_archive_dialog(recipe.archive_dialog);
             w.set_ow_popup_args(recipe.args.into());
             w.set_ow_popup_ctx_file(recipe.ctx & openers::CTX_FILE != 0);
             w.set_ow_popup_ctx_ext(recipe.ctx_exts.join(", ").into());
@@ -3820,7 +3901,7 @@ pub fn install(window: &MainWindow, state: AppState) {
                 p.extension()
                     .map(|e| e.to_string_lossy().to_ascii_lowercase())
             });
-            match actions::run_opener(&opener, &paths) {
+            match archive::run_opener(&w, &st, &opener, &paths) {
                 Ok(()) => {
                     let set_default = w.get_ow_picker_set_default();
                     {
@@ -3883,6 +3964,7 @@ pub fn install(window: &MainWindow, state: AppState) {
                 w.set_ow_popup_name(op.label.clone().into());
                 w.set_ow_popup_program(op.program.clone().into());
                 w.set_ow_popup_icon_kind(effective_opener_icon(op).as_i32());
+                w.set_ow_popup_archive_dialog(op.archive_dialog);
                 // OS/Store app (assoc, without exe) → Program field frozen.
                 w.set_ow_popup_is_store(op.assoc.is_some());
                 w.set_ow_popup_args(join_args(&op.args).into());
@@ -3985,6 +4067,7 @@ pub fn install(window: &MainWindow, state: AppState) {
             // Run as administrator (Windows) — checkbox checked in the popup.
             let elevated = w.get_ow_popup_elevated();
             let icon = openers::OpenerIcon::from_i32(w.get_ow_popup_icon_kind());
+            let archive_dialog = w.get_ow_popup_archive_dialog();
             // Pinning to the context menu: 3 checkboxes → bitmask.
             // A lone "*" is stored as-is: `matches_ctx_ext` reads it as the
             // wildcard, and an empty field means the same thing.
@@ -4005,6 +4088,9 @@ pub fn install(window: &MainWindow, state: AppState) {
             if !id.is_empty() {
                 st.openers.borrow_mut().update(&id, &label, &program, args);
                 st.openers.borrow_mut().set_icon(&id, icon);
+                st.openers
+                    .borrow_mut()
+                    .set_archive_dialog(&id, archive_dialog);
                 apply_default_exts(&st, &id, &exts);
                 st.openers.borrow_mut().set_used_exts(&id, &used);
                 st.openers.borrow_mut().set_elevated(&id, elevated);
@@ -4014,6 +4100,9 @@ pub fn install(window: &MainWindow, state: AppState) {
             } else if w.get_ow_popup_add() {
                 let new_id = st.openers.borrow_mut().add(&label, &program, args);
                 st.openers.borrow_mut().set_icon(&new_id, icon);
+                st.openers
+                    .borrow_mut()
+                    .set_archive_dialog(&new_id, archive_dialog);
                 apply_default_exts(&st, &new_id, &exts);
                 st.openers.borrow_mut().set_used_exts(&new_id, &used);
                 st.openers.borrow_mut().set_elevated(&new_id, elevated);
@@ -4028,6 +4117,7 @@ pub fn install(window: &MainWindow, state: AppState) {
                     program,
                     assoc: None,
                     icon: openers::OpenerIcon::from_i32(w.get_ow_popup_icon_kind()),
+                    archive_dialog,
                     args,
                     default_exts: Vec::new(),
                     used_exts: Vec::new(),
@@ -4037,8 +4127,14 @@ pub fn install(window: &MainWindow, state: AppState) {
                     ctx_menu: 0,
                     ctx_exts: Vec::new(),
                 };
-                if let Err(err) = actions::run_opener(&temp, &selected_paths(&st)) {
+                if let Err(err) = archive::run_opener(&w, &st, &temp, &selected_paths(&st)) {
                     error!(error = %err, "one-shot opener failed");
+                    notice(
+                        &w,
+                        i18n::tr(st.config.borrow().language, "ow_run_failed")
+                            .replace("{name}", &temp.label),
+                        NoticeKind::Error,
+                    );
                 }
             }
             push_openers_ui(&w, &st);
@@ -4557,8 +4653,10 @@ pub fn install(window: &MainWindow, state: AppState) {
     {
         let st = state.clone();
         let weak = window.as_weak();
-        window.on_file_drag_begin(move |src_panel: i32, row_idx: i32| {
-            let Some(w) = weak.upgrade() else { return };
+        window.on_file_drag_begin(move |src_panel: i32, row_idx: i32| -> bool {
+            let Some(w) = weak.upgrade() else {
+                return false;
+            };
             // A previous drop menu may have been closed without choosing an action.
             // No new gesture should keep its stale frozen paths.
             *st.pending_file_drop.borrow_mut() = None;
@@ -4566,7 +4664,7 @@ pub fn install(window: &MainWindow, state: AppState) {
             let changed_count = {
                 let mut panels = st.panels.borrow_mut();
                 let Some(p) = panels.get_mut(src) else {
-                    return;
+                    return false;
                 };
                 let already = p
                     .rows_model
@@ -4590,6 +4688,9 @@ pub fn install(window: &MainWindow, state: AppState) {
                     push_active_footer(&w, &st, count);
                 }
             }
+            panel_selected_paths(&st, src)
+                .iter()
+                .any(|path| favorite_path_is_directory(path))
         });
     }
     // Real-time validation of the internal target. In the source view, the
@@ -4786,15 +4887,7 @@ pub fn install(window: &MainWindow, state: AppState) {
             *st.rename_source.borrow_mut() = None;
             if let Some(to) = renamed_to.as_ref() {
                 invalidate_thumbnail_paths(&st, &[from.clone(), to.clone()]);
-                // The colour and the note are keyed by path, so they have to
-                // follow the item rather than be left behind under a name that
-                // no longer exists — where a later item of the same name would
-                // inherit them. Done only once the rename actually succeeded,
-                // and with the path the OS returned rather than the one asked
-                // for. Renaming a folder carries what was annotated inside it.
-                let mut annotations = annotations_for_update(&st);
-                annotations.rename(&from, to);
-                save_annotations(&st, &annotations);
+                track_renamed_path(&w, &st, &from, to);
             }
             // Refresh EVERY panel, not just the active one, so other views on the
             // same folder show the rename immediately — harmonized with
@@ -4851,16 +4944,7 @@ pub fn install(window: &MainWindow, state: AppState) {
             let Some(replaced_to) = replaced_to else {
                 return false;
             };
-            // Same reasoning as a plain rename, with one more thing to settle:
-            // the item that was overwritten is gone, so its colour and note
-            // must not stay on that path and end up describing the newcomer.
-            // The store's `rename` does exactly that — it carries the source's
-            // annotation over and drops whatever the destination held.
-            {
-                let mut annotations = annotations_for_update(&st);
-                annotations.rename(&from, &replaced_to);
-                save_annotations(&st, &annotations);
-            }
+            track_renamed_path(&w, &st, &from, &replaced_to);
             *st.rename_source.borrow_mut() = None;
             invalidate_thumbnail_paths(&st, &[from, replaced_to]);
             // Refresh every panel (see `on_rename_confirmed`).
@@ -5373,11 +5457,12 @@ pub fn install(window: &MainWindow, state: AppState) {
         let weak = window.as_weak();
         window.on_tab_new(move || {
             let Some(w) = weak.upgrade() else { return };
+            let default_preview = st.config.borrow().default_preview_mode;
             let target = st.with_tabs_mut(|book| {
                 // New UX: the new tab inherits the path of the
                 // previously active tab (instead of always $HOME).
                 let inherited = book.tabs[book.active].current_path.clone();
-                book.open(inherited);
+                book.open(inherited, default_preview);
                 let a = book.active;
                 book.tabs[a].current_path.clone()
             });
@@ -5489,6 +5574,7 @@ pub fn install(window: &MainWindow, state: AppState) {
         window.on_panel_split(move |dir: i32| {
             let Some(w) = weak.upgrade() else { return };
             let inherited = st.current_path();
+            let default_preview = st.config.borrow().default_preview_mode;
             let new_active = {
                 let mut panels = st.panels.borrow_mut();
                 if panels.len() >= MAX_PANELS {
@@ -5511,7 +5597,7 @@ pub fn install(window: &MainWindow, state: AppState) {
                         // is duplicated, as the user expects on split).
                         let cols = panels[active].columns.clone();
                         let mode = panels[active].tab_bar_mode;
-                        panels.push(Panel::with_mode(inherited, cols, mode));
+                        panels.push(Panel::with_mode(inherited, cols, mode, default_preview));
                         Some(new_idx)
                     } else {
                         None
@@ -7236,15 +7322,16 @@ fn apply_ui_scale(window: &MainWindow, state: &AppState, factor: f32) {
     }
 }
 
-/// Detects ffmpeg (Linux) and pushes the state to the "Video thumbnails"
-/// settings section. Called at startup and on every (re)opening of settings / click on
-/// "Recheck". Effectively a no-op on Windows (section hidden, `ffmpeg` unused).
-fn apply_ffmpeg_info(window: &MainWindow) {
-    let info = actions::ffmpeg_info();
-    window.set_ffmpeg_found(info.available);
-    window.set_ffmpeg_version(info.version.into());
-    window.set_ffmpeg_flatpak(info.flatpak);
-    window.set_ffmpeg_detected_index(info.detected_distro);
+fn apply_optional_tools_info(window: &MainWindow) {
+    let info = actions::optional_tools_info();
+    window.set_ffmpeg_found(info.ffmpeg.available);
+    window.set_ffmpeg_version(info.ffmpeg.version.into());
+    window.set_poppler_found(info.poppler.available);
+    window.set_poppler_version(info.poppler.version.into());
+    window.set_seven_zip_found(info.seven_zip.available);
+    window.set_seven_zip_version(info.seven_zip.version.into());
+    window.set_optional_tools_flatpak(info.flatpak);
+    window.set_optional_tools_checked(true);
 }
 
 /// Eject operation requested from the drive menu.
@@ -7470,8 +7557,36 @@ fn refresh_sidebar(window: &MainWindow, state: &AppState) {
             space_hint: space.hint.into(),
         }
     };
-    let shortcuts = places::user_places()
+    let redirects = state.snapshot_config().sidebar_shortcut_redirects;
+    let shortcuts = places::user_place_candidates()
         .into_iter()
+        .filter_map(|mut place| {
+            let mut path = place.path.clone();
+            // Each rename normally updates the original redirect in place.
+            // The bounded loop also repairs earlier chained entries safely.
+            for _ in 0..=redirects.len() {
+                let Some(next) = redirects.get(&path.to_string_lossy().into_owned()) else {
+                    break;
+                };
+                let next = PathBuf::from(next);
+                if ops::paths_equal(&next, &path) {
+                    break;
+                }
+                path = next;
+            }
+            if !path.is_dir() {
+                return None;
+            }
+            if path != place.path {
+                place.path = path;
+                place.name = place
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| place.path.display().to_string());
+            }
+            Some(place)
+        })
         .map(place_item)
         .collect::<Vec<_>>();
     // Keep sections strictly grouped: local, Windows portable
@@ -7644,6 +7759,7 @@ fn sync_annotations(state: &AppState) {
     *state.annotations.borrow_mut() =
         favnyr_core::annotations::AnnotationStore::load(&paths::annotations_path());
     *state.annotations_stamp.borrow_mut() = stamp;
+    state.annotations_dirty.set(true);
 }
 
 /// The store, for reading a listing.
@@ -7669,11 +7785,239 @@ fn annotations_for_update(
 /// Cosmetic data: a failure is logged and never interrupts the operation that
 /// asked for it.
 fn save_annotations(state: &AppState, annotations: &favnyr_core::annotations::AnnotationStore) {
+    state.annotations_dirty.set(true);
     if let Err(err) = annotations.save(&paths::annotations_path()) {
         error!(error = %err, "save annotations failed");
         return;
     }
     *state.annotations_stamp.borrow_mut() = annotations_stamp();
+}
+
+/// Carries every path-owned reference after a successful in-app rename.
+/// Annotations, favorites and sidebar redirects are persisted immediately;
+/// tabs and their histories remain workspace state and follow the normal
+/// workspace save lifecycle.
+fn track_renamed_path(window: &MainWindow, state: &AppState, from: &Path, to: &Path) {
+    {
+        let mut annotations = annotations_for_update(state);
+        annotations.rename(from, to);
+        save_annotations(state, &annotations);
+    }
+
+    let favorites_changed = {
+        let mut favorites = favorites_for_update(state);
+        favorites.relocate_paths(from, to)
+    };
+    if favorites_changed {
+        save_favorites(state);
+        push_favorites_ui(window, state);
+    }
+
+    let visible_shortcuts: Vec<PathBuf> = window
+        .get_sidebar_places_shortcuts()
+        .iter()
+        .map(|place| PathBuf::from(place.path.as_str()))
+        .collect();
+    if visible_shortcuts
+        .iter()
+        .any(|path| ops::is_within(path, from))
+    {
+        state.persist_config(|config| {
+            redirect_shortcuts_after_rename(
+                &mut config.sidebar_shortcut_redirects,
+                &visible_shortcuts,
+                from,
+                to,
+            );
+        });
+        refresh_sidebar(window, state);
+    }
+
+    let open_paths_changed = {
+        let mut panels = state.panels.borrow_mut();
+        let mut closed_tabs = state.closed_tabs.borrow_mut();
+        relocate_open_paths(&mut panels, &mut closed_tabs, from, to)
+    };
+    if open_paths_changed {
+        state.persist_workspace();
+    }
+}
+
+fn redirect_shortcuts_after_rename(
+    redirects: &mut std::collections::BTreeMap<String, String>,
+    visible_shortcuts: &[PathBuf],
+    from: &Path,
+    to: &Path,
+) -> bool {
+    let mut changed = false;
+    for destination in redirects.values_mut() {
+        if let Some(relocated) = ops::relocated_path(Path::new(destination), from, to) {
+            *destination = relocated.to_string_lossy().into_owned();
+            changed = true;
+        }
+    }
+    for path in visible_shortcuts {
+        if let Some(relocated) = ops::relocated_path(path, from, to) {
+            let key = path.to_string_lossy().into_owned();
+            let value = relocated.to_string_lossy().into_owned();
+            if redirects.get(&key) != Some(&value) {
+                redirects.insert(key, value);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn relocate_open_paths(
+    panels: &mut [Panel],
+    closed_tabs: &mut [TabState],
+    from: &Path,
+    to: &Path,
+) -> bool {
+    let mut changed = false;
+    for panel in panels {
+        if let Some(relocated) = ops::relocated_path(&panel.displayed_path, from, to) {
+            panel.displayed_path = relocated;
+            changed = true;
+        }
+        for tab in &mut panel.tabs.tabs {
+            if let Some(relocated) = ops::relocated_path(&tab.current_path, from, to) {
+                tab.current_path = relocated;
+                changed = true;
+            }
+            changed |= tab.history.relocate(from, to);
+        }
+    }
+    for tab in closed_tabs {
+        let path = Path::new(&tab.path);
+        if let Some(relocated) = ops::relocated_path(path, from, to) {
+            tab.path = relocated.to_string_lossy().into_owned();
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Updates cosmetic fields in place: no directory scan, model replacement,
+/// selection reset or drag interruption. Unchanged stores cost only a stat.
+fn refresh_annotations_ui(window: &MainWindow, state: &AppState) {
+    let annotations = annotations_now(state);
+    if !state.annotations_dirty.replace(false) {
+        return;
+    }
+    refresh_annotation_models(&annotations, &window.get_panels(), &window.get_fav_nodes());
+    drop(annotations);
+    if regroup_colored_folder_panels(state) {
+        update_panels_ui(window, state);
+        // Background deliveries carry their original row index and verify the
+        // full path before writing. Rebuild their queues with the new indices
+        // so a safe rejection cannot leave a moved row without pending data.
+        request_thumbnails(state);
+        request_folder_stats(state);
+        request_imgmeta(state);
+    }
+}
+
+/// Reorders only panels using the colour grouping after an annotation update.
+/// Rows keep their selection, thumbnails and computed data; only their order
+/// and vertical geometry change. Cursor and range-selection anchors continue
+/// to designate the same entries after the move.
+fn regroup_colored_folder_panels(state: &AppState) -> bool {
+    let compact_icon_rows = state.config.borrow().compact_icon_rows_in_preview;
+    let mut regrouped = false;
+    let mut panels = state.panels.borrow_mut();
+    for panel in panels.iter_mut() {
+        let active = panel.tabs.active;
+        let tab = &panel.tabs.tabs[active];
+        if tab.group_mode != GroupMode::ColoredFoldersFirst {
+            continue;
+        }
+
+        let mut rows: Vec<FileRow> = panel.rows_model.iter().collect();
+        let previous_order: Vec<String> = rows
+            .iter()
+            .map(|row| row.name.as_str().to_owned())
+            .collect();
+        let anchor_name = usize::try_from(tab.selection_anchor)
+            .ok()
+            .and_then(|index| previous_order.get(index))
+            .cloned();
+        let cursor_name = usize::try_from(tab.cursor)
+            .ok()
+            .and_then(|index| previous_order.get(index))
+            .cloned();
+
+        group_colored_folder_rows(&mut rows);
+        if rows
+            .iter()
+            .map(|row| row.name.as_str())
+            .eq(previous_order.iter().map(String::as_str))
+        {
+            continue;
+        }
+
+        let tab = &mut panel.tabs.tabs[active];
+        tab.selection_anchor = anchor_name
+            .as_deref()
+            .and_then(|name| rows.iter().position(|row| row.name == name))
+            .map_or(-1, |index| index as i32);
+        tab.cursor = cursor_name
+            .as_deref()
+            .and_then(|name| rows.iter().position(|row| row.name == name))
+            .map_or(-1, |index| index as i32);
+        layout_rows(&mut rows, tab.zoom, compact_icon_rows);
+        panel.replace_rows(rows);
+        regrouped = true;
+    }
+    regrouped
+}
+
+fn refresh_annotation_models(
+    annotations: &favnyr_core::annotations::AnnotationStore,
+    panels: &ModelRc<PanelView>,
+    favorites: &ModelRc<FavNode>,
+) {
+    for panel in panels.iter() {
+        for (index, mut row) in panel.rows.iter().enumerate() {
+            // Each row retains its displayed parent, including during an
+            // asynchronous navigation whose new listing has not arrived yet.
+            let path = Path::new(row.path.as_str()).join(row.name.as_str());
+            let slot = i32::from(annotations.color_of(&path));
+            let note = annotations.note_of(&path);
+            if row.folder_slot != slot || row.comment != note {
+                row.folder_slot = slot;
+                row.comment = note.into();
+                panel.rows.set_row_data(index, row);
+            }
+        }
+        for (index, mut tab) in panel.tabs.iter().enumerate() {
+            let slot = i32::from(annotations.color_of(Path::new(tab.path.as_str())));
+            if tab.folder_slot != slot {
+                tab.folder_slot = slot;
+                panel.tabs.set_row_data(index, tab);
+            }
+        }
+    }
+    for (index, mut favorite) in favorites.iter().enumerate() {
+        let slot = favorite_folder_slot(&favorite, annotations);
+        if favorite.folder_slot != slot {
+            favorite.folder_slot = slot;
+            favorites.set_row_data(index, favorite);
+        }
+    }
+}
+
+/// Virtual containers and legacy file bookmarks do not carry folder colours.
+fn favorite_folder_slot(
+    favorite: &FavNode,
+    annotations: &favnyr_core::annotations::AnnotationStore,
+) -> i32 {
+    if !favorite.is_container && favorite.is_dir {
+        i32::from(annotations.color_of(Path::new(favorite.path.as_str())))
+    } else {
+        0
+    }
 }
 
 /// Re-reads the favorites tree when the file changed under us. Same shape, and
@@ -7715,7 +8059,10 @@ fn save_favorites(state: &AppState) {
 
 /// Converts a flattened core node into a Slint struct (existence checked for
 /// favorites → grayed out if the path is missing).
-fn flat_to_favnode(f: &FlatFav) -> FavNode {
+fn flat_to_favnode(
+    f: &FlatFav,
+    annotations: &favnyr_core::annotations::AnnotationStore,
+) -> FavNode {
     // One metadata read answers both questions and follows directory symlinks,
     // matching navigation. Containers carry no filesystem path.
     let metadata = (!f.is_container && !f.path.is_empty())
@@ -7723,7 +8070,7 @@ fn flat_to_favnode(f: &FlatFav) -> FavNode {
         .flatten();
     let available = f.is_container || f.path.is_empty() || metadata.is_some();
     let is_dir = metadata.is_some_and(|entry| entry.is_dir());
-    FavNode {
+    let mut node = FavNode {
         id: f.id.clone().into(),
         label: f.name.clone().into(),
         path: f.path.clone().into(),
@@ -7733,7 +8080,10 @@ fn flat_to_favnode(f: &FlatFav) -> FavNode {
         has_children: f.has_children,
         available,
         is_dir,
-    }
+        folder_slot: 0,
+    };
+    node.folder_slot = favorite_folder_slot(&node, annotations);
+    node
 }
 
 // "Open with" openers ----------
@@ -7808,7 +8158,8 @@ fn is_drop_runnable(p: &Path) -> bool {
 
 /// Builds a `slint::Image` from the exe's icon (empty if unavailable).
 fn opener_icon(path: &str) -> Image {
-    match openwith::icon_rgba(path) {
+    let expanded = actions::expand_program_path(path);
+    match openwith::icon_rgba(&expanded.to_string_lossy()) {
         Some((rgba, w, h)) => Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
             &rgba, w, h,
         )),
@@ -7919,7 +8270,7 @@ fn opener_to_item(opener: &openers::Opener) -> OpenerItem {
     OpenerItem {
         id: opener.id.clone().into(),
         label: opener.label.clone().into(),
-        available: opener.assoc.is_some() || Path::new(&opener.program).is_file(),
+        available: opener.assoc.is_some() || actions::program_is_valid(&opener.program),
         icon: if icon == openers::OpenerIcon::None {
             opener_icon(&opener.program)
         } else {
@@ -8361,6 +8712,7 @@ struct Recipe {
     ctx_exts: &'static [&'static str],
     /// Visual family persisted with commands created from this template.
     icon: openers::OpenerIcon,
+    archive_dialog: bool,
 }
 
 impl Recipe {
@@ -8392,34 +8744,21 @@ const SEVEN_ZIP: &[&str] = &[
 /// Order matters — it is the display order: archivers first, grouped by tool,
 /// then sharing.
 ///
-/// None of these tools opens a format-chooser dialog: the archivers listed
-/// here are driven entirely from their command line (on Windows such a dialog
-/// belongs to the shell extension, which Favnyr already exposes through the
-/// native context menu), and `tar` has no interface at all.
+/// The interactive compression recipe opens Favnyr's options dialog. Legacy
+/// extraction templates are supervised when their executable and arguments
+/// still match; other templates remain ordinary editable commands.
 const RECIPES: &[Recipe] = &[
-    // ----- 7-Zip -----
-    // One archive per selected item, named after it, created alongside it.
     Recipe {
         tool: "7z",
-        label_key: "ow_recipe_compress_each",
-        programs: SEVEN_ZIP,
-        args: "a {dir}/{stem}.7z {file}",
-        ctx_exts: &[openers::CTX_EXT_ALL],
-        ctx: openers::CTX_FILE | openers::CTX_DIR,
-        icon: openers::OpenerIcon::SevenZip,
-    },
-    // Everything in ONE archive, which `{files}` exists to make expressible.
-    // `{setname}` names it after the selected item when there is only one, and
-    // after the folder they share otherwise — what archivers do.
-    Recipe {
-        tool: "7z",
-        label_key: "ow_recipe_compress_zip",
+        label_key: "archive_compress_to",
         programs: SEVEN_ZIP,
         args: "a {dir}/{setname}.zip {files}",
         ctx_exts: &[openers::CTX_EXT_ALL],
         ctx: openers::CTX_FILE | openers::CTX_DIR,
         icon: openers::OpenerIcon::SevenZip,
+        archive_dialog: true,
     },
+    // ----- 7-Zip -----
     Recipe {
         tool: "7z",
         label_key: "ow_recipe_extract_here",
@@ -8428,6 +8767,7 @@ const RECIPES: &[Recipe] = &[
         ctx_exts: rfs::ARCHIVE_EXTENSIONS,
         ctx: openers::CTX_FILE,
         icon: openers::OpenerIcon::SevenZip,
+        archive_dialog: false,
     },
     // Into a subfolder named after the archive, so a messy archive does not
     // scatter its contents over the current folder. 7-Zip creates the folder.
@@ -8439,6 +8779,7 @@ const RECIPES: &[Recipe] = &[
         ctx_exts: rfs::ARCHIVE_EXTENSIONS,
         ctx: openers::CTX_FILE,
         icon: openers::OpenerIcon::SevenZip,
+        archive_dialog: false,
     },
     // ----- tar -----
     // `-C {dir}` plus bare names: handed absolute paths, tar strips the leading
@@ -8452,6 +8793,7 @@ const RECIPES: &[Recipe] = &[
         ctx_exts: &[openers::CTX_EXT_ALL],
         ctx: openers::CTX_FILE | openers::CTX_DIR,
         icon: openers::OpenerIcon::Archive,
+        archive_dialog: false,
     },
     // Own label key rather than the one 7z's identical-looking recipe uses:
     // this family carries a "Tar - " prefix in its wording, on top of the icon,
@@ -8466,6 +8808,7 @@ const RECIPES: &[Recipe] = &[
         ctx_exts: rfs::ARCHIVE_EXTENSIONS,
         ctx: openers::CTX_FILE,
         icon: openers::OpenerIcon::Archive,
+        archive_dialog: false,
     },
     // `--one-top-level` (bare) both creates the destination folder — unlike
     // `-C`, which needs it to exist — and derives its name from the archive.
@@ -8482,6 +8825,7 @@ const RECIPES: &[Recipe] = &[
         ctx_exts: rfs::ARCHIVE_EXTENSIONS,
         ctx: openers::CTX_FILE,
         icon: openers::OpenerIcon::Archive,
+        archive_dialog: false,
     },
     // ----- Sharing -----
     // No cross-desktop standard exists on Linux: the entry Dolphin offers comes
@@ -8500,6 +8844,7 @@ const RECIPES: &[Recipe] = &[
         ctx_exts: &[openers::CTX_EXT_ALL],
         ctx: openers::CTX_FILE,
         icon: openers::OpenerIcon::Email,
+        archive_dialog: false,
     },
     // The GUI handler, not `kdeconnect-cli`: it opens a picker limited to
     // paired, reachable devices, whereas the CLI demands a device id up front.
@@ -8511,6 +8856,7 @@ const RECIPES: &[Recipe] = &[
         ctx_exts: &[openers::CTX_EXT_ALL],
         ctx: openers::CTX_FILE,
         icon: openers::OpenerIcon::Device,
+        archive_dialog: false,
     },
     // Both take the files last and show a device chooser when none is given,
     // so the whole selection goes in one run.
@@ -8522,6 +8868,7 @@ const RECIPES: &[Recipe] = &[
         ctx_exts: &[openers::CTX_EXT_ALL],
         ctx: openers::CTX_FILE,
         icon: openers::OpenerIcon::Device,
+        archive_dialog: false,
     },
 ];
 
@@ -8576,6 +8923,12 @@ fn recompute_ow_preview(window: &MainWindow, state: &AppState) {
     // command on Linux — see `program_is_valid`.
     window
         .set_ow_popup_valid(window.get_ow_popup_is_store() || actions::program_is_valid(&program));
+    if window.get_ow_popup_archive_dialog() {
+        let lang = state.config.borrow().language;
+        window.set_ow_popup_preview(i18n::tr(lang, "archive_compress_to").into());
+        window.set_ow_popup_runs(i18n::tr(lang, "ow_runs_once").into());
+        return;
+    }
     let selection = selected_paths(state);
     // Sample used to resolve the tags. A bare "example.txt" would leave `{dir}`
     // empty, so an argument like `{dir}/out.7z` would render as "/out.7z" and
@@ -8595,6 +8948,7 @@ fn recompute_ow_preview(window: &MainWindow, state: &AppState) {
         program: program.clone(),
         assoc: None,
         icon: openers::OpenerIcon::None,
+        archive_dialog: false,
         args,
         default_exts: Vec::new(),
         used_exts: Vec::new(),
@@ -8751,8 +9105,9 @@ fn create_link_entry(
 // Only used by the `.lnk` path (see `open_shortcut_as_tab`, Windows).
 #[cfg(windows)]
 fn open_dir_in_new_tab(window: &MainWindow, state: &AppState, dir: &Path) {
+    let default_preview = state.config.borrow().default_preview_mode;
     let opened = state.with_tabs_mut(|book| {
-        let a = book.open_after_active(dir.to_path_buf());
+        let a = book.open_after_active(dir.to_path_buf(), default_preview);
         book.tabs[a].current_path.clone()
     });
     load_directory(window, state, &opened, false);
@@ -8859,9 +9214,20 @@ fn plan_open(paths: &[PathBuf], opener_for: impl Fn(&str) -> Option<String>) -> 
 
 /// Runs one opener over the files it was chosen for, and records the use so the
 /// "Open with" list keeps its order of preference.
-fn run_default_opener(state: &AppState, op: &openers::Opener, paths: &[PathBuf], ext: &str) {
-    if let Err(err) = actions::run_opener(op, paths) {
+fn run_default_opener(
+    window: &MainWindow,
+    state: &AppState,
+    op: &openers::Opener,
+    paths: &[PathBuf],
+    ext: &str,
+) {
+    if let Err(err) = archive::run_opener(window, state, op, paths) {
         error!(error = %err, "run default opener failed");
+        notice(
+            window,
+            i18n::tr(state.config.borrow().language, "ow_run_failed").replace("{name}", &op.label),
+            NoticeKind::Error,
+        );
         return;
     }
     state.openers.borrow_mut().record_use(&op.id, Some(ext));
@@ -8870,7 +9236,7 @@ fn run_default_opener(state: &AppState, op: &openers::Opener, paths: &[PathBuf],
 
 /// Opens ONE file (never a folder): the Favnyr default for its extension if
 /// there is one, otherwise the OS default.
-fn open_one_file_default(state: &AppState, path: &PathBuf) {
+fn open_one_file_default(window: &MainWindow, state: &AppState, path: &PathBuf) {
     let ext = ext_of(path);
     // Bound BEFORE the branch, and it must stay that way. The `Ref` a scrutinee
     // produces lives for the WHOLE body of an `if let`, and running the opener
@@ -8878,7 +9244,7 @@ fn open_one_file_default(state: &AppState, path: &PathBuf) {
     // and compiles fine; it panics at run time.
     let opener = state.openers.borrow().default_for(&ext).cloned();
     if let Some(op) = opener {
-        run_default_opener(state, &op, std::slice::from_ref(path), &ext);
+        run_default_opener(window, state, &op, std::slice::from_ref(path), &ext);
         return;
     }
     #[cfg(windows)]
@@ -8909,7 +9275,7 @@ const OPEN_MANY_PROMPT_AT: usize = 15;
 /// for the answer to matter.
 fn open_selected_files(window: &MainWindow, state: &AppState, paths: Vec<PathBuf>) {
     if paths.len() <= OPEN_MANY_PROMPT_AT {
-        open_file_default(state, &paths);
+        open_file_default(window, state, &paths);
         return;
     }
     let lang = state.config.borrow().language;
@@ -8929,9 +9295,9 @@ fn open_selected_files(window: &MainWindow, state: &AppState, paths: Vec<PathBuf
 /// get alone — one rule to predict rather than two. Files that share a Favnyr
 /// opener are the one exception, handed over in a single go so an editor opens
 /// one window instead of several.
-fn open_file_default(state: &AppState, paths: &[PathBuf]) {
+fn open_file_default(window: &MainWindow, state: &AppState, paths: &[PathBuf]) {
     if let [only] = paths {
-        open_one_file_default(state, only);
+        open_one_file_default(window, state, only);
         return;
     }
     let plan = plan_open(paths, |ext| {
@@ -8948,9 +9314,9 @@ fn open_file_default(state: &AppState, paths: &[PathBuf]) {
                     continue;
                 };
                 let ext = paths.first().map(|p| ext_of(p)).unwrap_or_default();
-                run_default_opener(state, &op, &paths, &ext);
+                run_default_opener(window, state, &op, &paths, &ext);
             }
-            Launch::System(path) => open_one_file_default(state, &path),
+            Launch::System(path) => open_one_file_default(window, state, &path),
         }
     }
 }
@@ -8971,6 +9337,7 @@ fn open_ow_create(window: &MainWindow, state: &AppState, program: &str, name: &s
     window.set_ow_popup_name(name.into());
     window.set_ow_popup_program(program.into());
     window.set_ow_popup_icon_kind(openers::OpenerIcon::None.as_i32());
+    window.set_ow_popup_archive_dialog(false);
     window.set_ow_popup_is_store(false); // creation = command with an executable
     window.set_ow_popup_args(SharedString::new());
     window.set_ow_popup_default_ext(SharedString::new());
@@ -8991,7 +9358,12 @@ fn open_ow_create(window: &MainWindow, state: &AppState, program: &str, name: &s
 /// Pushes the flattened tree + the container dropdown to the GUI.
 fn push_favorites_ui(window: &MainWindow, state: &AppState) {
     let fav = favorites_now(state);
-    let rows: Vec<FavNode> = fav.flatten().iter().map(flat_to_favnode).collect();
+    let annotations = annotations_now(state);
+    let rows: Vec<FavNode> = fav
+        .flatten()
+        .iter()
+        .map(|row| flat_to_favnode(row, &annotations))
+        .collect();
     window.set_fav_nodes(ModelRc::new(VecModel::from(rows)));
     // Toggles "Collapse all" (if ≥1 container is expanded) / "Expand all".
     window.set_fav_can_collapse(fav.any_expanded());
@@ -9058,6 +9430,7 @@ fn open_path_in_tab_at(
     let Some(panel) = usize::try_from(panel).ok() else {
         return false;
     };
+    let default_preview = state.config.borrow().default_preview_mode;
     {
         let mut panels = state.panels.borrow_mut();
         let Some(target) = panels.get_mut(panel) else {
@@ -9065,7 +9438,7 @@ fn open_path_in_tab_at(
         };
         target
             .tabs
-            .insert_tab_at(gap.max(0) as usize, Tab::new(path.clone()));
+            .insert_tab_at(gap.max(0) as usize, Tab::new(path.clone(), default_preview));
     }
     *state.active_panel.borrow_mut() = panel;
     load_directory(window, state, &path, false);
@@ -9080,8 +9453,9 @@ fn fav_open_path_new_tab(window: &MainWindow, state: &AppState, p: PathBuf) {
     let Some(target) = resolve_fav_dir(window, &p, lang) else {
         return;
     };
+    let default_preview = state.config.borrow().default_preview_mode;
     let opened = state.with_tabs_mut(|book| {
-        let a = book.open_after_active(target);
+        let a = book.open_after_active(target, default_preview);
         book.tabs[a].current_path.clone()
     });
     load_directory(window, state, &opened, false);
@@ -9114,6 +9488,12 @@ fn default_alias(p: &Path) -> String {
         .unwrap_or_else(|| p.display().to_string())
 }
 
+/// Only existing directories may be newly added to Favorites. Loading and
+/// manipulating older favorite entries remains independent from this gate.
+fn favorite_path_is_directory(path: &Path) -> bool {
+    path.is_dir()
+}
+
 /// Saves `paths` into the `container` favorites folder: deduplication
 /// (already-present path ignored) + default alias, then saves + refreshes
 /// the UI + appropriate toast (added / already present). SHARED core for drag
@@ -9124,12 +9504,16 @@ fn add_paths_to_favorite(
     state: &AppState,
     paths: &[PathBuf],
     container: &str,
-) {
+) -> bool {
     // EMPTY `container` = root (""): drop on the "no favorites" zone / favorites
-    // dead zone. The model handles "" as the root container; we only
-    // reject the absence of paths now.
+    // dead zone. The model handles "" as the root container; this boundary
+    // keeps regular files out without changing how older entries are loaded.
+    let paths: Vec<&PathBuf> = paths
+        .iter()
+        .filter(|path| favorite_path_is_directory(path))
+        .collect();
     if paths.is_empty() {
-        return;
+        return false;
     }
     let mut added = 0usize;
     {
@@ -9165,10 +9549,12 @@ fn add_paths_to_favorite(
             NoticeKind::FavExists,
         );
     }
+    true
 }
 
 /// Opens the "Save as favorite" popup for a set of paths.
-fn open_fav_save_popup(window: &MainWindow, state: &AppState, paths: Vec<PathBuf>) {
+fn open_fav_save_popup(window: &MainWindow, state: &AppState, mut paths: Vec<PathBuf>) {
+    paths.retain(|path| favorite_path_is_directory(path));
     if paths.is_empty() {
         return;
     }
@@ -9383,6 +9769,7 @@ fn apply_initial_listing(
         }
         let big_icon = tab.preview;
         let zoom = tab.zoom;
+        let group_mode = tab.group_mode;
         p.pending_initial = false;
         match res {
             Ok((entries, hidden_count)) => {
@@ -9397,6 +9784,7 @@ fn apply_initial_listing(
                         big_icon,
                         zoom,
                         compact_icon_rows,
+                        group_mode,
                         annotations: &annotations_now(state),
                     },
                 );
@@ -9542,6 +9930,7 @@ fn relist_panel(state: &AppState, i: usize) {
                     big_icon,
                     zoom,
                     compact_icon_rows,
+                    group_mode,
                     annotations: &annotations_now(state),
                 },
             );
@@ -10140,6 +10529,9 @@ fn clear_external_hover(window: &MainWindow) {
 fn set_external_file_hover(window: &MainWindow, screen_x: i32, screen_y: i32, copy: bool) {
     let (wx, wy) = screen_to_window_logical(window, screen_x, screen_y);
     window.set_file_drag_source_panel(-1);
+    // The OLE hover message carries no paths, so it cannot prove that the
+    // payload contains a directory eligible for Favorites.
+    window.set_file_drag_selection_has_dir(false);
     window.set_file_drag_target_invalid(false);
     window.set_file_drag_copy(copy);
     window.set_file_drag_abs_x(wx);
@@ -10151,6 +10543,7 @@ fn set_external_file_hover(window: &MainWindow, screen_x: i32, screen_y: i32, co
 fn clear_external_file_hover(window: &MainWindow) {
     if window.get_file_drag_active() && window.get_file_drag_source_panel() < 0 {
         window.set_file_drag_active(false);
+        window.set_file_drag_selection_has_dir(false);
         window.set_file_drag_target_panel(-1);
         window.set_file_drag_target_row(-1);
         window.set_file_drag_target_folder(false);
@@ -10261,13 +10654,14 @@ fn on_tab_received(window: &MainWindow, state: &AppState, payload: &str) {
         None => String::new(),
     };
     clear_external_hover(window); // clears the insertion preview in all cases
-    if !fav_container.is_empty() {
-        add_paths_to_favorite(
+    if !fav_container.is_empty()
+        && add_paths_to_favorite(
             window,
             state,
             std::slice::from_ref(&tab.current_path),
             &fav_container,
-        );
+        )
+    {
         return;
     }
     let (panel, gap) = match drop {
@@ -10426,6 +10820,7 @@ fn split_with_path(
     dir: SplitDir,
     new_first: bool,
 ) -> bool {
+    let default_preview = state.config.borrow().default_preview_mode;
     let mut panels = state.panels.borrow_mut();
     if target_panel >= panels.len() || panels.len() >= MAX_PANELS {
         return false;
@@ -10436,7 +10831,7 @@ fn split_with_path(
     let inherited_mode = panels[target_panel].tab_bar_mode;
     let inherited_vbar = panels[target_panel].vbar_user_w;
     let panel = Panel::from_tab(
-        Tab::new(path),
+        Tab::new(path, default_preview),
         inherited_cols,
         inherited_mode,
         inherited_vbar,
@@ -10828,8 +11223,24 @@ fn begin_paste_with_cleanup(
     if dst_dir.as_os_str().is_empty() || sources.is_empty() {
         return;
     }
-    // Refuses a second paste while one is still being resolved.
+    // Refuses a second paste while one is still being resolved, and says so.
+    // An OLE drop from another application reaches this point without the user
+    // ever touching Favnyr's window, so a silent refusal looks exactly like a
+    // drag that did nothing — and the staging tree holding the dropped bytes is
+    // released on the way out, leaving no trace at all. The waiting dialog can
+    // easily sit behind the application the drag came from.
     if state.paste_job.borrow().is_some() {
+        warn!(
+            destination = %dst_dir.display(),
+            count = sources.len(),
+            "a paste is still waiting on its name conflict: the new one is refused"
+        );
+        let lang = state.snapshot_config().language;
+        notice(
+            window,
+            i18n::tr(lang, "paste_already_pending"),
+            NoticeKind::Error,
+        );
         return;
     }
     let mut job = PasteJob {
@@ -11721,6 +12132,7 @@ fn apply_async_listing(window: &MainWindow, state: &AppState, delivery: AsyncLis
             return; // stale response: a more recent navigation has won
         }
         let zoom = panel.tabs.tabs[active].zoom;
+        let group_mode = panel.tabs.tabs[active].group_mode;
         panel.pending_listing = false;
         let pending_select = panel.pending_select.take();
         let pending_focus = pending_select.clone();
@@ -11737,6 +12149,7 @@ fn apply_async_listing(window: &MainWindow, state: &AppState, delivery: AsyncLis
                         big_icon: delivery.big_icon,
                         zoom,
                         compact_icon_rows,
+                        group_mode,
                         annotations: &annotations_now(state),
                     },
                 );
@@ -11948,6 +12361,7 @@ fn refresh_listing_sync(window: &MainWindow, state: &AppState, path: &Path) {
             big_icon,
             zoom,
             compact_icon_rows: cfg.compact_icon_rows_in_preview,
+            group_mode,
             annotations: &annotations_now(state),
         },
     );
@@ -12247,6 +12661,7 @@ fn push_geometry_inplace(window: &MainWindow, state: &AppState) {
 /// (each panel carries its row model, its tabs, its current
 /// path, its pre-formatted footer, etc.).
 fn update_panels_ui(window: &MainWindow, state: &AppState) {
+    let annotations = annotations_now(state);
     let panels = state.panels.borrow();
     let lang = state.config.borrow().language;
     let strings = i18n::strings_for(lang);
@@ -12292,6 +12707,7 @@ fn update_panels_ui(window: &MainWindow, state: &AppState) {
                     .zip(&p.tabs.tabs)
                     .map(|((title, (width, offset)), t)| TabInfo {
                         title: title.into(),
+                        folder_slot: i32::from(annotations.color_of(&t.current_path)),
                         width,
                         offset,
                         // Full path → tooltip on hover.
@@ -14511,6 +14927,7 @@ struct RowContext<'a> {
     big_icon: bool,
     zoom: i32,
     compact_icon_rows: bool,
+    group_mode: GroupMode,
     annotations: &'a favnyr_core::annotations::AnnotationStore,
 }
 
@@ -14619,14 +15036,34 @@ fn entries_to_rows(entries: &[Entry], parent_display: &str, ctx: &RowContext) ->
     let RowContext {
         zoom,
         compact_icon_rows,
+        group_mode,
         ..
     } = *ctx;
     let mut rows: Vec<FileRow> = entries
         .iter()
         .map(|entry| entry_to_row(entry, parent_display, ctx))
         .collect();
+    if group_mode == GroupMode::ColoredFoldersFirst {
+        group_colored_folder_rows(&mut rows);
+    }
     layout_rows(&mut rows, zoom, compact_icon_rows);
     rows
+}
+
+/// Stable subdivision applied after folder colours have been projected onto
+/// rows. The active column sort already ordered the folder and file blocks;
+/// preserving equal-rank order keeps that criterion intact inside all three
+/// resulting blocks.
+fn group_colored_folder_rows(rows: &mut [FileRow]) {
+    rows.sort_by_key(|row| {
+        if row.is_dir && row.folder_slot > 0 {
+            0
+        } else if row.is_dir {
+            1
+        } else {
+            2
+        }
+    });
 }
 
 // ---------- Selection helpers (Slint model manipulation) ----------
@@ -15853,6 +16290,7 @@ mod tests {
             program: "7z".into(),
             assoc: None,
             icon: openers::OpenerIcon::None,
+            archive_dialog: false,
             args: vec![],
             default_exts: vec![],
             used_exts: vec![],
@@ -15952,7 +16390,7 @@ mod tests {
         // Actions that must cover the whole selection in a single run; every
         // other one runs per selected item.
         const RUN_ONCE: &[&str] = &[
-            "ow_recipe_compress_zip",
+            "archive_compress_to",
             "ow_recipe_compress_targz",
             "ow_recipe_share_bluetooth",
         ];
@@ -15983,6 +16421,7 @@ mod tests {
                 assoc: None,
                 // Simulates an opener saved before recipe icons were persisted.
                 icon: openers::OpenerIcon::None,
+                archive_dialog: false,
                 args: split_args(r.args),
                 default_exts: Vec::new(),
                 used_exts: Vec::new(),
@@ -16228,14 +16667,14 @@ mod tests {
     #[test]
     fn contextual_open_and_duplicate_share_adjacent_tab_insertion() {
         let mut book = TabBook {
-            tabs: vec![Tab::new(PathBuf::from("A"))],
+            tabs: vec![Tab::new(PathBuf::from("A"), false)],
             active: 0,
         };
-        book.open(PathBuf::from("B"));
-        book.open(PathBuf::from("C"));
+        book.open(PathBuf::from("B"), false);
+        book.open(PathBuf::from("C"), false);
         assert!(book.select(0));
 
-        let opened = book.open_after_active(PathBuf::from("X"));
+        let opened = book.open_after_active(PathBuf::from("X"), false);
         assert_eq!(opened, 1);
         assert_eq!(book.active, 1);
         assert_eq!(
@@ -16260,12 +16699,12 @@ mod tests {
     #[test]
     fn an_external_location_is_inserted_at_the_claimed_tab_gap() {
         let mut book = TabBook {
-            tabs: vec![Tab::new(PathBuf::from("A"))],
+            tabs: vec![Tab::new(PathBuf::from("A"), false)],
             active: 0,
         };
-        book.open(PathBuf::from("C"));
+        book.open(PathBuf::from("C"), false);
 
-        let inserted = book.insert_tab_at(1, Tab::new(PathBuf::from("B")));
+        let inserted = book.insert_tab_at(1, Tab::new(PathBuf::from("B"), false));
         assert_eq!(inserted, 1);
         assert_eq!(book.active, 1);
         assert_eq!(
@@ -16276,9 +16715,20 @@ mod tests {
             ["A", "B", "C"].map(Path::new)
         );
 
-        let appended = book.insert_tab_at(usize::MAX, Tab::new(PathBuf::from("D")));
+        let appended = book.insert_tab_at(usize::MAX, Tab::new(PathBuf::from("D"), false));
         assert_eq!(appended, 3);
         assert_eq!(book.active, 3);
+    }
+
+    #[test]
+    fn new_tab_display_mode_uses_the_matching_default_zoom() {
+        let list = Tab::new(PathBuf::from("folder01"), false);
+        assert!(!list.preview);
+        assert_eq!(list.zoom, LIST_DEFAULT_ZOOM);
+
+        let previews = Tab::new(PathBuf::from("folder02"), true);
+        assert!(previews.preview);
+        assert_eq!(previews.zoom, THUMB_DEFAULT_ZOOM);
     }
 
     #[test]
@@ -16300,19 +16750,213 @@ mod tests {
             has_children: false,
         };
 
-        let directory = flat_to_favnode(&row(&folder));
+        let mut annotations = favnyr_core::annotations::AnnotationStore::default();
+        annotations.set_color(&folder, 3);
+        annotations.set_color(&file, 4);
+        let directory = flat_to_favnode(&row(&folder), &annotations);
         assert!(directory.available);
         assert!(directory.is_dir);
+        assert_eq!(directory.folder_slot, 3);
 
-        let regular_file = flat_to_favnode(&row(&file));
+        let regular_file = flat_to_favnode(&row(&file), &annotations);
         assert!(regular_file.available);
         assert!(!regular_file.is_dir);
+        assert_eq!(regular_file.folder_slot, 0);
+        assert!(!favorite_path_is_directory(&file));
 
-        let missing = flat_to_favnode(&row(&root.join("missing")));
+        let missing = flat_to_favnode(&row(&root.join("missing")), &annotations);
         assert!(!missing.available);
         assert!(!missing.is_dir);
+        assert_eq!(missing.folder_slot, 0);
+        assert!(!favorite_path_is_directory(&root.join("missing")));
+
+        assert!(favorite_path_is_directory(&folder));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn annotations_refresh_all_views_tabs_and_favorites_in_place() {
+        let parent = PathBuf::from("directory_a");
+        let path = parent.join("directory_b");
+        let path_text: SharedString = path.to_string_lossy().as_ref().into();
+        let original_row = FileRow {
+            name: "directory_b".into(),
+            path: parent.to_string_lossy().as_ref().into(),
+            is_dir: true,
+            selected: true,
+            cut: true,
+            rendered: true,
+            model_index: 4,
+            visual_y: 128.0,
+            visual_h: 32.0,
+            ..FileRow::default()
+        };
+        let original_tab = TabInfo {
+            title: "directory_b".into(),
+            path: path_text.clone(),
+            width: 120.0,
+            offset: 122.0,
+            ..TabInfo::default()
+        };
+        let panels: ModelRc<PanelView> = ModelRc::new(VecModel::from(
+            (0..2)
+                .map(|active_tab_idx| PanelView {
+                    rows: ModelRc::new(VecModel::from(vec![original_row.clone()])),
+                    tabs: ModelRc::new(VecModel::from(vec![
+                        TabInfo::default(),
+                        original_tab.clone(),
+                    ])),
+                    active_tab_idx,
+                    // The listing still displays the previous path during navigation.
+                    current_path: "directory_c".into(),
+                    rows_revision: 7,
+                    viewport_reset_gen: 2,
+                    ..PanelView::default()
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let original_favorite = FavNode {
+            id: "favorite_a".into(),
+            label: "Saved directory".into(),
+            path: path_text,
+            available: true,
+            is_dir: true,
+            depth: 1,
+            ..FavNode::default()
+        };
+        let favorites: ModelRc<FavNode> = ModelRc::new(VecModel::from(vec![
+            original_favorite.clone(),
+            FavNode {
+                is_container: true,
+                ..original_favorite.clone()
+            },
+            FavNode {
+                is_dir: false,
+                ..original_favorite.clone()
+            },
+        ]));
+        let before: Vec<_> = panels.iter().collect();
+        let mut annotations = favnyr_core::annotations::AnnotationStore::default();
+        // Adding, changing and clearing share the same projection.
+        for slot in [1, 5, 0] {
+            annotations.set_color(&path, slot);
+            let note = if slot == 0 { "" } else { "Directory note" };
+            annotations.set_note(&path, note);
+            refresh_annotation_models(&annotations, &panels, &favorites);
+            for (index, panel) in panels.iter().enumerate() {
+                assert_eq!(panel, before[index]);
+                let row = panel.rows.row_data(0).unwrap();
+                assert_eq!(row.folder_slot, i32::from(slot));
+                assert_eq!(row.comment, note);
+                // Empty Slint images do not compare equal, so check the
+                // interaction and layout fields independently of those images.
+                assert_eq!(row.name, original_row.name);
+                assert_eq!(row.path, original_row.path);
+                assert_eq!(row.selected, original_row.selected);
+                assert_eq!(row.cut, original_row.cut);
+                assert_eq!(row.rendered, original_row.rendered);
+                assert_eq!(row.model_index, original_row.model_index);
+                assert_eq!(row.visual_y, original_row.visual_y);
+                assert_eq!(row.visual_h, original_row.visual_h);
+                assert_eq!(panel.tabs.row_data(0).unwrap(), TabInfo::default());
+                assert_eq!(
+                    panel.tabs.row_data(1).unwrap(),
+                    TabInfo {
+                        folder_slot: i32::from(slot),
+                        ..original_tab.clone()
+                    }
+                );
+            }
+            assert_eq!(
+                favorites.row_data(0).unwrap(),
+                FavNode {
+                    folder_slot: i32::from(slot),
+                    ..original_favorite.clone()
+                }
+            );
+            assert_eq!(favorites.row_data(1).unwrap().folder_slot, 0);
+            assert_eq!(favorites.row_data(2).unwrap().folder_slot, 0);
+        }
+        // Navigating an existing tab away must not retain the old tint.
+        annotations.set_color(&path, 2);
+        let tabs = panels.row_data(0).unwrap().tabs;
+        let mut tab = tabs.row_data(1).unwrap();
+        tab.path = "directory_c".into();
+        tab.folder_slot = 2;
+        tabs.set_row_data(1, tab);
+        refresh_annotation_models(&annotations, &panels, &favorites);
+        assert_eq!(tabs.row_data(1).unwrap().folder_slot, 0);
+        assert_eq!(
+            panels
+                .row_data(1)
+                .unwrap()
+                .tabs
+                .row_data(1)
+                .unwrap()
+                .folder_slot,
+            2
+        );
+    }
+
+    #[test]
+    fn colored_folder_grouping_preserves_selection_anchor_and_cursor() {
+        let state = AppState::new_at(Config::default(), PathBuf::from("root"), 0);
+        {
+            let mut panels = state.panels.borrow_mut();
+            let panel = &mut panels[0];
+            let tab = &mut panel.tabs.tabs[0];
+            tab.group_mode = GroupMode::ColoredFoldersFirst;
+            tab.selection_anchor = 0;
+            tab.cursor = 1;
+            let mut rows = vec![
+                FileRow {
+                    name: "folder_a".into(),
+                    is_dir: true,
+                    selected: true,
+                    ..FileRow::default()
+                },
+                FileRow {
+                    name: "folder_b".into(),
+                    is_dir: true,
+                    folder_slot: 3,
+                    ..FileRow::default()
+                },
+                FileRow {
+                    name: "folder_c".into(),
+                    is_dir: true,
+                    ..FileRow::default()
+                },
+                FileRow {
+                    name: "my_file.bin".into(),
+                    folder_slot: 4,
+                    ..FileRow::default()
+                },
+            ];
+            layout_rows(
+                &mut rows,
+                tab.zoom,
+                state.config.borrow().compact_icon_rows_in_preview,
+            );
+            panel.replace_rows(rows);
+        }
+
+        assert!(regroup_colored_folder_panels(&state));
+        let panels = state.panels.borrow();
+        let panel = &panels[0];
+        let rows: Vec<FileRow> = panel.rows_model.iter().collect();
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            ["folder_b", "folder_a", "folder_c", "my_file.bin"]
+        );
+        assert!(rows[1].selected);
+        assert_eq!(panel.tabs.tabs[0].selection_anchor, 1);
+        assert_eq!(panel.tabs.tabs[0].cursor, 0);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row.model_index, index as i32);
+        }
+        drop(panels);
+        assert!(!regroup_colored_folder_panels(&state));
     }
 
     #[test]
@@ -16872,7 +17516,12 @@ mod tests {
 
     #[test]
     fn zoom_keeps_the_single_visible_selection_at_the_same_screen_position() {
-        let panel = Panel::with_mode(PathBuf::from("gallery"), columns::default_columns(), 0);
+        let panel = Panel::with_mode(
+            PathBuf::from("gallery"),
+            columns::default_columns(),
+            0,
+            false,
+        );
         let mut rows: Vec<FileRow> = (0..80)
             .map(|index| FileRow {
                 name: format!("image-{index:02}.png").into(),
@@ -17118,7 +17767,7 @@ mod tests {
 
     #[test]
     fn changing_context_resets_the_exact_viewport_before_replacing_rows() {
-        let panel = Panel::with_mode(PathBuf::from("old"), columns::default_columns(), 0);
+        let panel = Panel::with_mode(PathBuf::from("old"), columns::default_columns(), 0, false);
         let mut rows: Vec<FileRow> = (0..2_000)
             .map(|index| FileRow {
                 preview_capable: index % 2 == 0,
@@ -17335,6 +17984,7 @@ mod tests {
             program: r"C:\Apps\Editor.exe".into(),
             assoc: Some("Applications\\Editor.exe".into()),
             icon: openers::OpenerIcon::None,
+            archive_dialog: false,
             args: vec!["--wait".into(), "{file}".into()],
             default_exts: vec!["rs".into()],
             used_exts: vec!["txt".into()],
@@ -17385,7 +18035,7 @@ mod tests {
     #[test]
     fn async_listing_only_accepts_the_latest_matching_navigation() {
         let path = PathBuf::from("network-a");
-        let mut panel = Panel::with_mode(path.clone(), columns::default_columns(), 0);
+        let mut panel = Panel::with_mode(path.clone(), columns::default_columns(), 0, false);
         panel.pending_listing = true;
         panel.listing_gen = 7;
 
@@ -17463,6 +18113,108 @@ mod tests {
             std::slice::from_ref(&file),
             &file,
             false
+        ));
+    }
+
+    #[test]
+    fn rename_redirects_shortcuts_without_touching_neighboring_paths() {
+        let mut redirects = std::collections::BTreeMap::from([
+            (
+                "root/original_shortcut".to_string(),
+                "root/directory_a/nested".to_string(),
+            ),
+            (
+                "root/other_shortcut".to_string(),
+                "root/directory_ab".to_string(),
+            ),
+        ]);
+        let visible = vec![
+            PathBuf::from("root/directory_a"),
+            PathBuf::from("root/directory_ab"),
+        ];
+
+        assert!(redirect_shortcuts_after_rename(
+            &mut redirects,
+            &visible,
+            Path::new("root/directory_a"),
+            Path::new("root/directory_b"),
+        ));
+        // Compared as PATHS: a redirect is rebuilt with the platform's own
+        // separator, which is not a fact about the redirection.
+        assert_eq!(
+            redirects.get("root/original_shortcut").map(Path::new),
+            Some(Path::new("root/directory_b/nested"))
+        );
+        assert_eq!(
+            redirects.get("root/directory_a").map(Path::new),
+            Some(Path::new("root/directory_b"))
+        );
+        assert_eq!(
+            redirects.get("root/other_shortcut").map(Path::new),
+            Some(Path::new("root/directory_ab"))
+        );
+    }
+
+    #[test]
+    fn rename_relocates_open_tabs_histories_and_closed_tabs() {
+        let source = PathBuf::from("root/directory_a");
+        let destination = PathBuf::from("root/directory_b");
+        let mut panels = vec![Panel::with_mode(
+            source.clone(),
+            columns::default_columns(),
+            0,
+            false,
+        )];
+        panels[0].tabs.open(source.join("nested"), false);
+        panels[0]
+            .tabs
+            .open(PathBuf::from("root/directory_ab"), false);
+        panels[0].displayed_path = source.join("shown");
+        panels[0].tabs.tabs[0].history.push(source.join("history"));
+        let mut closed_tabs = vec![
+            tab("root/directory_a/closed"),
+            tab("root/directory_ab/closed"),
+        ];
+
+        assert!(relocate_open_paths(
+            &mut panels,
+            &mut closed_tabs,
+            &source,
+            &destination
+        ));
+
+        assert_eq!(panels[0].displayed_path, destination.join("shown"));
+        assert_eq!(panels[0].tabs.tabs[0].current_path, destination);
+        assert_eq!(
+            panels[0].tabs.tabs[0].history.stack,
+            vec![
+                PathBuf::from("root/directory_b"),
+                PathBuf::from("root/directory_b/history"),
+            ]
+        );
+        assert_eq!(
+            panels[0].tabs.tabs[1].current_path,
+            PathBuf::from("root/directory_b/nested")
+        );
+        assert_eq!(
+            panels[0].tabs.tabs[2].current_path,
+            PathBuf::from("root/directory_ab")
+        );
+        assert_eq!(
+            closed_tabs
+                .iter()
+                .map(|tab| Path::new(tab.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                Path::new("root/directory_b/closed"),
+                Path::new("root/directory_ab/closed")
+            ]
+        );
+        assert!(!relocate_open_paths(
+            &mut panels,
+            &mut closed_tabs,
+            Path::new("root/missing"),
+            Path::new("root/replacement")
         ));
     }
 

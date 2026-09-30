@@ -26,6 +26,7 @@ use tracing::{info, warn};
 use favnyr_core::{Config, WorkspaceState, logging, paths, workspace};
 
 mod actions;
+mod archives;
 mod bridge;
 mod clipboard;
 mod i18n;

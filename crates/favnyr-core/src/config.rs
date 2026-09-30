@@ -127,6 +127,11 @@ pub struct Config {
         skip_serializing_if = "sidebar_section_order_is_default"
     )]
     pub sidebar_section_order: [SidebarSection; SidebarSection::COUNT],
+    /// Favnyr-side redirects for standard sidebar shortcuts renamed from
+    /// inside the application. Keys remain the OS-provided original paths, so
+    /// a later OS-side location change naturally supersedes stale entries.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sidebar_shortcut_redirects: std::collections::BTreeMap<String, String>,
     /// Default columns — applied on 1st launch and on "Reset".
     #[serde(default = "crate::columns::default_columns")]
     pub default_columns: Vec<crate::columns::ColumnSpec>,
@@ -152,6 +157,11 @@ pub struct Config {
     /// a split inherits from the view it split off, not this default.
     #[serde(default)]
     pub default_tab_bar_mode: u8,
+    /// Display mode used by newly created tabs and views. New installations
+    /// start in Previews; an absent field in an existing config keeps List.
+    /// Restored, duplicated, and transferred tabs keep their own per-tab mode.
+    #[serde(default)]
+    pub default_preview_mode: bool,
     /// Shows the full path as a tooltip when hovering a tab. `true` by default
     /// (`default = true` → earlier configs without the field keep it on too);
     /// the user can uncheck it.
@@ -225,11 +235,13 @@ impl Default for Config {
             left_panel: default_left_panel(),
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_section_order: SidebarSection::DEFAULT_ORDER,
+            sidebar_shortcut_redirects: std::collections::BTreeMap::new(),
             default_columns: crate::columns::default_columns(),
             shortcut_overrides: std::collections::BTreeMap::new(),
             recursive_mtime_depth: 0,
             recursive_size_depth: 0,
             default_tab_bar_mode: 0,
+            default_preview_mode: true,
             tab_path_tooltip: true,
             warn_unsaved_workspace: true,
             compact_icon_rows_in_preview: true,
@@ -308,7 +320,20 @@ mod tests {
             back.compact_icon_rows_in_preview,
             original.compact_icon_rows_in_preview
         );
+        assert_eq!(back.default_preview_mode, original.default_preview_mode);
         assert_eq!(back.sidebar_section_order, SidebarSection::DEFAULT_ORDER);
+        assert!(back.sidebar_shortcut_redirects.is_empty());
+    }
+
+    #[test]
+    fn explicit_list_mode_round_trips_despite_the_new_install_default() {
+        let original = Config {
+            default_preview_mode: false,
+            ..Config::default()
+        };
+        let serialized = toml::to_string_pretty(&original).unwrap();
+        let restored: Config = toml::from_str(&serialized).unwrap();
+        assert!(!restored.default_preview_mode);
     }
 
     #[test]
@@ -317,6 +342,8 @@ mod tests {
         let path = dir.join("config.toml");
         let cfg = Config::load_or_default(&path).unwrap();
         assert_eq!(cfg.language, Lang::default());
+        assert!(cfg.default_preview_mode);
+        assert!(Config::load_or_default(&path).unwrap().default_preview_mode);
         assert!(path.exists());
     }
 
@@ -333,6 +360,8 @@ mod tests {
         assert!(cfg.warn_unsaved_workspace);
         // Same backward compatibility for compact rows in preview.
         assert!(cfg.compact_icon_rows_in_preview);
+        // Earlier configurations keep the historical List default.
+        assert!(!cfg.default_preview_mode);
         // The global order absent from an old config falls back to the historical order.
         assert_eq!(cfg.sidebar_section_order, SidebarSection::DEFAULT_ORDER);
     }
@@ -369,6 +398,26 @@ mod tests {
         assert!(serialized.contains("sidebar_section_order"));
         let restored: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(restored.sidebar_section_order, cfg.sidebar_section_order);
+    }
+
+    #[test]
+    fn sidebar_shortcut_redirects_are_optional_and_persistent() {
+        let legacy: Config = toml::from_str("language = \"en\"\ntheme = \"dark\"").unwrap();
+        assert!(legacy.sidebar_shortcut_redirects.is_empty());
+
+        let mut config = Config::default();
+        config
+            .sidebar_shortcut_redirects
+            .insert("root/directory_a".into(), "root/directory_b".into());
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let restored: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            restored
+                .sidebar_shortcut_redirects
+                .get("root/directory_a")
+                .map(String::as_str),
+            Some("root/directory_b")
+        );
     }
 
     #[test]

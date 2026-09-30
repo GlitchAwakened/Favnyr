@@ -1206,6 +1206,24 @@ pub fn is_within(path: &Path, ancestor: &Path) -> bool {
     true
 }
 
+/// Rewrites `path` from one tree root to another, preserving its relative
+/// suffix. The comparison follows [`is_within`], including Windows' usual
+/// case-insensitivity, and performs no filesystem access.
+pub fn relocated_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    if !is_within(path, from) {
+        return None;
+    }
+    let suffix = path
+        .components()
+        .skip(from.components().count())
+        .collect::<PathBuf>();
+    Some(if suffix.as_os_str().is_empty() {
+        to.to_path_buf()
+    } else {
+        to.join(suffix)
+    })
+}
+
 /// Platforms without a restore API exposed by `trash::os_limited`.
 #[cfg(not(any(target_os = "windows", all(unix, not(target_os = "macos")))))]
 pub fn restore_from_trash(_original_path: &Path) -> std::result::Result<(), TrashError> {
@@ -1262,6 +1280,24 @@ mod tests {
             Path::new("/home/User/Pictures"),
             Path::new("/home/user/pictures")
         ));
+    }
+
+    #[test]
+    fn relocated_path_rewrites_only_the_selected_tree() {
+        let source = Path::new("root").join("directory_a");
+        let destination = Path::new("root").join("directory_b");
+        assert_eq!(
+            relocated_path(&source, &source, &destination),
+            Some(destination.clone())
+        );
+        assert_eq!(
+            relocated_path(&source.join("nested/my_file.txt"), &source, &destination),
+            Some(destination.join("nested/my_file.txt"))
+        );
+        assert_eq!(
+            relocated_path(Path::new("root/directory_ab"), &source, &destination),
+            None
+        );
     }
 
     fn write_file(p: &Path, content: &[u8]) {

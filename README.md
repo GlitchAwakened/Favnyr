@@ -19,7 +19,7 @@ Copy the executable where you want and run it. That is the whole installation.
 
 Favnyr makes no network request. There is no account, no telemetry, no update check, no crash reporting.
 
-Its settings, favourites and workspaces are plain TOML files in the usual per-user folders. You do not have to guess where: **Settings → Storage locations** lists the exact paths and opens them.
+Its settings, favorites and workspaces are plain TOML files in the usual per-user folders. You do not have to guess where: **Settings → Storage locations** lists the exact paths and opens them.
 
 Thumbnails live in a bounded memory cache for the length of the session. Nothing is written to a thumbnail database on disk.
 
@@ -31,11 +31,11 @@ Favnyr runs with ordinary user permissions. It installs no service and no backgr
 
 **Workspaces.** A workspace is a saved set of panels and tabs. Keep one per project and restore the whole arrangement in one click.
 
-**Favourites.** Shared across every workspace, so your usual places do not depend on which layout is open.
+**Favorites.** Shared across every workspace, so your usual places do not depend on which layout is open.
 
-**Custom commands.** Run any program on the selection with your own arguments, using placeholders: `{file}`, `{files}` (the whole selection), `{dir}`, `{dirname}`, `{name}`, `{stem}`, `{ext}`, `{names}`, `{uri}`. A command can be pinned to the right-click menu, and restricted to the extensions where it makes sense.
+**Custom commands.** Run any program on the selection with your own arguments, using placeholders: `{file}`, `{files}` (the whole selection), `{dir}`, `{dirname}`, `{setname}`, `{name}`, `{stem}`, `{ext}`, `{names}`, `{uri}`. A command can be pinned to the right-click menu, and restricted to the extensions where it makes sense.
 
-Ready-made recipes fill the editor for you when the tool is installed — for instance **Compress to zip** or **Extract to folder**, with an icon identifying the tool. This is genuinely useful on Linux, where no equivalent shell integration exists. The editor shows the exact command line and whether it will run once or once per selected file, before you save anything.
+Ready-made recipes fill the editor for you when the tool is installed — for instance **Compress to…** or **Extract to folder**, with an icon identifying the tool. This is genuinely useful on Linux, where no equivalent shell integration exists. The editor shows the exact command line and whether it will run once or once per selected file, before you save anything.
 
 **Keyboard.** 39 actions follow the usual conventions and can all be rebound from Settings.
 
@@ -103,7 +103,9 @@ Then the build dependencies:
 - Fedora — `sudo dnf install gcc pkgconf-pkg-config fontconfig-devel`
 - Arch — `sudo pacman -S --needed base-devel fontconfig`
 
-Optionally `ffmpeg` for video previews and `poppler-utils` for PDF previews.
+Optionally install `ffmpeg` for video previews, `poppler-utils` for PDF
+previews, and 7-Zip (`7zz`, `7z`, or `7za`) for the advanced compression and
+extraction recipes (ready-made commands).
 
 ### Build and run
 

@@ -93,13 +93,13 @@ impl Place {
     }
 }
 
-/// Shortcuts to standard user folders (the ones that exist).
-pub fn user_places() -> Vec<Place> {
+/// Standard user-folder shortcuts before reachability filtering. Keeping the
+/// unavailable candidates lets the GUI carry one across a rename performed by
+/// Favnyr, while [`user_places`] retains its public existing-only contract.
+pub fn user_place_candidates() -> Vec<Place> {
     let mut out = Vec::new();
     let mut push = |dir: Option<PathBuf>, kind: PlaceKind| {
-        if let Some(p) = dir
-            && p.is_dir()
-        {
+        if let Some(p) = dir {
             let name = file_name_of(&p);
             out.push(Place::simple(kind, p, name));
         }
@@ -112,6 +112,14 @@ pub fn user_places() -> Vec<Place> {
     push(dirs::audio_dir(), PlaceKind::Folder);
     push(dirs::video_dir(), PlaceKind::Folder);
     out
+}
+
+/// Shortcuts to standard user folders (the ones that exist).
+pub fn user_places() -> Vec<Place> {
+    user_place_candidates()
+        .into_iter()
+        .filter(|place| place.path.is_dir())
+        .collect()
 }
 
 /// LIGHTWEIGHT "signature" of the set of drives/mounts, to cheaply detect an

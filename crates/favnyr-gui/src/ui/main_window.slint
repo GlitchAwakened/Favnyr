@@ -25,6 +25,7 @@ import { ComboBox, VerticalBox, HorizontalBox, ScrollView, LineEdit, Button, Spi
 // a geometry independent of the reactive layout.
 export struct TabInfo {
     title: string,
+    folder-slot: int,       // shared path annotation, 0 = unmarked
     width: length,
     offset: length,
     // Full path shown in the tooltip on hover.
@@ -134,6 +135,7 @@ export struct FavNode {
     has-children: bool,    // container: has at least one child (chevron)
     available: bool,       // favorite: path exists? (false = greyed out)
     is-dir: bool,          // favorite: existing target is a directory
+    folder-slot: int,      // directory annotation; containers and files stay unmarked
 }
 
 // A list column. `id` = code ("name"/"path"/"size"/"modified"…),
@@ -305,7 +307,7 @@ export struct PanelView {
     content-width: length,
     // Hidden file display: true = dotfiles/HIDDEN shown.
     show-hidden: bool,
-    // Grouping by type: code "folders" / "files" / "mixed".
+    // Grouping by type: code "folders" / "colored" / "files" / "mixed".
     group-mode: string,
     // Keyboard navigation: cursor row to make visible; `scroll-gen`
     // is a counter bumped on every keyboard move → triggers
@@ -368,19 +370,41 @@ export struct OpProgress {
 // All translatable UI strings.
 export struct Strings {
     app-title: string,
+    archive-compress-to: string,
+    archive-name: string,
+    archive-format: string,
+    archive-tar-compression: string,
+    archive-none: string,
+    archive-level: string,
+    archive-level-hint: string,
+    archive-password: string,
+    archive-confirm-password: string,
+    archive-password-title: string,
+    archive-password-hint: string,
+    archive-password-toggle: string,
+    archive-tar-hint: string,
+    archive-create: string,
+    archive-extract: string,
+    archive-managed: string,
+    archive-managed-hint: string,
 
     settings-language: string,
     settings-theme: string,
     settings-ui-scale: string,        // "Interface zoom"
-    // "Video thumbnails (ffmpeg)" section — Linux only.
-    settings-ffmpeg-title: string,
-    settings-ffmpeg-hint-ok: string,
-    settings-ffmpeg-hint-missing: string,
-    settings-ffmpeg-missing-badge: string,
-    settings-ffmpeg-recheck: string,
-    settings-ffmpeg-detected: string,
-    settings-ffmpeg-flatpak: string,
+    settings-optional-tools-title: string,
+    settings-optional-tools-hint: string,
+    settings-optional-tools-recheck: string,
+    settings-optional-tools-available: string,
+    settings-optional-tools-missing: string,
+    settings-optional-tools-flatpak: string,
+    settings-tool-ffmpeg-hint: string,
+    settings-tool-poppler-hint: string,
+    settings-tool-seven-zip-hint: string,
     settings-tabbar-default: string,  // default tab bar position
+    settings-default-view-mode-label: string,
+    settings-default-view-mode-hint: string,
+    settings-view-mode-list: string,
+    settings-view-mode-previews: string,
     settings-clock-label: string,     // label for the timezone setting of the Modified column
     settings-clock-local: string,     // "Local time" option of the timezone dropdown
     settings-tab-tooltip-label: string,  // tab path tooltip option
@@ -454,6 +478,7 @@ export struct Strings {
     show-hidden-tooltip: string,
     group-section: string,
     group-folders-first: string,
+    group-colored-folders-first: string,
     group-files-first: string,
     group-mixed: string,
 
@@ -2648,6 +2673,7 @@ component FilterBar inherits Rectangle {
 // native `LineEdit` placeholder is too light and gets confused with actual input.
 component HintEdit inherits Rectangle {
     in-out property <string> text;
+    in property <bool> read-only: false;
     in property <string> hint;
     callback edited(string);
     height: 32px;
@@ -2655,6 +2681,7 @@ component HintEdit inherits Rectangle {
         width: parent.width;
         height: parent.height;
         text <=> root.text;
+        read-only: root.read-only;
         edited(t) => { root.edited(t); }
     }
     // Overlaid hint, visible only when the field is empty. Not
@@ -2889,6 +2916,9 @@ component TabItem inherits Rectangle {
     /// Drag completed: (delta_px, abs_x, abs_y).
     callback drag-completed(length, length, length);
     in property <string> title;
+    in property <int> folder-slot;
+    property <color> tone: root.folder-slot > 0
+        ? Tokens.folder-color(root.folder-slot) : Theme.accent-background;
     in property <bool> active: false;
     /// Full path of the tab — tooltip on hover (empty = no tooltip).
     in property <string> tip-path;
@@ -2944,19 +2974,23 @@ component TabItem inherits Rectangle {
     // this keeps the shape a rectangle that happens to be softened.
     border-radius: 5px;
     opacity: dragging ? 0.5 : 1.0;
-    // Clean tab bar: the ACTIVE tab is filled/accented, inactive ones
-    // fade out (transparent) and only reveal themselves on hover → clear hierarchy.
+    // Marked tabs keep a subtle tint even when inactive. Stronger fill and
+    // outline distinguish the active tab without changing the drag geometry.
     background: root.active
-        ? Theme.accent-background.with-alpha(0.22)
-        : (touch.has-hover
+        ? root.tone.with-alpha(0.22)
+        : root.folder-slot > 0
+            ? root.tone.with-alpha(touch.has-hover ? 0.14 : 0.07)
+            : (touch.has-hover
             ? Theme.foreground.with-alpha(0.06)
             : transparent);
     border-width: 1px;
     // Active tab: accent outline. Inactive: faint light outline to
     // distinguish them from the background (a bit stronger on hover).
     border-color: root.active
-        ? Theme.accent-background.with-alpha(0.55)
-        : (touch.has-hover
+        ? root.tone.with-alpha(0.55)
+        : root.folder-slot > 0
+            ? root.tone.with-alpha(touch.has-hover ? 0.40 : 0.25)
+            : (touch.has-hover
             ? Theme.foreground.with-alpha(0.30)
             : Theme.foreground.with-alpha(0.18));
 
@@ -3049,7 +3083,7 @@ component TabItem inherits Rectangle {
         width: 2px;
         height: parent.height - 6px;
         border-radius: 1px;
-        background: Theme.accent-background;
+        background: root.tone;
     }
 
     // Title + "x" zone — visual positioned on top of the root touch area.
@@ -3060,7 +3094,7 @@ component TabItem inherits Rectangle {
         Text {
             text: root.title;
             font-size: 11px;
-            color: Theme.foreground;
+            color: root.folder-slot > 0 ? root.tone : Theme.foreground;
             vertical-alignment: center;
             horizontal-stretch: 1;
             overflow: elide;
@@ -3227,6 +3261,7 @@ component VTabBar inherits Rectangle {
                         cross-len: flick.width;
                         indicator-right: root.on-left;
                         title: tab.title;
+                        folder-slot: tab.folder-slot;
                         // Path tooltip: opt-in — empty = disabled.
                         tip-path: root.show-tooltip ? tab.path : "";
                         active: idx == root.active-tab-idx;
@@ -3684,20 +3719,25 @@ component PanelComponent inherits Rectangle {
         ? root.drag-hover-row
         : -1;
     // Normalized [0,1] coordinates WITHIN the body — X renormalized OUTSIDE the
-    // vertical bar: otherwise the "west/east" zone and the 30/70%
-    // thresholds would be offset by the bar's width.
+    // vertical bar: otherwise the west/east zones and center bounds would be
+    // offset by the bar's width.
     property <float> body-nx:
         (root.dl-x - root.body-left) / max(1px, root.body-right - root.body-left);
     property <float> body-ny: (root.dl-y - root.body-top) / max(1px, root.height - root.body-top);
+    // The center is deliberately compact: dropping on a view is primarily a
+    // split gesture, while appending to its tab bar remains available here and
+    // across the whole header. Named bounds keep preview and release identical.
+    property <float> drag-center-min: 0.40;
+    property <float> drag-center-max: 0.60;
     // Drop zone: 0 none · 1 center (move) · 2 west · 3 east · 4 north · 5 south.
-    // Central 40%x40% band = move; otherwise the nearest edge (diagonals).
+    // Central 20%x20% band = move; otherwise the nearest edge (diagonals).
     // The TAB BAR (top band OR side column) and the nav bar
     // count as "center" (move zone, no split).
     out property <int> drag-zone:
         !root.drag-over ? 0
         : (root.drag-in-bar || root.dl-y < root.body-top) ? 1
-        : (root.body-nx >= 0.30 && root.body-nx <= 0.70
-                && root.body-ny >= 0.30 && root.body-ny <= 0.70) ? 1
+        : (root.body-nx >= root.drag-center-min && root.body-nx <= root.drag-center-max
+                && root.body-ny >= root.drag-center-min && root.body-ny <= root.drag-center-max) ? 1
         : (min(root.body-nx, 1 - root.body-nx) < min(root.body-ny, 1 - root.body-ny))
             ? (root.body-nx < 0.5 ? 2 : 3)
             : (root.body-ny < 0.5 ? 4 : 5);
@@ -4371,6 +4411,7 @@ component PanelComponent inherits Rectangle {
                         // computed INSIDE TabItem on these plain values (ColumnHeader pattern).
                         for tab[idx] in root.view.tabs : TabItem {
                             title: tab.title;
+                            folder-slot: tab.folder-slot;
                             // Path tooltip: opt-in — empty = disabled.
                             tip-path: root.tab-tooltip-enabled ? tab.path : "";
                             active: idx == root.view.active-tab-idx;
@@ -7574,7 +7615,9 @@ component FavRow inherits Rectangle {
                     : @image-url("../../assets/icons/bookmark.svg");
                 colorize: root.node.is-container
                     ? (root.node.expanded ? Theme.accent-background : Theme.foreground.with-alpha(0.7))
-                    : (root.node.available ? Theme.foreground.with-alpha(0.65) : Tokens.danger.with-alpha(0.8));
+                    : !root.node.available ? Tokens.danger.with-alpha(0.8)
+                    : root.node.folder-slot > 0 ? Tokens.folder-color(root.node.folder-slot)
+                    : Theme.foreground.with-alpha(0.65);
             }
         }
         // Node label, renamed via a modal popup.
@@ -7585,7 +7628,7 @@ component FavRow inherits Rectangle {
                 font-size: 12px;
                 font-weight: root.node.is-container ? 600 : 400;
                 color: (root.node.is-container || root.node.available)
-                    ? Theme.foreground
+                    ? (root.node.folder-slot > 0 ? Tokens.folder-color(root.node.folder-slot) : Theme.foreground)
                     : Theme.foreground.with-alpha(0.4);
                 vertical-alignment: center;
                 overflow: elide;
@@ -7975,106 +8018,66 @@ component ActivityRail inherits Rectangle {
 
 // ---------- Main window ----------
 
-// An "install command" row of the ffmpeg panel: distro badge,
-// monospace command, copy button (icon → checkmark ~1.3s after copying). The
-// DETECTED row is promoted (left accent bar + "Detected" chip).
-component FfmpegCmdRow inherits Rectangle {
-    in property <string> distro;
-    in property <string> command;
-    in property <bool> promoted;
-    in property <string> detected-label;
-    callback copy(string);
-    property <bool> copied: false;
+// One optional command-line tool and the feature it unlocks.
+component OptionalToolRow inherits Rectangle {
+    in property <string> name;
+    in property <string> hint;
+    in property <bool> found;
+    in property <string> version;
+    in property <string> available-label;
+    in property <string> missing-label;
 
-    height: 34px;
-    border-radius: 5px;
-    background: root.promoted
-        ? Theme.accent-background.with-alpha(0.07)
-        : (row-touch.has-hover ? Theme.alternate-background : transparent);
-
-    // Left accent bar: marker for the detected distro (like the active tab).
-    if root.promoted : Rectangle {
-        x: 0;
-        y: 4px;
-        width: 2px;
-        height: parent.height - 8px;
-        border-radius: 1px;
-        background: Theme.accent-background.with-alpha(0.85);
-    }
-    // Row hover (below the content → doesn't intercept the copy button).
-    row-touch := TouchArea { }
+    height: 48px;
+    border-radius: 6px;
+    background: Theme.background;
+    border-width: 1px;
+    border-color: Tokens.hairline;
     HorizontalLayout {
         padding-left: 8px;
-        padding-right: 4px;
-        spacing: 8px;
-        // Distro badge (label, not decoration).
+        padding-right: 8px;
+        spacing: 10px;
+        Image {
+            width: 15px;
+            height: 15px;
+            y: (parent.height - self.height) / 2;
+            source: root.found
+                ? @image-url("../../assets/icons/check.svg")
+                : @image-url("../../assets/icons/alert-triangle.svg");
+            colorize: root.found ? Tokens.success : Tokens.warning;
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 2px;
+            Text {
+                text: root.name + (root.version == "" ? "" : " " + root.version);
+                font-size: 12px;
+                font-weight: 600;
+                color: Theme.foreground;
+            }
+            Text {
+                text: root.hint;
+                font-size: 10px;
+                color: Theme.foreground.with-alpha(0.55);
+                overflow: elide;
+            }
+        }
         Rectangle {
             y: (parent.height - self.height) / 2;
-            height: 18px;
-            border-radius: 4px;
-            background: Theme.foreground.with-alpha(0.07);
+            height: 22px;
+            border-radius: 11px;
+            background: (root.found ? Tokens.success : Tokens.warning).with-alpha(0.15);
             HorizontalLayout {
-                padding-left: 7px;
-                padding-right: 7px;
+                padding-left: 9px;
+                padding-right: 9px;
                 Text {
-                    text: root.distro;
+                    text: root.found ? root.available-label : root.missing-label;
                     font-size: 11px;
-                    font-weight: 500;
-                    color: Theme.foreground.with-alpha(0.75);
+                    font-weight: 600;
+                    color: root.found ? Tokens.success : Tokens.warning;
                     vertical-alignment: center;
                 }
             }
         }
-        if root.promoted : Text {
-            text: root.detected-label;
-            font-size: 10px;
-            font-weight: 600;
-            color: Theme.accent-background;
-            vertical-alignment: center;
-        }
-        // Command to paste in the terminal.
-        Text {
-            text: root.command;
-            horizontal-stretch: 1;
-            font-family: "monospace";
-            font-size: 12px;
-            color: Theme.foreground.with-alpha(0.92);
-            vertical-alignment: center;
-            overflow: elide;
-        }
-        // Copy button (feedback: green "checkmark" icon for ~1.3s).
-        Rectangle {
-            y: (parent.height - self.height) / 2;
-            width: 28px;
-            height: 28px;
-            border-radius: 5px;
-            background: copy-touch.has-hover ? Theme.alternate-background : transparent;
-            border-width: copy-touch.has-hover ? 1px : 0px;
-            border-color: Theme.accent-background;
-            Image {
-                width: 14px;
-                height: 14px;
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                source: root.copied
-                    ? @image-url("../../assets/icons/check.svg")
-                    : @image-url("../../assets/icons/duplicate.svg");
-                colorize: root.copied ? Tokens.success : Theme.foreground.with-alpha(0.6);
-            }
-            copy-touch := TouchArea {
-                mouse-cursor: pointer;
-                clicked => {
-                    root.copy(root.command);
-                    root.copied = true;
-                    copied-timer.restart();
-                }
-            }
-        }
-    }
-    copied-timer := Timer {
-        interval: 1300ms;
-        running: root.copied;
-        triggered => { root.copied = false; }
     }
 }
 
@@ -8104,18 +8107,28 @@ export component MainWindow inherits Window {
     callback language-changed(int);
     callback theme-changed(int);
     callback ui-scale-changed(int);               // → applies + persists the zoom
-    // "Video thumbnails (ffmpeg)" section (Linux). State set by the bridge.
+    // Optional command-line tools (Linux), checked only after expansion.
+    in-out property <bool> optional-tools-expanded: false;
+    in-out property <bool> optional-tools-checked: false;
     in property <bool> ffmpeg-found: false;
-    in property <string> ffmpeg-version;          // "8.1.2"; empty if unknown
-    in property <bool> ffmpeg-flatpak: false;     // sandbox → host commands useless
-    in property <int> ffmpeg-detected-index: -1;  // 0 Debian·1 Fedora·2 Arch·3 Alpine; -1 unknown
-    callback ffmpeg-recheck();                    // re-runs detection
-    callback settings-copy(string);               // copies text to the clipboard
+    in property <string> ffmpeg-version;
+    in property <bool> poppler-found: false;
+    in property <string> poppler-version;
+    in property <bool> seven-zip-found: false;
+    in property <string> seven-zip-version;
+    in property <bool> optional-tools-flatpak: false;
+    callback optional-tools-recheck();
+    changed optional-tools-expanded => {
+        if (root.optional-tools-expanded) { root.optional-tools-recheck(); }
+    }
     // DEFAULT tab bar position for new views "from
     // scratch" (new workspace / reset) — global setting.
     in property <[string]> tabbar-default-labels;
     in-out property <int> tabbar-default-pref: 0;
     callback tabbar-default-changed(int);
+    // Display mode used by newly created tabs and views.
+    in-out property <int> default-view-mode-index: 0;
+    callback default-view-mode-changed(int);
     // Timezone for the "Modified" column: 0 = local time (default), 1 = UTC.
     in-out property <int> clock-utc-pref: 0;
     callback clock-mode-changed(int);
@@ -8307,7 +8320,7 @@ export component MainWindow inherits Window {
     in-out property <length> columns-menu-x;
     in-out property <length> columns-menu-y;
     in-out property <int> columns-menu-panel: 0;
-    // changes the grouping mode (panel_idx, code "folders"/"files"/"mixed").
+    // changes the grouping mode (panel_idx, code "folders"/"colored"/"files"/"mixed").
     callback set-group-mode(int, string);
     // Active view's "type-ahead" filter -----
     // Typed text (maintained by the bridge). The bar shows in the active view
@@ -8325,7 +8338,7 @@ export component MainWindow inherits Window {
     // it. A drag is deliberately absent from this list: it IS the gesture, not
     // something stealing it — a list that included it could never tell the two
     // apart.
-    property <bool> popup-overlay-open:
+    out property <bool> popup-overlay-open:
         root.settings-open || root.workspaces-open || root.rename-popup-open
         || root.create-popup-open || root.ctx-menu-open
         || root.paste-conflict-open || root.columns-menu-open || root.trash-menu-open
@@ -8335,7 +8348,7 @@ export component MainWindow inherits Window {
         || root.fav-menu-open || root.fav-name-open || root.fav-save-open
         || root.fav-newc-open || root.tab-menu-open || root.tab-empty-menu-open
         || root.ow-menu-open || root.new-menu-open || root.mark-menu-open
-        || root.ow-popup-open || root.ow-picker-open
+        || root.ow-popup-open || root.ow-picker-open || root.archive-open
         || root.delete-warning-open || root.open-many-open;
     property <bool> any-overlay-open: root.popup-overlay-open || root.file-drag-active;
     // One of those appearing in the middle of a gesture ends it, rather than
@@ -8483,6 +8496,9 @@ export component MainWindow inherits Window {
     in-out property <bool> file-drag-target-folder: false;
     in-out property <bool> file-drag-target-exec: false;
     in-out property <bool> file-drag-target-invalid: false; // target = source/descendant
+    // True when the dragged selection contains at least one directory that may
+    // be newly added to Favorites. Regular files remain valid for file drops.
+    in-out property <bool> file-drag-selection-has-dir: false;
     callback file-drop-target-invalid(int /*src panel*/, int /*target panel*/, int /*row*/) -> bool;
     function claim-file-drag-target(panel: int, row: int, folder: bool, executable: bool) {
         root.file-drag-target-panel = panel;
@@ -8530,7 +8546,7 @@ export component MainWindow inherits Window {
     // window during a drag → external apps. Re-armed on every new drag.
     in-out property <bool> native-drag-armed: false;
     callback start-native-drag(int /*src_panel*/);
-    callback file-drag-begin(int /*src_panel*/, int /*row_idx*/);  // ensures the selection
+    callback file-drag-begin(int /*src_panel*/, int /*row_idx*/) -> bool; // ensures selection, returns whether it contains a directory
     // Drop menu (Move / Copy / Link here) + panels captured on drop.
     in-out property <bool> file-drop-menu-open: false;
     in-out property <length> file-drop-menu-x;
@@ -8627,6 +8643,9 @@ export component MainWindow inherits Window {
     // `ctx-selection-is-dir`, which describes only the primary item: a mixed
     // selection starting with a file still has folders to colour.
     in-out property <bool> ctx-selection-has-dir: false;
+    // Unlike the context-menu folder classification, this excludes shortcut
+    // files: only actual directory paths can become new Favorites entries.
+    in-out property <bool> ctx-selection-has-favorite-dir: false;
     callback folder-color-picked(int);
     // Note editor. Single item at a time, so the entry that opens it is gated
     // on `ctx-selection-single` exactly as "Create a shortcut" is.
@@ -8657,6 +8676,44 @@ export component MainWindow inherits Window {
     in-out property <bool> new-flyout-hover: false;
     // "Custom command" popup (create/edit/one-shot launch).
     in-out property <bool> ow-popup-open: false;
+    in-out property <bool> ow-popup-archive-dialog: false;
+    in-out property <bool> archive-open: false;
+    in-out property <bool> archive-password-only: false;
+    in-out property <bool> archive-use-password: false;
+    in-out property <bool> archive-work-pending: false;
+    property <bool> archive-focus-armed: false;
+    in-out property <string> archive-subject;
+    in-out property <string> archive-name;
+    in-out property <int> archive-format: 0;
+    in-out property <int> archive-tar-compression: 0;
+    in-out property <int> archive-level: 3;
+    in-out property <string> archive-password;
+    in-out property <string> archive-confirm-password;
+    in-out property <string> archive-error;
+    callback archive-submit();
+    callback archive-cancel();
+    callback archive-poll();
+    changed archive-use-password => {
+        root.archive-error = "";
+        if (!root.archive-use-password) {
+            root.archive-password = "";
+            root.archive-confirm-password = "";
+        }
+    }
+    changed archive-format => {
+        root.archive-error = "";
+        if (root.archive-format == 2) { root.archive-use-password = false; }
+        else { root.archive-tar-compression = 0; }
+    }
+    changed archive-open => {
+        if (root.archive-open) { root.archive-focus-armed = true; }
+        else { key-scope.focus(); }
+    }
+    Timer {
+        interval: 120ms;
+        running: root.archive-work-pending;
+        triggered => { root.archive-poll(); }
+    }
     in-out property <bool> ow-popup-focus-armed: false;
     in-out property <string> ow-popup-id: "";       // "" = creation
     in-out property <string> ow-popup-name: "";
@@ -9159,6 +9216,7 @@ export component MainWindow inherits Window {
     }
     callback sidebar-refresh();                     // re-scans places
     callback poll-drives();                          // lightweight drive check: rebuilds only if changed
+    callback poll-annotations();                     // shared colours and notes, independent of sidebar visibility
     // Cross-instance IPC init: `true` = initialized (the Timer stops),
     // `false` = window not ready yet → the Timer retries.
     callback init-ipc() -> bool;
@@ -9486,10 +9544,8 @@ export component MainWindow inherits Window {
             root.shortcut-capturing = "";
             root.shortcut-conflict-action = "";
             root.shortcut-conflict-message = "";
+            root.optional-tools-expanded = false;
         } else {
-            // On OPENING: re-detects ffmpeg (Linux) — the user may have
-            // installed it since last time → status stays current with no action needed.
-            root.ffmpeg-recheck();
             // Same reasoning: the count is a filesystem walk, so it is taken
             // when the panel opens rather than kept live.
             root.count-annotation-orphans();
@@ -9628,7 +9684,8 @@ export component MainWindow inherits Window {
         if (id == "cycle-group") {
             if (root.active-panel-idx < root.panels.length) {
                 root.set-group-mode(root.active-panel-idx,
-                    root.panels[root.active-panel-idx].group-mode == "folders" ? "files"
+                    root.panels[root.active-panel-idx].group-mode == "folders" ? "colored"
+                    : root.panels[root.active-panel-idx].group-mode == "colored" ? "files"
                     : root.panels[root.active-panel-idx].group-mode == "files" ? "mixed"
                     : "folders");
             }
@@ -9740,6 +9797,7 @@ export component MainWindow inherits Window {
                 // command" popup can be opened ON TOP OF the settings
                 // → Escape closes the popup first, not the settings.
                 if (root.ow-popup-open) { root.ow-popup-open = false; return accept; }
+                if (root.archive-open) { root.archive-cancel(); return accept; }
                 if (root.ow-picker-open) { root.ow-picker-open = false; return accept; }
                 // A submenu is peeled off first: Escape closes what it
                 // opened, not everything at once. Same route as the left
@@ -9998,7 +10056,7 @@ export component MainWindow inherits Window {
                             tab-drag-active: root.drag-active;
                             tab-drag-abs-x: root.drag-abs-x;
                             tab-drag-abs-y: root.drag-abs-y;
-                            file-drag-active: root.file-drag-active;
+                            file-drag-active: root.file-drag-active && root.file-drag-selection-has-dir;
                             file-drag-abs-x: root.file-drag-abs-x;
                             file-drag-abs-y: root.file-drag-abs-y;
                             section-collapsed: root.fav-section-collapsed;
@@ -10320,10 +10378,10 @@ export component MainWindow inherits Window {
                         root.file-drag-source-panel = idx;
                         root.file-drag-abs-x = x;
                         root.file-drag-abs-y = y;
-                        root.file-drag-active = true;
                         root.file-drag-copy = root.ctrl-down;
                         root.native-drag-armed = false;   // re-arms the native drag
-                        root.file-drag-begin(idx, ri);
+                        root.file-drag-selection-has-dir = root.file-drag-begin(idx, ri);
+                        root.file-drag-active = true;
                         // `file-drag-begin` just guaranteed the selection of the
                         // grabbed row: now recompute the target/source conflict.
                         root.refresh-file-drag-target-invalid();
@@ -10615,9 +10673,10 @@ export component MainWindow inherits Window {
             //
             // The bridge's clamp repeats this calculation to know whether the
             // menu still fits below the pointer.
-            height: (root.ctx-on-empty ? 194px : 376px
+            height: (root.ctx-on-empty ? 194px : 350px
                     + (root.ctx-selection-is-dir ? 0px : 26px)          // Open with
                     + (root.ctx-selection-single ? 26px : 0px)          // Create a shortcut
+                    + (root.ctx-selection-has-favorite-dir ? 26px : 0px) // Add to favorites
                     + ((root.ctx-selection-has-dir || root.ctx-selection-single) ? 26px : 0px)) // Color & note
                 + (root.ctx-custom-entries.length > 0 ? root.ctx-custom-entries.length * 26px + 1px : 0px)
                 + (root.ctx-shell-entries.length > 0 ? root.ctx-shell-entries.length * 26px + 1px : 0px);
@@ -10678,7 +10737,10 @@ export component MainWindow inherits Window {
                 Rectangle { height: 1px; background: Theme.border; }
                 MenuItem { label: root.strings.ctx-copy-path;                         clicked => { root.ctx-close(); root.action-copy-path(); } }
                 MenuItem { label: root.strings.ctx-copy-name;                         clicked => { root.ctx-close(); root.action-copy-name(); } }
-                MenuItem { label: root.strings.fav-add;                               clicked => { root.ctx-close(); root.fav-add-selection(); } }
+                if root.ctx-selection-has-favorite-dir : MenuItem {
+                    label: root.strings.fav-add;
+                    clicked => { root.ctx-close(); root.fav-add-selection(); }
+                }
                 // "Create a shortcut" — any SINGLE item, file or folder: opens
                 // the popup (.lnk shortcut / symlink tabs) creating a link in the
                 // current folder to it. Folders link fine (junction on Windows,
@@ -11786,10 +11848,10 @@ export component MainWindow inherits Window {
             x: min(root.columns-menu-x, root.width - self.width - 8px);
             y: min(root.columns-menu-y, root.height - self.height - 8px);
             width: 210px;
-            // height = grouping section (label 22 + 3x30 + separator 9 = 121)
+            // height = grouping section (label 22 + 4x30 + separator 9 = 151)
             //          + columns (nx30) + padding (8)
-            // grouping (121) + columns (nx30) + ext filter (separator 9 + 30) + padding 8
-            height: self.cols.length * 30px + 168px;
+            // grouping (151) + columns (nx30) + ext filter (separator 9 + 30) + padding 8
+            height: self.cols.length * 30px + 198px;
             background: Theme.surface;
             border-radius: Tokens.radius-overlay;
             border-width: 1px;
@@ -11801,7 +11863,7 @@ export component MainWindow inherits Window {
             VerticalLayout {
                 padding: 4px;
                 spacing: 0px;
-                // "Grouping" section: 3 exclusive modes -----
+                // "Grouping" section: 4 exclusive modes -----
                 // Marks (check.svg) the active mode; orthogonal to column
                 // sorting (which remains driven by clicking the header).
                 Text {
@@ -11814,6 +11876,7 @@ export component MainWindow inherits Window {
                 }
                 for gopt[gi] in [
                     { code: "folders", label: root.strings.group-folders-first },
+                    { code: "colored", label: root.strings.group-colored-folders-first },
                     { code: "files", label: root.strings.group-files-first },
                     { code: "mixed", label: root.strings.group-mixed },
                 ] : Rectangle {
@@ -12355,9 +12418,8 @@ export component MainWindow inherits Window {
                             }
                         }
 
-                        // "Video thumbnails (ffmpeg)" section — LINUX only.
-                        // Discreet when ffmpeg is present; guides toward installation
-                        // (command per distro, detected one highlighted) otherwise.
+                        // Optional command-line tools — Linux only. Detection
+                        // starts on expansion, so opening Settings stays cheap.
                         if !root.platform-windows : Rectangle {
                             background: Theme.alternate-background.with-alpha(0.5);
                             border-radius: 8px;
@@ -12366,138 +12428,118 @@ export component MainWindow inherits Window {
                             VerticalLayout {
                                 padding: 12px;
                                 spacing: 10px;
-                                // Header: title+hint (stretch) · badge · recheck.
-                                HorizontalLayout {
-                                    spacing: 12px;
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        spacing: 3px;
-                                        Text {
-                                            text: root.strings.settings-ffmpeg-title;
-                                            font-size: 13px;
-                                            font-weight: 600;
-                                            color: Theme.foreground;
-                                        }
-                                        Text {
-                                            text: root.ffmpeg-found
-                                                ? root.strings.settings-ffmpeg-hint-ok
-                                                : root.strings.settings-ffmpeg-hint-missing;
-                                            font-size: 11px;
-                                            color: Theme.foreground.with-alpha(0.55);
-                                            wrap: word-wrap;
-                                        }
+                                Rectangle {
+                                    height: 38px;
+                                    header-touch := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.optional-tools-expanded = !root.optional-tools-expanded; }
                                     }
-                                    // Status badge: green (found) / amber (missing).
-                                    // Amber, not red: ffmpeg is an optional convenience,
-                                    // not a destructive error.
-                                    status-badge := Rectangle {
-                                        property <color> tone: root.ffmpeg-found ? Tokens.success : Tokens.warning;
-                                        height: 22px;
-                                        vertical-stretch: 0;
-                                        border-radius: 11px;
-                                        background: status-badge.tone.with-alpha(0.15);
-                                        HorizontalLayout {
-                                            padding-left: 9px;
-                                            padding-right: 9px;
-                                            spacing: 5px;
-                                            Image {
-                                                width: 12px;
-                                                height: 12px;
-                                                y: (parent.height - self.height) / 2;
-                                                source: root.ffmpeg-found
-                                                    ? @image-url("../../assets/icons/check.svg")
-                                                    : @image-url("../../assets/icons/alert-triangle.svg");
-                                                colorize: status-badge.tone;
-                                            }
+                                    HorizontalLayout {
+                                        spacing: 10px;
+                                        VerticalLayout {
+                                            horizontal-stretch: 1;
+                                            spacing: 3px;
                                             Text {
-                                                text: root.ffmpeg-found
-                                                    ? (root.ffmpeg-version == "" ? "ffmpeg" : "ffmpeg " + root.ffmpeg-version)
-                                                    : root.strings.settings-ffmpeg-missing-badge;
-                                                font-size: 12px;
+                                                text: root.strings.settings-optional-tools-title;
+                                                font-size: 13px;
                                                 font-weight: 600;
-                                                color: status-badge.tone;
-                                                vertical-alignment: center;
-                                            }
-                                        }
-                                    }
-                                    // "Recheck" button.
-                                    Rectangle {
-                                        height: 28px;
-                                        vertical-stretch: 0;
-                                        border-radius: 6px;
-                                        border-width: 1px;
-                                        border-color: recheck-touch.has-hover ? Theme.accent-background : Theme.border;
-                                        background: recheck-touch.has-hover ? Theme.alternate-background : transparent;
-                                        HorizontalLayout {
-                                            padding-left: 9px;
-                                            padding-right: 10px;
-                                            spacing: 6px;
-                                            Image {
-                                                width: 13px;
-                                                height: 13px;
-                                                y: (parent.height - self.height) / 2;
-                                                source: @image-url("../../assets/icons/refresh.svg");
-                                                colorize: Theme.foreground.with-alpha(0.7);
+                                                color: Theme.foreground;
                                             }
                                             Text {
-                                                text: root.strings.settings-ffmpeg-recheck;
-                                                font-size: 12px;
-                                                color: Theme.foreground;
-                                                vertical-alignment: center;
+                                                text: root.strings.settings-optional-tools-hint;
+                                                font-size: 11px;
+                                                color: Theme.foreground.with-alpha(0.55);
+                                                overflow: elide;
                                             }
                                         }
-                                        recheck-touch := TouchArea {
-                                            mouse-cursor: pointer;
-                                            clicked => { root.ffmpeg-recheck(); }
+                                        Image {
+                                            width: 14px;
+                                            height: 14px;
+                                            y: (parent.height - self.height) / 2;
+                                            source: root.optional-tools-expanded
+                                                ? @image-url("../../assets/icons/chevron-up.svg")
+                                                : @image-url("../../assets/icons/chevron-down.svg");
+                                            colorize: Theme.foreground.with-alpha(0.65);
                                         }
                                     }
                                 }
-                                // "Missing" body: honest Flatpak message OR the
-                                // per-distribution install commands.
-                                if !root.ffmpeg-found && root.ffmpeg-flatpak : Text {
-                                    text: root.strings.settings-ffmpeg-flatpak;
+                                if root.optional-tools-expanded : VerticalLayout {
+                                    spacing: 6px;
+                                    OptionalToolRow {
+                                        name: "ffmpeg";
+                                        hint: root.strings.settings-tool-ffmpeg-hint;
+                                        found: root.ffmpeg-found;
+                                        version: root.ffmpeg-version;
+                                        available-label: root.strings.settings-optional-tools-available;
+                                        missing-label: root.strings.settings-optional-tools-missing;
+                                    }
+                                    OptionalToolRow {
+                                        name: "poppler-utils";
+                                        hint: root.strings.settings-tool-poppler-hint;
+                                        found: root.poppler-found;
+                                        version: root.poppler-version;
+                                        available-label: root.strings.settings-optional-tools-available;
+                                        missing-label: root.strings.settings-optional-tools-missing;
+                                    }
+                                    OptionalToolRow {
+                                        name: "7-Zip";
+                                        hint: root.strings.settings-tool-seven-zip-hint;
+                                        found: root.seven-zip-found;
+                                        version: root.seven-zip-version;
+                                        available-label: root.strings.settings-optional-tools-available;
+                                        missing-label: root.strings.settings-optional-tools-missing;
+                                    }
+                                    if root.optional-tools-flatpak : Text {
+                                        text: root.strings.settings-optional-tools-flatpak;
+                                        font-size: 11px;
+                                        color: Theme.foreground.with-alpha(0.55);
+                                        wrap: word-wrap;
+                                    }
+                                    Button {
+                                        text: root.strings.settings-optional-tools-recheck;
+                                        enabled: root.optional-tools-checked;
+                                        clicked => { root.optional-tools-recheck(); }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Preview preferences follow the media support settings.
+                        // Existing per-tab modes remain unchanged.
+                        Rectangle {
+                            background: Theme.alternate-background.with-alpha(0.5);
+                            border-radius: 8px;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            VerticalLayout {
+                                padding: 12px;
+                                spacing: 6px;
+                                HorizontalLayout {
+                                    spacing: 12px;
+                                    Text {
+                                        text: root.strings.settings-default-view-mode-label;
+                                        font-size: 13px;
+                                        font-weight: 600;
+                                        color: Theme.foreground;
+                                        wrap: word-wrap;
+                                        horizontal-stretch: 1;
+                                        vertical-alignment: center;
+                                    }
+                                    settings-view-mode := ComboBox {
+                                        width: 160px;
+                                        vertical-stretch: 0;
+                                        model: [root.strings.settings-view-mode-list, root.strings.settings-view-mode-previews];
+                                        current-index <=> root.default-view-mode-index;
+                                        selected(_) => {
+                                            root.default-view-mode-changed(settings-view-mode.current-index);
+                                        }
+                                    }
+                                }
+                                Text {
+                                    text: root.strings.settings-default-view-mode-hint;
                                     font-size: 11px;
                                     color: Theme.foreground.with-alpha(0.55);
                                     wrap: word-wrap;
-                                }
-                                if !root.ffmpeg-found && !root.ffmpeg-flatpak : Rectangle {
-                                    // "Inset" field (more recessed than the card).
-                                    background: Theme.background;
-                                    border-radius: 6px;
-                                    border-width: 1px;
-                                    border-color: Tokens.hairline;
-                                    VerticalLayout {
-                                        padding: 6px;
-                                        spacing: 4px;
-                                        FfmpegCmdRow {
-                                            distro: "Debian/Ubuntu";
-                                            command: "sudo apt install ffmpeg";
-                                            promoted: root.ffmpeg-detected-index == 0;
-                                            detected-label: root.strings.settings-ffmpeg-detected;
-                                            copy(t) => { root.settings-copy(t); }
-                                        }
-                                        FfmpegCmdRow {
-                                            distro: "Fedora";
-                                            command: "sudo dnf install ffmpeg-free";
-                                            promoted: root.ffmpeg-detected-index == 1;
-                                            detected-label: root.strings.settings-ffmpeg-detected;
-                                            copy(t) => { root.settings-copy(t); }
-                                        }
-                                        FfmpegCmdRow {
-                                            distro: "Arch/Manjaro";
-                                            command: "sudo pacman -S ffmpeg";
-                                            promoted: root.ffmpeg-detected-index == 2;
-                                            detected-label: root.strings.settings-ffmpeg-detected;
-                                            copy(t) => { root.settings-copy(t); }
-                                        }
-                                        FfmpegCmdRow {
-                                            distro: "Alpine";
-                                            command: "sudo apk add ffmpeg";
-                                            promoted: root.ffmpeg-detected-index == 3;
-                                            detected-label: root.strings.settings-ffmpeg-detected;
-                                            copy(t) => { root.settings-copy(t); }
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -14956,6 +14998,11 @@ export component MainWindow inherits Window {
             running: root.left-panel == 1;
             triggered => { root.poll-drives(); }
         }
+        Timer {
+            interval: 1500ms;
+            running: true;
+            triggered => { root.poll-annotations(); }
+        }
         // Cross-instance IPC init: shortly after startup (the window
         // exists → HWND available for tagging + subclassing). RETRIES as long
         // as the bridge returns `false` (window not found yet).
@@ -15077,7 +15124,21 @@ export component MainWindow inherits Window {
                     Button { text: "…"; clicked => { root.ow-browse(); } }
                 }
                 Text { text: root.strings.ow-args; font-size: 10px; font-weight: 600; color: Theme.foreground.with-alpha(0.55); }
-                owp-args := HintEdit { hint: "{file}"; text <=> root.ow-popup-args; edited(t) => { root.ow-popup-changed(); } }
+                owp-args := HintEdit { hint: "{file}"; text <=> root.ow-popup-args; read-only: root.ow-popup-archive-dialog; edited(t) => { root.ow-popup-changed(); } }
+                if !root.ow-popup-is-store && root.ow-popup-icon-kind == 1 : CheckBox {
+                    text: root.strings.archive-managed;
+                    checked <=> root.ow-popup-archive-dialog;
+                    toggled => {
+                        if (self.checked) { root.ow-popup-elevated = false; }
+                        root.ow-popup-changed();
+                    }
+                }
+                if root.ow-popup-archive-dialog : Text {
+                    text: root.strings.archive-managed-hint;
+                    color: Theme.foreground.with-alpha(0.65);
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
                 // Tag insertion buttons, one per tag the core substitutes.
                 // The label sits on its OWN line: sharing a row with six
                 // buttons left too little room in longer languages and at 150%
@@ -15110,6 +15171,7 @@ export component MainWindow inherits Window {
                             : Theme.foreground.with-alpha(0.07);
                         tagtxt := Text { text: t.tag; font-size: 11px; font-weight: 500; color: Tokens.ext; x: (parent.width - self.width)/2; vertical-alignment: center; height: parent.height; }
                         tagta := TouchArea {
+                            enabled: !root.ow-popup-archive-dialog;
                             mouse-cursor: pointer;
                             clicked => {
                                 root.ow-popup-args = root.ow-popup-args == "" ? t.tag : root.ow-popup-args + " " + t.tag;
@@ -15310,7 +15372,7 @@ export component MainWindow inherits Window {
                 // ONLY and excluding OS/Store apps (an association can't be elevated).
                 // Unchecked by default and placed at the bottom, since it configures the
                 // launch behavior rather than the command's visibility.
-                if root.platform-windows && !root.ow-popup-is-store : HorizontalBox {
+                if root.platform-windows && !root.ow-popup-is-store && !root.ow-popup-archive-dialog : HorizontalBox {
                     padding: 0px;
                     spacing: 8px;
                     CheckBox {
@@ -15405,6 +15467,125 @@ export component MainWindow inherits Window {
                 color: Theme.foreground;
                 wrap: word-wrap;
                 horizontal-alignment: left;
+            }
+        }
+
+        // Archive prompts share the application's modal and keyboard rules.
+        if root.archive-open : ModalBackdrop { }
+        if root.archive-open : Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(520px, parent.width - 32px);
+            height: min(max(archive-form.preferred-height, archive-form.min-height)
+                + max(archive-footer.preferred-height, archive-footer.min-height),
+                parent.height - 32px);
+            background: Theme.background;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Theme.border;
+            VerticalLayout {
+                ScrollView {
+                    vertical-stretch: 1;
+                    archive-form := VerticalBox {
+                        padding: 18px;
+                        spacing: 10px;
+                        Text {
+                            text: root.archive-password-only ? root.strings.archive-password-title : root.strings.archive-compress-to;
+                            font-size: 16px;
+                            font-weight: 700;
+                            color: Theme.foreground;
+                            wrap: word-wrap;
+                        }
+                        Text { text: root.archive-subject; color: Theme.foreground.with-alpha(0.65); font-size: 11px; wrap: word-wrap; }
+                        if !root.archive-password-only : VerticalLayout {
+                            spacing: 8px;
+                            Text { text: root.strings.archive-name; color: Theme.foreground; }
+                            archive-name-edit := EditLineEdit { text <=> root.archive-name; }
+                            Timer {
+                                interval: 1ms;
+                                running: root.archive-focus-armed;
+                                triggered => {
+                                    archive-name-edit.focus();
+                                    archive-name-edit.set-selection-offsets(0, 99999);
+                                    root.archive-focus-armed = false;
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 12px;
+                                Text { text: root.strings.archive-format; color: Theme.foreground; vertical-alignment: center; }
+                                ComboBox { model: [".zip", ".7z", ".tar"]; current-index <=> root.archive-format; horizontal-stretch: 1; }
+                            }
+                            if root.archive-format == 2 : HorizontalLayout {
+                                spacing: 12px;
+                                Text { text: root.strings.archive-tar-compression; color: Theme.foreground; vertical-alignment: center; }
+                                ComboBox {
+                                    model: [root.strings.archive-none, "gzip", "XZ", "BZip2"];
+                                    current-index <=> root.archive-tar-compression;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+                            if root.archive-format != 2 || root.archive-tar-compression != 0 : HorizontalLayout {
+                                spacing: 12px;
+                                Text { text: root.strings.archive-level; color: Theme.foreground; vertical-alignment: center; }
+                                ComboBox { model: ["0", "1", "3", "5", "7", "9"]; current-index <=> root.archive-level; horizontal-stretch: 1; }
+                            }
+                            if root.archive-format != 2 || root.archive-tar-compression != 0 : Text { text: root.strings.archive-level-hint; color: Theme.foreground.with-alpha(0.65); font-size: 11px; wrap: word-wrap; }
+                            CheckBox {
+                                text: root.strings.archive-password-toggle;
+                                checked <=> root.archive-use-password;
+                                enabled: root.archive-format != 2;
+                            }
+                            if root.archive-format == 2 : Text {
+                                text: root.strings.archive-tar-hint;
+                                color: Theme.foreground.with-alpha(0.65);
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                        }
+                        if root.archive-password-only || (root.archive-use-password && root.archive-format != 2) : VerticalLayout {
+                            spacing: 8px;
+                            Text { text: root.strings.archive-password; color: Theme.foreground; }
+                            archive-password-edit := LineEdit {
+                                text <=> root.archive-password;
+                                input-type: password;
+                                accepted => { root.archive-submit(); }
+                            }
+                            Timer {
+                                interval: 1ms;
+                                running: root.archive-password-only && root.archive-focus-armed;
+                                triggered => { archive-password-edit.focus(); root.archive-focus-armed = false; }
+                            }
+                            if !root.archive-password-only : VerticalLayout {
+                                spacing: 8px;
+                                Text { text: root.strings.archive-confirm-password; color: Theme.foreground; }
+                                LineEdit { text <=> root.archive-confirm-password; input-type: password; accepted => { root.archive-submit(); } }
+                            }
+                        }
+                        if root.archive-password-only : Text {
+                            text: root.strings.archive-password-hint;
+                            color: Theme.foreground.with-alpha(0.65);
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                        if root.archive-error != "" : Text {
+                            text: root.archive-error;
+                            color: Tokens.danger;
+                            wrap: word-wrap;
+                            font-size: 12px;
+                        }
+                    }
+                }
+                archive-footer := HorizontalBox {
+                    padding: 18px;
+                    Button { text: root.strings.btn-cancel; clicked => { root.archive-cancel(); } }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: root.archive-password-only ? root.strings.archive-extract : root.strings.archive-create;
+                        primary: true;
+                        enabled: root.archive-password-only ? root.archive-password != "" : (root.archive-name != "" && (!root.archive-use-password || root.archive-password != ""));
+                        clicked => { root.archive-submit(); }
+                    }
+                }
             }
         }
 

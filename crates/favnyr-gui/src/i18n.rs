@@ -118,17 +118,36 @@ pub fn strings_for(lang: Lang) -> Strings {
     let c = catalog(lang);
     let g = |k: &str| -> slint::SharedString { c.get(k).map(|s| s.as_str()).unwrap_or(k).into() };
     Strings {
+        archive_compress_to: g("archive_compress_to"),
+        archive_name: g("archive_name"),
+        archive_format: g("archive_format"),
+        archive_tar_compression: g("archive_tar_compression"),
+        archive_none: g("archive_none"),
+        archive_level: g("archive_level"),
+        archive_level_hint: g("archive_level_hint"),
+        archive_password: g("archive_password"),
+        archive_confirm_password: g("archive_confirm_password"),
+        archive_password_title: g("archive_password_title"),
+        archive_password_hint: g("archive_password_hint"),
+        archive_password_toggle: g("archive_password_toggle"),
+        archive_tar_hint: g("archive_tar_hint"),
+        archive_create: g("archive_create"),
+        archive_extract: g("archive_extract"),
+        archive_managed: g("archive_managed"),
+        archive_managed_hint: g("archive_managed_hint"),
         app_title: g("app_title"),
         settings_language: g("settings_language"),
         settings_theme: g("settings_theme"),
         settings_ui_scale: g("settings_ui_scale"),
-        settings_ffmpeg_title: g("settings_ffmpeg_title"),
-        settings_ffmpeg_hint_ok: g("settings_ffmpeg_hint_ok"),
-        settings_ffmpeg_hint_missing: g("settings_ffmpeg_hint_missing"),
-        settings_ffmpeg_missing_badge: g("settings_ffmpeg_missing_badge"),
-        settings_ffmpeg_recheck: g("settings_ffmpeg_recheck"),
-        settings_ffmpeg_detected: g("settings_ffmpeg_detected"),
-        settings_ffmpeg_flatpak: g("settings_ffmpeg_flatpak"),
+        settings_optional_tools_title: g("settings_optional_tools_title"),
+        settings_optional_tools_hint: g("settings_optional_tools_hint"),
+        settings_optional_tools_recheck: g("settings_optional_tools_recheck"),
+        settings_optional_tools_available: g("settings_optional_tools_available"),
+        settings_optional_tools_missing: g("settings_optional_tools_missing"),
+        settings_optional_tools_flatpak: g("settings_optional_tools_flatpak"),
+        settings_tool_ffmpeg_hint: g("settings_tool_ffmpeg_hint"),
+        settings_tool_poppler_hint: g("settings_tool_poppler_hint"),
+        settings_tool_seven_zip_hint: g("settings_tool_seven_zip_hint"),
         theme_auto: g("theme_auto"),
         theme_light: g("theme_light"),
         theme_dark: g("theme_dark"),
@@ -181,6 +200,7 @@ pub fn strings_for(lang: Lang) -> Strings {
         show_hidden_tooltip: g("show_hidden_tooltip"),
         group_section: g("group_section"),
         group_folders_first: g("group_folders_first"),
+        group_colored_folders_first: g("group_colored_folders_first"),
         group_files_first: g("group_files_first"),
         group_mixed: g("group_mixed"),
         tab_new_tooltip: g("tab_new_tooltip"),
@@ -191,6 +211,10 @@ pub fn strings_for(lang: Lang) -> Strings {
         tabbar_left: g("tabbar_left"),
         tabbar_right: g("tabbar_right"),
         settings_tabbar_default: g("settings_tabbar_default"),
+        settings_default_view_mode_label: g("settings_default_view_mode_label"),
+        settings_default_view_mode_hint: g("settings_default_view_mode_hint"),
+        settings_view_mode_list: g("settings_view_mode_list"),
+        settings_view_mode_previews: g("settings_view_mode_previews"),
         settings_tab_tooltip_label: g("settings_tab_tooltip_label"),
         settings_tab_tooltip_hint: g("settings_tab_tooltip_hint"),
         settings_clock_label: g("settings_clock_label"),
@@ -735,6 +759,37 @@ mod tests {
     fn french_overrides_english() {
         assert_eq!(tr(Lang::Fr, "settings_language"), "Langue");
         assert_eq!(tr(Lang::En, "settings_language"), "Language");
+    }
+
+    #[test]
+    fn colored_folder_grouping_is_present_in_every_language_without_fallback() {
+        for &lang in Lang::all() {
+            assert!(
+                catalog(lang)
+                    .get("group_colored_folders_first")
+                    .is_some_and(|value| !value.is_empty()),
+                "missing colored-folder grouping translation: {lang:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_messages_are_present_in_every_language_without_fallback() {
+        let english = catalog(Lang::En);
+        let keys: Vec<_> = english
+            .keys()
+            .filter(|key| key.starts_with("archive_"))
+            .collect();
+        assert!(keys.len() >= 21);
+        for &lang in Lang::all() {
+            let translated = catalog(lang);
+            for key in &keys {
+                assert!(
+                    translated.get(*key).is_some_and(|value| !value.is_empty()),
+                    "missing archive translation: {lang:?} {key}"
+                );
+            }
+        }
     }
 
     #[test]
