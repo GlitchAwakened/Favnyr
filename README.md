@@ -122,6 +122,47 @@ cargo run --release --bin favnyr
 
 The executable lands in `target/release/` (`favnyr` on Linux, `favnyr.exe` on Windows). Copy it anywhere. `cargo clean` reclaims the build directory, which is large.
 
+## NixOS
+
+### Run directly
+
+```bash
+nix run github:GlitchAwakened/Favnyr
+```
+
+### Install via Profile
+
+```bash
+nix profile install GlitchAwakened/Favnyr
+```
+
+### Install via Flake
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    favnyr.url = "github:GlitchAwakened/Favnyr"
+  };
+
+  outputs = { self, nixpkgs, favnyr, ... }: {
+    nixosConfigurations.myhostname = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ({ pkgs, ... }: {
+          environment.systemPackages = [
+            favnyr.packages.${pkgs.system}.default
+          ];
+        })
+      ];
+    };
+  };
+}
+```
+
+
+
+
 ## License
 
 GNU General Public License v3.0 or later.

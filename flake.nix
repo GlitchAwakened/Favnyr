@@ -17,7 +17,7 @@
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        favnyr = pkgs.callPackage ./nix/package.nix { };
+        favnyr = pkgs.callPackage ./package.nix { };
       in
       {
         packages = {

@@ -92,7 +92,7 @@ stdenv.mkDerivation rec {
   meta = with lib; {
     description = "A modern and lightweight file manager";
     homepage = "https://github.com/GlitchAwakened/Favnyr";
-    license = licenses.gpl3;
+    license = licenses.gpl3Plus;
     mainProgram = "favnyr";
     platforms = [ "x86_64-linux" ];
   };
