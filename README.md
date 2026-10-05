@@ -133,7 +133,7 @@ nix run github:GlitchAwakened/Favnyr
 ### Install via Profile
 
 ```bash
-nix profile install GlitchAwakened/Favnyr
+nix profile install github:GlitchAwakened/Favnyr
 ```
 
 ### Install via Flake
