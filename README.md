@@ -127,13 +127,13 @@ The executable lands in `target/release/` (`favnyr` on Linux, `favnyr.exe` on Wi
 ### Run directly
 
 ```bash
-nix run github:GlitchAwakened/Favnyr
+nix run github:GlitchAwakened/Favnyr?dir=packaging/nix
 ```
 
 ### Install via Profile
 
 ```bash
-nix profile install github:GlitchAwakened/Favnyr
+nix profile install github:GlitchAwakened/Favnyr?dir=packaging/nix
 ```
 
 ### Install via Flake
@@ -142,7 +142,7 @@ nix profile install github:GlitchAwakened/Favnyr
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    favnyr.url = "github:GlitchAwakened/Favnyr"
+    favnyr.url = "github:GlitchAwakened/Favnyr?dir=packaging/nix";
   };
 
   outputs = { self, nixpkgs, favnyr, ... }: {
