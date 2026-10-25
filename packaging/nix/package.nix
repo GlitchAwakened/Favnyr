@@ -17,7 +17,7 @@
 
 stdenv.mkDerivation rec {
   pname = "favnyr";
-  version = "0.3.6";
+  version = "0.3.7";
 
   # One release, one architecture. A second architecture cannot be another entry
   # in the flake's system list: each one has its own archive and its own hash, so
@@ -25,7 +25,7 @@ stdenv.mkDerivation rec {
   # here, and `meta.platforms` widened to match.
   src = fetchurl {
     url = "https://github.com/GlitchAwakened/Favnyr/releases/download/v${version}/favnyr-linux-x86_64.tar.gz";
-    hash = "sha256-TMJsDX1lDPFBmzxi6Pj5/5s9M/mUYdkwdr4Sku2bHJE=";
+    hash = "sha256-NN+YrrRsgjQs30MhB90DaO7C1Hlme9f6WkONRnUdCR0=";
   };
 
   nativeBuildInputs = [
