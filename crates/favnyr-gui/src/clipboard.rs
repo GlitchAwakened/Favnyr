@@ -319,8 +319,8 @@ mod imp {
     const URI_LIST: &str = "text/uri-list";
     /// Plain text: without it, Ctrl+C on a file drops NO text into the
     /// clipboard, and Ctrl+V in a text field (Favnyr's Rename popup, an
-    /// editor, a terminal…) pastes nothing. Native managers (Dolphin,
-    /// Nautilus) publish the path; we do the same.
+    /// editor, a terminal…) pastes nothing. Native file managers publish
+    /// the path; we do the same.
     const TEXT_PLAIN_UTF8: &str = "text/plain;charset=utf-8";
     const TEXT_PLAIN: &str = "text/plain";
     const GNOME_COPIED_FILES: &str = "x-special/gnome-copied-files";

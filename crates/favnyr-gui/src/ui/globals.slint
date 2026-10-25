@@ -1,0 +1,286 @@
+// Window-wide state shared by components that cannot reach each other through
+// properties: overlays drawn at window level, context menu placement,
+// navigation and dismissal, focus, and the helpers Rust answers for Slint.
+
+import { CascadeAnchor } from "types.slint";
+
+/// What Slint cannot work out about a string, answered by Rust.
+///
+/// `TextInput.set-selection-offsets` counts **bytes**, while the language's
+/// own `character-count` counts graphemes. The two agree only on plain ASCII:
+/// a single accented letter in a path already makes a caret land one position
+/// short of where it was asked to go.
+///
+/// A global rather than callbacks on the window, because the address bar
+/// lives inside a panel and cannot reach the window's own.
+export global TextMetrics {
+    /// Length in bytes, the unit every caret offset here is expressed in.
+    pure callback byte-length(string) -> int;
+    /// Where the caret belongs when a name is offered for renaming: at the
+    /// end for a folder, just before the extension for a file.
+    pure callback rename-caret-offset(string /* name */, bool /* folder */) -> int;
+}
+
+// GLOBAL note bubble — the comment attached to one entry, rendered at window
+// level like `Tip` below so no panel drawn afterward can clip it.
+//
+// Long notes use the same surface as menus. Short labels use the dedicated
+// tooltip colors, which a palette can adjust independently. Their placement
+// and dwell behavior remain separate.
+//
+// `pending` is what the pointer is over right now; `text` is what is actually
+// shown. A timer promotes one to the other only once it has held still for a
+// whole tick, so crossing a list on the way somewhere else never flashes a
+// bubble. `owner` is a ticket, bumped by whichever view sets `pending`, so a
+// view only clears what it put there itself.
+export global Note {
+    in-out property <string> text: "";
+    in-out property <length> x;
+    in-out property <string> pending: "";
+    in-out property <length> pending-x;
+    // Top and bottom edges of the hovered row, in window coordinates. Both are
+    // kept so the bubble can sit under the row, or above it when the window
+    // ends too soon — rather than being clamped ONTO the row it describes.
+    // `row-*` is what the pointer is over now; `shown-*` is what the displayed
+    // bubble belongs to, frozen when the dwell promoted it.
+    in-out property <length> row-top;
+    in-out property <length> row-bottom;
+    in-out property <length> shown-top;
+    in-out property <length> shown-bottom;
+    // Ticket of the last view to set `pending`; see the note above.
+    in-out property <int> owner: -1;
+    in-out property <string> last-seen: "";
+}
+
+// GLOBAL tooltip: set by any button on hover, rendered at the
+// window level (above everything) → never hidden/clipped by a
+// panel drawn afterward. `text == ""` = hidden.
+export global Tip {
+    in-out property <string> text: "";
+    in-out property <length> x;
+    in-out property <length> y;
+}
+
+// Where a floating surface lands. Every menu, flyout and picker in this window
+// places itself through here, and the family it picks says what it must not
+// cover.
+//
+// A PINNED surface hangs from the point the user aimed at, a button or the
+// pointer itself. Nothing behind it is being read, so the only rule is to stay
+// inside the window.
+//
+// A CASCADE hangs from a row of the menu that opened it, and that menu is
+// still on screen and still being read. Keeping it inside the window the same
+// way would slide it over its own parent, so it changes side instead.
+//
+// Writing both here rather than at each surface means a new menu only has to
+// say which of the two it is, and the margins are decided once.
+export global Flyout {
+    /// Breathing room kept between a floating surface and the window edges.
+    out property <length> margin: 8px;
+    /// How far a cascade laps onto the row it comes from, so the two read as
+    /// one surface and the pointer crosses the seam without falling through.
+    out property <length> overlap: 4px;
+
+    /// Keeps a surface of `size` inside `window` along one axis. `max` guards
+    /// the case of a surface larger than the window, where the far margin
+    /// would otherwise ask for less than the near one and invert the bounds.
+    pure function within(wanted: length, size: length, window: length) -> length {
+        return clamp(wanted, self.margin, max(self.margin, window - size - self.margin));
+    }
+
+    /// A pinned surface goes where it was asked, as far as the window allows.
+    public pure function pinned-x(wanted: length, w: length, window: length) -> length {
+        return self.within(wanted, w, window);
+    }
+    public pure function pinned-y(wanted: length, h: length, window: length) -> length {
+        return self.within(wanted, h, window);
+    }
+
+    /// A cascade opens across its parent row: past the far edge when there is
+    /// room, mirrored before the near edge otherwise. Deciding by side rather
+    /// than by sliding is the whole point, a slide ends up on top of the menu
+    /// the user is still reading.
+    ///
+    /// When neither side can hold it, the roomier one is kept and the window
+    /// edge takes the rest; that still leaves more of the parent legible than
+    /// the other side would.
+    public pure function cascade-x(at: CascadeAnchor, w: length, window: length) -> length {
+        let past: length = at.left + at.width - self.overlap;
+        let mirrored: length = at.left + self.overlap - w;
+        return past + w <= window - self.margin
+            ? past
+            : (mirrored >= self.margin
+                ? mirrored
+                : self.within(window - at.left - at.width >= at.left ? past : mirrored,
+                    w, window));
+    }
+
+    /// A cascade lines its first entry up with the row that opens it and
+    /// slides up only as far as the window demands. Sliding is enough on this
+    /// axis: the side has already been chosen, so the two surfaces no longer
+    /// meet whatever the vertical offset.
+    public pure function cascade-y(at: CascadeAnchor, h: length, window: length) -> length {
+        return self.within(at.top - self.overlap, h, window);
+    }
+}
+
+// Keyboard navigation of the view's context menu.
+//
+// The list of entries a menu shows exists nowhere as data: it is implied by a
+// tree of conditions. So the highlighted entry is named by its POSITION in the
+// menu rather than by a number in a list. Their `y` inside the menu is that
+// order, including for conditional and repeated rows.
+//
+// Moving is a poll: `step` names a direction, every entry of the level being
+// navigated answers with its own position, and the nearest one on that side
+// wins. Entries answer in creation order, which does not matter here — keeping
+// the smallest distance gives the same winner whatever the order.
+//
+// Each participating row declares its level explicitly. This stays correct
+// when conditional elements are instantiated eagerly and avoids coupling
+// keyboard navigation to component creation order.
+export global CtxNav {
+    /// 0 = nothing navigable, 1 = the menu, 2 = its open submenu.
+    in-out property <int> level: 0;
+    /// Position of the highlighted entry at each level. Negative = none, a
+    /// value no row can take.
+    in-out property <length> menu-y: -1px;
+    in-out property <length> sub-y: -1px;
+    /// Bumped to fire the highlighted entry: all of them hear it, only the one
+    /// at the highlighted position acts.
+    in-out property <int> activate: 0;
+    /// Same broadcast for opening the submenu of the highlighted entry.
+    in-out property <int> expand: 0;
+    /// The poll in progress: its direction, the position it starts from, and
+    /// the best answer so far (smaller = nearer).
+    in-out property <int> poll: 0;
+    in-out property <int> dir: 1;
+    in-out property <length> from-y: -1px;
+    in-out property <float> best: 0;
+    /// A submenu was opened from the keyboard and its first entry is to be
+    /// highlighted as soon as it exists. See `enter-submenu`.
+    in-out property <bool> want-first: false;
+    /// The keyboard is driving the open submenu. A flyout normally closes on
+    /// its own once the pointer has left it, which would take away a submenu
+    /// opened with the right arrow the moment it appeared: at the keyboard the
+    /// pointer is nowhere near it. The pointer takes the flyout back as soon
+    /// as it touches an entry (see `point`).
+    in-out property <bool> keyboard-holds: false;
+    /// Entries on the wrong side of the cursor are pushed behind this, so that
+    /// wrapping around the ends falls out of the same comparison instead of
+    /// needing a second pass. In pixels, and larger than any menu.
+    property <float> wrap-penalty: 1000000;
+
+    /// Asks every entry of the level being navigated for its position, and
+    /// highlights the nearest one in direction `d` (+1 down, -1 up).
+    public function step(d: int) {
+        if (self.level == 2) { self.keyboard-holds = true; }
+        self.dir = d;
+        self.from-y = self.level == 2 ? self.sub-y : self.menu-y;
+        self.best = 2 * self.wrap-penalty;
+        self.poll += 1;
+    }
+
+    /// The pointer moved onto an entry: the keyboard follows it, so that only
+    /// one entry ever looks highlighted and Enter acts where the eye is.
+    public function point(entry-level: int, y: length) {
+        self.keyboard-holds = false;
+        // Recorded for the entry's OWN level, even when navigation is currently
+        // a level deeper. Hovering a row that opens a flyout takes the level to
+        // 2; moving on to a neighbour of the parent menu must still move the
+        // mark, because the flyout closes a moment later and hands the level
+        // back — and the mark would then point at the row that opened it, which
+        // would light up again behind the pointer and stay lit, no further
+        // hover being due to correct it.
+        //
+        // Unlike `offer`, which answers a poll and must only be answered by the
+        // level being navigated, the pointer is authoritative: wherever it is
+        // is where that level's mark belongs.
+        if (entry-level == 2) { self.sub-y = y; }
+        if (entry-level == 1) { self.menu-y = y; }
+    }
+
+    /// An entry's answer to `step`.
+    public function offer(entry-level: int, y: length) {
+        if (entry-level > 0 && entry-level == self.level) {
+            // Downwards the positions are compared as they are, upwards they
+            // are compared mirrored, so that "nearest" is the smaller number
+            // in both directions.
+            let ahead: bool = self.dir > 0 ? y > self.from-y : y < self.from-y;
+            let distance: float = (self.dir > 0 ? y / 1px : (0px - y) / 1px)
+                + (ahead ? 0 : self.wrap-penalty);
+            if (distance < self.best) {
+                self.best = distance;
+                if (entry-level == 2) { self.sub-y = y; } else { self.menu-y = y; }
+            }
+        }
+    }
+
+    /// Enters the submenu level. A keyboard opening records that its first
+    /// visible entry must be selected once the submenu-open binding is applied.
+    public function enter-submenu(fresh: bool, select-first: bool) {
+        if (fresh) {
+            self.sub-y = -1px;
+        }
+        self.level = 2;
+        if (select-first) {
+            self.keyboard-holds = true;
+            if (self.sub-y < 0px) { self.want-first = true; }
+        }
+    }
+
+    /// Puts the keyboard back on the row that opened the submenu.
+    public function leave-submenu() {
+        self.level = 1;
+        self.sub-y = -1px;
+        self.want-first = false;
+        self.keyboard-holds = false;
+    }
+
+    /// Nothing is navigable any more, and no entry created from now on should
+    /// register. Called on every route out of the menu.
+    public function disarm() {
+        self.level = 0;
+        self.menu-y = -1px;
+        self.sub-y = -1px;
+        self.want-first = false;
+        self.keyboard-holds = false;
+    }
+
+    /// Is this entry the highlighted one?
+    public pure function on(entry-level: int, y: length) -> bool {
+        return entry-level > 0 && self.level == entry-level
+            && y == (entry-level == 1 ? self.menu-y : self.sub-y);
+    }
+
+    /// Keeps the parent marked while its submenu is driven from the keyboard.
+    public pure function holds-parent(entry-level: int, y: length) -> bool {
+        return entry-level == 1 && self.level == 2 && self.keyboard-holds
+            && y == self.menu-y;
+    }
+}
+
+// "Click elsewhere" closing of the context menu. This menu
+// deliberately has NO backdrop (see its declaration: clicks on the CONTENT
+// close it IN PASSING — selection + close in a single click, right-click =
+// repositioning). The "chrome" (rail, sidebar, favorites, tabs, headers,
+// nav buttons, splitters, empty areas) increments `serial` on every
+// interaction; MainWindow observes it (`dismiss-watch`) and closes the menu.
+// Surfaces that OPEN the menu (row right-click / empty list area)
+// do NOT bump the counter. Same global-window principle as `Tip`.
+export global Dismiss {
+    in-out property <int> serial: 0;
+}
+
+/// Favnyr came back to the foreground. Bumped on every activation, so a gesture
+/// can tell the click that brought the window forward from one made while it
+/// was already there.
+export global WindowFocus {
+    in-out property <int> activations: 0;
+}
+
+/// Resolves editing keys with the configured fallback, without changing typed text.
+export global KeyAdapter {
+    callback normalize-key(string) -> string;
+}

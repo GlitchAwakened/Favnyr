@@ -1,0 +1,556 @@
+// Tab bar items, the scroll buttons of the horizontal strip and the vertical
+// tab bar.
+
+import { TabInfo } from "types.slint";
+import { Dismiss, Tip } from "globals.slint";
+import { Theme, Tokens } from "theme.slint";
+
+// Mini chevron scroll button for the tab bar. Same idiom as the "+"
+// button (24x26, no border, hover = alternate-background), greyed out at the
+// end (opacity 0.35). Press = tokens of the ACTIVE tab (accent). Tooltip via the global Tip.
+export component TabScrollButton inherits Rectangle {
+    callback clicked();
+    in property <image> icon;
+    in property <string> tooltip-text;
+    in property <bool> enabled: true;
+    width: 24px;
+    height: 26px;
+    border-radius: 5px;
+    opacity: root.enabled ? 1.0 : 0.35;
+    background: !root.enabled
+        ? transparent
+        : (tsb-touch.pressed
+            ? Theme.accent-background.with-alpha(0.22)
+            : (tsb-touch.has-hover ? Theme.alternate-background : transparent));
+    border-width: 1px;
+    border-color: (root.enabled && tsb-touch.pressed)
+        ? Theme.accent-background.with-alpha(0.55)
+        : transparent;
+    Image {
+        source: root.icon;
+        width: 12px;
+        height: 12px;
+        colorize: Theme.foreground.with-alpha((tsb-touch.has-hover && root.enabled) ? 1.0 : 0.75);
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    tsb-touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { Dismiss.serial += 1; root.clicked(); }
+        changed has-hover => {
+            if (self.has-hover && root.tooltip-text != "") {
+                Tip.text = root.tooltip-text;
+                Tip.x = self.absolute-position.x;
+                Tip.y = self.absolute-position.y + root.height + 4px;
+            } else if (Tip.text == root.tooltip-text) {
+                Tip.text = "";
+            }
+        }
+    }
+}
+
+export component TabItem inherits Rectangle {
+    callback clicked();
+    callback close-clicked();
+    callback right-clicked(length, length);   // tab context menu
+    /// Drag in progress: (delta_px, abs_x, abs_y). Lets the parent
+    /// preview the drop AND detect a cross-view target.
+    callback drag-progress(length, length, length);
+    /// Drag completed: (delta_px, abs_x, abs_y).
+    callback drag-completed(length, length, length);
+    in property <string> title;
+    in property <int> folder-slot;
+    property <color> tone: root.folder-slot > 0
+        ? Tokens.folder-color(root.folder-slot) : Theme.accent-background;
+    in property <bool> active: false;
+    /// Full path of the tab — tooltip on hover (empty = no tooltip).
+    in property <string> tip-path;
+
+    // Geometry & insertion gap claiming -----
+    // Width IMPOSED by the model (bridge) — no fit-to-text: the layout no
+    // longer depends on the text, and the drop logic uses THE SAME plain value.
+    // Like `ColumnHeader.my-drop-target`, this binding only observes
+    // simple model values: offset, width, and the propagated cursor position. It
+    // never depends on `self.x`, `self.width`, or the layout cache, so as not to
+    // create a reactive cycle.
+    // ORIENTATION: `tab-width`/`tab-offset`/`reorder-cur` live on the
+    // bar's MAIN AXIS (X horizontally, Y vertically) — the gap
+    // claim below is thus SHARED between both bars.
+    // `vertical` only toggles the visual geometry (width ↔ height).
+    in property <bool> vertical: false;
+    in property <length> cross-len: 120px;  // VISUAL width in vertical mode
+    // Active indicator on the inner edge of the vertical bar: on the right
+    // when the bar sits to the left of the content, and vice versa.
+    in property <bool> indicator-right: true;
+    in property <length> tab-width: 120px;  // extent along the main axis
+    in property <length> tab-offset;        // offset (main axis) within the bar (bridge)
+    in property <int> tab-index;
+    in property <int> tab-count;
+    in property <bool> reorder-active;      // drag in progress + cursor within the panel's bar
+    in property <length> reorder-cur;       // drag cursor along the main axis (content-relative)
+    /// Emitted when THIS tab claims the gap: (gap index, gap x).
+    callback claim-drop(int, length);
+    // Claimed zone = tab + its right-hand gap (2px spacing) → continuous
+    // tiling; the first tab extends left, the last extends right (outer gaps).
+    // Left half → insert BEFORE (index); right half → AFTER (index+1).
+    property <int> my-claim:
+        (!root.reorder-active
+            || (root.reorder-cur < root.tab-offset && root.tab-index != 0)
+            || (root.reorder-cur >= root.tab-offset + root.tab-width + 2px
+                && root.tab-index != root.tab-count - 1))
+        ? -1
+        : (root.reorder-cur < root.tab-offset + root.tab-width / 2
+            ? root.tab-index
+            : root.tab-index + 1);
+    changed my-claim => {
+        if (root.my-claim >= 0) {
+            root.claim-drop(root.my-claim,
+                root.my-claim == root.tab-index
+                    ? root.tab-offset
+                    : root.tab-offset + root.tab-width + 2px);
+        }
+    }
+
+    height: root.vertical ? root.tab-width : 26px;
+    width: root.vertical ? root.cross-len : root.tab-width;
+    // 15% of the 26px tab height. At 6px (23%) the corners read as a pill;
+    // this keeps the shape a rectangle that happens to be softened.
+    border-radius: 5px;
+    opacity: dragging ? 0.5 : 1.0;
+    // Marked tabs keep a subtle tint even when inactive. Stronger fill and
+    // outline distinguish the active tab without changing the drag geometry.
+    background: root.active
+        ? root.tone.with-alpha(0.22)
+        : root.folder-slot > 0
+            ? root.tone.with-alpha(touch.has-hover ? 0.14 : 0.07)
+            : (touch.has-hover
+            ? Theme.foreground.with-alpha(0.06)
+            : transparent);
+    border-width: 1px;
+    // Active tab: accent outline. Inactive: faint light outline to
+    // distinguish them from the background (a bit stronger on hover).
+    border-color: root.active
+        ? root.tone.with-alpha(0.55)
+        : root.folder-slot > 0
+            ? root.tone.with-alpha(touch.has-hover ? 0.40 : 0.25)
+            : (touch.has-hover
+            ? Theme.foreground.with-alpha(0.30)
+            : Theme.foreground.with-alpha(0.18));
+
+    property <length> ds-x;
+    property <length> ds-y;
+    property <bool> dragging: false;
+    /// The window's tab drag. Watched rather than merely reflected: when the
+    /// drag is cut from outside — a menu opening mid-gesture — this tab has to
+    /// stop looking carried, or it stays half-faded until the next click.
+    in property <bool> tab-drag-active: false;
+    changed tab-drag-active => {
+        if (!root.tab-drag-active) { root.dragging = false; }
+    }
+
+    // IMPORTANT: `touch` (the tab's root TouchArea) MUST be declared BEFORE
+    // the close button, otherwise in Slint it intercepts all clicks (z-order
+    // = declaration order, the LAST one is topmost).
+    touch := TouchArea {
+        pointer-event(ev) => {
+            // LEFT click on a tab closes menus; right-click (tab
+            // menu) does not bump → it can teleport the menu.
+            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) { Dismiss.serial += 1; }
+            if (ev.button == PointerEventButton.left
+                    && ev.kind == PointerEventKind.down) {
+                root.ds-x = self.absolute-position.x + self.mouse-x;
+                root.ds-y = self.absolute-position.y + self.mouse-y;
+                root.dragging = false;
+            }
+            if (ev.button == PointerEventButton.left
+                    && ev.kind == PointerEventKind.up) {
+                if (root.dragging) {
+                    root.drag-completed(
+                        self.absolute-position.x + self.mouse-x - root.ds-x,
+                        self.absolute-position.x + self.mouse-x,
+                        self.absolute-position.y + self.mouse-y,
+                    );
+                    root.dragging = false;
+                } else {
+                    root.clicked();
+                }
+            }
+            // Middle-click → closes the tab (common browser convention).
+            if (ev.button == PointerEventButton.middle
+                    && ev.kind == PointerEventKind.up) {
+                root.close-clicked();
+            }
+            // Right-click → tab context menu (save as favorite…).
+            if (ev.button == PointerEventButton.right
+                    && ev.kind == PointerEventKind.down) {
+                root.right-clicked(
+                    self.absolute-position.x + self.mouse-x,
+                    self.absolute-position.y + self.mouse-y);
+            }
+        }
+        moved => {
+            // Drag threshold on BOTH axes: a vertical tab drag
+            // starts with a Y movement — an X-only threshold wouldn't catch it.
+            if (self.pressed && !root.dragging) {
+                if (abs(self.absolute-position.x + self.mouse-x - root.ds-x) > 6px
+                        || abs(self.absolute-position.y + self.mouse-y - root.ds-y) > 6px) {
+                    root.dragging = true;
+                }
+            }
+            if (self.pressed && root.dragging) {
+                root.drag-progress(
+                    self.absolute-position.x + self.mouse-x - root.ds-x,
+                    self.absolute-position.x + self.mouse-x,
+                    self.absolute-position.y + self.mouse-y,
+                );
+            }
+        }
+        // Tooltip below the tab: the full path distinguishes identical
+        // titles. The `Tip` overlay stays bounded to the window dimensions.
+        changed has-hover => {
+            if (self.has-hover && root.tip-path != "" && !root.dragging) {
+                Tip.text = root.tip-path;
+                Tip.x = self.absolute-position.x;
+                Tip.y = self.absolute-position.y + root.height + 4px;
+            } else if (Tip.text == root.tip-path) {
+                Tip.text = "";
+            }
+        }
+    }
+
+    // In vertical orientation, a 2px accent bar marks the active tab
+    // on the inner edge, content side.
+    if root.vertical && root.active : Rectangle {
+        x: root.indicator-right ? parent.width - 2px : 0;
+        y: 3px;
+        width: 2px;
+        height: parent.height - 6px;
+        border-radius: 1px;
+        background: root.tone;
+    }
+
+    // Title + "x" zone — visual positioned on top of the root touch area.
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 4px;
+        spacing: 6px;
+        Text {
+            text: root.title;
+            font-size: 11px;
+            color: root.folder-slot > 0 ? root.tone : Theme.foreground;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        // Space reserved for the close button — the real button is a sibling
+        // (absolutely positioned) so it properly captures clicks.
+        Rectangle { width: 18px; }
+    }
+
+    // Close button: sibling of touch, declared AFTER so it's topmost.
+    Rectangle {
+        x: parent.width - self.width - 4px;
+        y: (parent.height - self.height) / 2;
+        width: 18px;
+        height: 18px;
+        border-radius: 4px;
+        // Hover: subtle red — consistent with the "x" in the Settings panel.
+        background: close-touch.has-hover ? Tokens.danger.with-alpha(0.27) : transparent;
+        Image {
+            source: @image-url("../../assets/icons/close.svg");
+            width: 11px;
+            height: 11px;
+            colorize: close-touch.has-hover ? Tokens.danger : Theme.foreground.with-alpha(0.7);
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        close-touch := TouchArea {
+            clicked => { Dismiss.serial += 1; root.close-clicked(); }
+        }
+    }
+}
+
+// VTabBar: a panel's VERTICAL tab bar ----------
+// Full-height column stacked to the left or right of the content. Full
+// parity with the horizontal strip: same TabItem (plain geometry on
+// the Y axis — uniform 26+2 px pitch computed by the bridge), same gap
+// claiming, wheel = next/previous tab, double-click on empty area = new tab,
+// non-interactive overflow fades, auto-scroll at the edges during a drag,
+// "+" in a fixed footer.
+// The component is instantiated on BOTH sides (width 0 when inactive): the ids
+// stay referenceable (a conditional `if` element would not be).
+export component VTabBar inherits Rectangle {
+    in property <[TabInfo]> tabs;
+    in property <int> active-tab-idx;
+    in property <bool> on-left;            // bar on the left → active indicator on the right
+    in property <bool> overlay-open;
+    in property <bool> tab-drag-active: false;   // forwarded to the tabs
+    in property <string> new-tab-tooltip;
+    in property <bool> show-tooltip: false;   // tab path tooltip (opt-in)
+    // Tab drag: cursor presence within this bar and Y coordinate within
+    // the content, computed by the PanelComponent without depending on the layout cache.
+    in property <bool> reorder-here;
+    in property <length> reorder-cur;
+    in property <length> cursor-in-bar-y;  // VISIBLE Y cursor (auto-scroll at edges)
+    // Insertion preview (claimed gap, content-relative position).
+    in property <int> preview-idx: -1;
+    in property <length> preview-pos;
+    // Current scroll (content-y ≤ 0) — read by the PanelComponent to
+    // convert the drag cursor to a content-relative position (PLAIN read).
+    out property <length> vp-y: flick.content-y;
+    callback claim-drop(int, length);
+    callback tab-clicked(int);
+    callback tab-closed(int);
+    callback tab-context(int, length, length);
+    callback tab-drag-progress(int, length, length);
+    callback tab-drag-completed(int, length, length);
+    callback tab-new();
+    callback bar-clicked();                // click on empty area → activate the panel
+    callback bar-context(length, length);  // right-click on empty area (absolute position)
+    callback wheel(bool /*fwd*/);          // wheel → next/previous tab
+    callback scrolled(length);             // content-y reported to the bridge
+    callback scroll-target(int, bool, length, length) -> length;
+
+    // Reveals tab `idx` (scroll-into-view) — same bridge target as the
+    // horizontal chevrons (exact geometry, no arbitrary jump).
+    public function reveal(idx: int) {
+        flick.content-y = root.scroll-target(idx, true, flick.content-y, flick.height);
+    }
+
+    property <bool> can-scroll-up: flick.content-y < -0.5px;
+    property <bool> can-scroll-down:
+        flick.content-y > flick.height - flick.content-height + 0.5px;
+
+    background: Theme.toolbar;
+    border-radius: Tokens.radius-row;
+
+    VerticalLayout {
+        padding: 4px;
+        spacing: 4px;
+
+        // ----- Fixed header: new tab, stable target always visible. -----
+        Rectangle {
+            height: 24px;
+            border-radius: 5px;
+            background: vnew-touch.has-hover ? Theme.alternate-background : transparent;
+            Image {
+                source: @image-url("../../assets/icons/plus.svg");
+                width: 13px;
+                height: 13px;
+                colorize: Theme.foreground;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            vnew-touch := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.bar-clicked(); root.tab-new(); }
+                changed has-hover => {
+                    if (self.has-hover && root.new-tab-tooltip != "") {
+                        Tip.text = root.new-tab-tooltip;
+                        // CONTENT side (doesn't hide the list while scanning).
+                        Tip.x = root.on-left
+                            ? self.absolute-position.x + root.width + 4px
+                            : self.absolute-position.x - 120px;
+                        Tip.y = self.absolute-position.y;
+                    } else if (Tip.text == root.new-tab-tooltip) {
+                        Tip.text = "";
+                    }
+                }
+            }
+        }
+        Rectangle { height: 1px; background: Tokens.hairline; }
+
+        // ----- Tab list (vertical scrolling) -----
+        Rectangle {
+            vertical-stretch: 1;
+            clip: true;
+
+            // Wheel + clicks on empty area — BELOW the TabItems (declared before).
+            vwheel := TouchArea {
+                clicked => { root.bar-clicked(); }
+                double-clicked => { root.bar-clicked(); root.tab-new(); }
+                pointer-event(ev) => {
+                    if (ev.kind == PointerEventKind.down
+                            && ev.button == PointerEventButton.right) {
+                        root.bar-context(
+                            self.absolute-position.x + self.mouse-x,
+                            self.absolute-position.y + self.mouse-y);
+                    }
+                }
+                scroll-event(ev) => {
+                    if (root.overlay-open) { return accept; }
+                    if (ev.delta-y < 0 || ev.delta-x < 0) { root.wheel(true); return accept; }
+                    if (ev.delta-y > 0 || ev.delta-x > 0) { root.wheel(false); return accept; }
+                    return reject;
+                }
+            }
+
+            flick := Flickable {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: parent.height;
+                content-width: self.width;
+                content-height: max(self.height, vtabs-col.preferred-height);
+                interactive: false;
+                animate content-y { duration: 120ms; easing: ease-out; }
+                changed content-y => { root.scrolled(self.content-y); }
+
+                vtabs-col := VerticalLayout {
+                    spacing: 2px;               // MUST == VTAB_SPACING (bridge)
+                    alignment: start;
+                    for tab[idx] in root.tabs : TabItem {
+                        vertical: true;
+                        cross-len: flick.width;
+                        indicator-right: root.on-left;
+                        title: tab.title;
+                        folder-slot: tab.folder-slot;
+                        // Path tooltip: opt-in — empty = disabled.
+                        tip-path: root.show-tooltip ? tab.path : "";
+                        active: idx == root.active-tab-idx;
+                        tab-width: tab.width;   // Y extent (26px, bridge)
+                        tab-offset: tab.offset;
+                        tab-index: idx;
+                        tab-count: root.tabs.length;
+                        reorder-active: root.reorder-here;
+                        reorder-cur: root.reorder-cur;
+                        tab-drag-active: root.tab-drag-active;
+                        claim-drop(g, gy) => { root.claim-drop(g, gy); }
+                        clicked => { root.tab-clicked(idx); }
+                        close-clicked => { root.tab-closed(idx); }
+                        right-clicked(x, y) => { root.tab-context(idx, x, y); }
+                        drag-progress(d, ax, ay) => { root.tab-drag-progress(idx, ax, ay); }
+                        drag-completed(d, ax, ay) => { root.tab-drag-completed(idx, ax, ay); }
+                    }
+                    // Bottom clearance: the last tab (and its close button) escapes
+                    // the fade (vertical equivalent of the `tab-cluster-w` spacer).
+                    Rectangle { height: 8px; }
+                }
+                // Drop preview line — HORIZONTAL between two tabs, as an
+                // out-of-layout overlay (Flickable content-relative position).
+                if root.preview-idx >= 0 : Rectangle {
+                    x: 2px;
+                    y: root.preview-pos - 1px;
+                    width: parent.width - 4px;
+                    height: 2px;
+                    background: Theme.accent-background;
+                }
+            }
+            // Top/bottom overflow fades — WITHOUT a TouchArea (wheel and clicks
+            // pass through), fading toward the bar's actual color.
+            if root.can-scroll-up : Rectangle {
+                x: 0; y: 0;
+                width: parent.width;
+                height: 20px;
+                background: @linear-gradient(180deg,
+                    Theme.toolbar 0%, Theme.toolbar.with-alpha(0.0) 100%);
+            }
+            if root.can-scroll-down : Rectangle {
+                x: 0; y: parent.height - self.height;
+                width: parent.width;
+                height: 20px;
+                background: @linear-gradient(0deg,
+                    Theme.toolbar 0%, Theme.toolbar.with-alpha(0.0) 100%);
+            }
+            // Auto-scroll during a reorder drag near the
+            // edges: `reorder-cur` follows
+            // `content-y` → the gap recomputes as scrolling progresses.
+            Timer {
+                interval: 16ms;
+                running: root.reorder-here
+                    && flick.content-height > flick.height + 0.5px;
+                triggered => {
+                    if (root.cursor-in-bar-y < 28px && root.can-scroll-up) {
+                        flick.content-y = min(0px, flick.content-y + 12px);
+                    } else if (root.cursor-in-bar-y > flick.height - 12px && root.can-scroll-down) {
+                        flick.content-y = max(
+                            flick.height - flick.content-height,
+                            flick.content-y - 12px);
+                    }
+                }
+            }
+
+            // ----- Overlaid mini-scrollbar for free scrolling -----
+            // Revealed on hover when the list overflows; 4px track on the right
+            // edge (scrollbar convention). Grabbable anywhere on the track:
+            // the thumb's center follows the mouse.
+            sb := Rectangle {
+                x: parent.width - 5px;
+                y: 0;
+                width: 4px;
+                height: parent.height;
+                property <bool> show: flick.content-height > flick.height + 0.5px
+                    && (vwheel.has-hover || sbt.has-hover || sbt.pressed);
+                opacity: self.show ? 1.0 : 0.0;
+                animate opacity { duration: 120ms; easing: ease-out; }
+                property <length> thumb-h: max(24px,
+                    flick.height * flick.height / max(1px, flick.content-height));
+                property <length> thumb-y: (flick.height - self.thumb-h)
+                    * (-flick.content-y)
+                    / max(1px, flick.content-height - flick.height);
+                Rectangle {
+                    x: 0;
+                    y: sb.thumb-y;
+                    width: parent.width;
+                    height: sb.thumb-h;
+                    border-radius: 2px;
+                    background: Theme.foreground.with-alpha(sbt.pressed ? 0.55 : 0.35);
+                }
+                // Widened hit area (10px) around the 4px track.
+                sbt := TouchArea {
+                    x: -3px;
+                    width: 10px;
+                    enabled: flick.content-height > flick.height + 0.5px;
+                    pointer-event(ev) => {
+                        if (ev.kind == PointerEventKind.down
+                                && ev.button == PointerEventButton.left) {
+                            flick.content-y = -clamp(
+                                (self.mouse-y - sb.thumb-h / 2) / max(1px, flick.height - sb.thumb-h),
+                                0, 1) * (flick.content-height - flick.height);
+                        }
+                    }
+                    moved => {
+                        if (self.pressed) {
+                            flick.content-y = -clamp(
+                                (self.mouse-y - sb.thumb-h / 2) / max(1px, flick.height - sb.thumb-h),
+                                0, 1) * (flick.content-height - flick.height);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Resize grip on the inner edge.
+    // 7px band straddling the content-side edge. The PanelComponent receives
+    // the mouse's absolute position and recomputes the width (shared clamp).
+    callback grip-moved(length /*abs-x*/);
+    callback grip-done();
+    grip := TouchArea {
+        x: root.on-left ? root.width - 3px : -4px;
+        y: 0;
+        width: 7px;
+        height: root.height;
+        mouse-cursor: ew-resize;
+        moved => {
+            if (self.pressed) {
+                root.grip-moved(self.absolute-position.x + self.mouse-x);
+            }
+        }
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.up
+                    && ev.button == PointerEventButton.left) {
+                root.grip-done();
+            }
+        }
+    }
+    // Affordance: accent thread on the inner edge on grip hover/drag.
+    if grip.has-hover || grip.pressed : Rectangle {
+        x: root.on-left ? root.width - 2px : 0;
+        y: 0;
+        width: 2px;
+        height: root.height;
+        background: Theme.accent-background.with-alpha(0.7);
+    }
+}

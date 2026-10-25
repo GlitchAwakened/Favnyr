@@ -1,0 +1,117 @@
+# Fluvy light and dark palettes, adapted to application semantic roles.
+# Original Fluvy theme by acosta290.
+# Colors are taken from the generated Sand palette of the Fluvy theme, which is
+# distributed under the GNU General Public License version 3, as is this
+# application. Only color values are reused.
+
+schema_version = 1
+
+# Light: content on the card color, side bars and headers on the page color,
+# the sunken page behind them. Hover uses the caramel accent tint. File types,
+# folders and ages use the domain state inks.
+[light.opacity]
+hidden = 0.58
+age = 0.16
+
+[light.colors]
+background = "#E6E0D6"
+surface = "#FFFDFA"
+toolbar = "#EFE9DF"
+alternate_background = "#F2E2CE"
+foreground = "#35260B"
+border = "#C7BAA5"
+accent_background = "#8A5A2B"
+accent_foreground = "#FBFAF9"
+danger = "#7C2F2E"
+danger_foreground = "#FBFAF9"
+success = "#28591A"
+warning = "#723C00"
+extension = "#00565E"
+track = "#E6E0D6"
+disk_normal = "#CB9F79"
+toast_success = "#D8EAD4"
+toast_info = "#C9EBEF"
+toast_danger = "#FBDBD9"
+tooltip_background = "#35260B"
+tooltip_foreground = "#EFE9DF"
+shadow = "#000000"
+modal_overlay = "#35260B73"
+file_application = "#478763"
+file_archive = "#88502F"
+file_audio = "#936592"
+file_document = "#036B83"
+file_image = "#A46356"
+file_video = "#268883"
+file_registry = "#7F735E"
+folder_default = "#B28257"
+folder_red = "#A46356"
+folder_green = "#478763"
+folder_teal = "#268883"
+folder_blue = "#036B83"
+folder_violet = "#6C5389"
+folder_pink = "#844E5E"
+folder_slate = "#7F735E"
+age_hour = "#A46356"
+age_hours = "#88502F"
+age_day = "#765C19"
+age_week = "#478763"
+age_month = "#268883"
+age_year = "#036B83"
+age_older = "#9D917B"
+
+# Dark: content on the card color, side bars and headers on the lifted page,
+# the page behind them. Pastel inks on colored fills carry the dark accent ink.
+[dark.opacity]
+hidden = 0.55
+age = 0.20
+
+[dark.colors]
+background = "#120D06"
+surface = "#1D1913"
+toolbar = "#19140A"
+alternate_background = "#392C21"
+foreground = "#EEE7DC"
+border = "#4E4940"
+accent_background = "#D5B89F"
+accent_foreground = "#12100D"
+danger = "#F9CFCC"
+danger_foreground = "#12100D"
+success = "#CBE3C5"
+warning = "#F4D4BC"
+extension = "#B7E4EA"
+toast_success = "#253421"
+toast_info = "#143538"
+toast_danger = "#412726"
+tooltip_background = "#EEE7DC"
+tooltip_foreground = "#120D06"
+shadow = "#000000"
+modal_overlay = "#00000099"
+file_application = "#88B699"
+file_archive = "#E0B9A4"
+file_audio = "#C09BBF"
+file_document = "#9DCBDB"
+file_image = "#CF9B90"
+file_video = "#78B7B3"
+file_registry = "#968C7C"
+folder_default = "#C3A286"
+folder_red = "#CF9B90"
+folder_green = "#88B699"
+folder_teal = "#78B7B3"
+folder_blue = "#9DCBDB"
+folder_violet = "#CABBDF"
+folder_pink = "#DDB7C1"
+folder_slate = "#968C7C"
+folder_red_foreground = "#12100D"
+folder_green_foreground = "#12100D"
+folder_teal_foreground = "#12100D"
+folder_blue_foreground = "#12100D"
+folder_violet_foreground = "#12100D"
+folder_pink_foreground = "#12100D"
+folder_slate_foreground = "#12100D"
+age_hour = "#CF9B90"
+age_hours = "#E0B9A4"
+age_day = "#D2C19C"
+age_week = "#88B699"
+age_month = "#78B7B3"
+age_year = "#9DCBDB"
+age_older = "#8B8171"

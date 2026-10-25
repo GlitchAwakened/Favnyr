@@ -1,0 +1,123 @@
+# Sonokai Atlantis, adapted to application semantic roles.
+# The dark surfaces and accents use the upstream Atlantis palette. The light
+# counterpart is a Favnyr adaptation, not an official Sonokai variant.
+#
+# MIT License
+# Copyright (c) 2020 sainnhe
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+schema_version = 1
+
+# Cool paper surfaces and deeper Atlantis hues keep colored text legible.
+# Notification backgrounds and ink on colored fills use the shared resolver.
+[light.opacity]
+hidden = 0.58
+age = 0.10
+
+[light.colors]
+background = "#E3E8EF"
+surface = "#F6F8FA"
+toolbar = "#EDF1F5"
+alternate_background = "#DCE3EC"
+foreground = "#2A2F38"
+border = "#BBC5D3"
+accent_background = "#176780"
+accent_foreground = "#FFFFFF"
+danger = "#B52F4D"
+danger_foreground = "#FFFFFF"
+success = "#477024"
+warning = "#85670F"
+extension = "#18657D"
+track = "#DCE3EC"
+disk_normal = "#BBC5D3"
+tooltip_background = "#2A2F38"
+tooltip_foreground = "#E1E3E4"
+shadow = "#181A1C"
+modal_overlay = "#181A1C73"
+file_application = "#477024"
+file_archive = "#9A531F"
+file_audio = "#7250A3"
+file_document = "#176780"
+file_image = "#B52F4D"
+file_video = "#217566"
+file_registry = "#586477"
+folder_default = "#B08A24"
+folder_red = "#B52F4D"
+folder_green = "#477024"
+folder_teal = "#217566"
+folder_blue = "#176780"
+folder_violet = "#7250A3"
+folder_pink = "#A5407E"
+folder_slate = "#586477"
+age_hour = "#B52F4D"
+age_hours = "#9A531F"
+age_day = "#785C0D"
+age_week = "#406421"
+age_month = "#1D685B"
+age_year = "#176780"
+age_older = "#586477"
+
+# Original blue-gray Atlantis surfaces and cyan accent. Teal and pink are
+# intermediate hues for folder slots. Metadata uses lighter colors where
+# needed, with a restrained age tint to preserve readability.
+[dark.opacity]
+hidden = 0.55
+age = 0.10
+
+[dark.colors]
+background = "#24272E"
+surface = "#2A2F38"
+toolbar = "#333846"
+alternate_background = "#373C4B"
+foreground = "#E1E3E4"
+border = "#424B5B"
+accent_background = "#72CCE8"
+accent_foreground = "#181A1C"
+danger = "#FF6578"
+danger_foreground = "#181A1C"
+success = "#9DD274"
+warning = "#EACB64"
+extension = "#72CCE8"
+tooltip_background = "#181A1C"
+tooltip_foreground = "#E1E3E4"
+shadow = "#181A1C"
+modal_overlay = "#181A1C99"
+file_application = "#9DD274"
+file_archive = "#F69C5E"
+file_audio = "#BA9CF3"
+file_document = "#72CCE8"
+file_image = "#FF6578"
+file_video = "#88CFAE"
+file_registry = "#A0A7B5"
+folder_default = "#EACB64"
+folder_red = "#FF6578"
+folder_green = "#9DD274"
+folder_teal = "#88CFAE"
+folder_blue = "#72CCE8"
+folder_violet = "#BA9CF3"
+folder_pink = "#DD81B6"
+folder_slate = "#A0A7B5"
+age_hour = "#FF8A98"
+age_hours = "#F69C5E"
+age_day = "#EACB64"
+age_week = "#9DD274"
+age_month = "#88CFAE"
+age_year = "#72CCE8"
+age_older = "#B0B7C4"

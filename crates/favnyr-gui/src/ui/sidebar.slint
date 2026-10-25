@@ -1,0 +1,726 @@
+// "Places" sidebar, the section headers it shares with the favorites panel,
+// and the activity rail.
+
+import { ScrollView } from "widgets.slint";
+import { MenuShortcuts, SidebarPlace } from "types.slint";
+import { Strings } from "strings.slint";
+import { Dismiss, Tip } from "globals.slint";
+import { Theme, Tokens } from "theme.slint";
+
+// Capacity gauge shown at the right end of a drive row.
+//
+// Fill and figures both measure what is USED, so they say one thing: the bar
+// grows, the number grows, the volume is filling. Showing free space here was
+// tried and read as a contradiction — a bar advancing while its own caption
+// counted down. Free space is what the reader usually wants, so it leads the
+// hover hint, where there is room to name it.
+//
+// The label straddles the seam between fill and empty track — a two-tone
+// ground no single text colour survives once the fill is coloured. It is
+// therefore drawn TWICE at the very same position, the second pass clipped to
+// the fill. Each half is then read against one flat colour, and the glyph
+// crossing the seam splits exactly where the bar ends. When the fill is
+// colourless both passes use the same ink, so nothing shows.
+//
+// No animation: a value that moves by a fraction of a percent per minute has
+// nothing to animate, and a sliding bar here would read as a copy in progress.
+component DriveGauge inherits Rectangle {
+    in property <float> used-ratio;
+    in property <int> level;
+    in property <string> label;     // "" renders the bare gauge
+    in property <length> avail-width;
+
+    // Floored so a nearly empty volume still shows a sliver rather than an
+    // apparently broken gauge, and capped short of the full width so the
+    // remaining track stays visible on a nearly full one — the two ends are
+    // where the reading matters most.
+    property <length> fill-w: root.used-ratio <= 0
+        ? 0px
+        : min(root.width, max(8px, root.width * clamp(root.used-ratio, 0, 1)));
+
+    height: 18px;
+    // A true capsule. `Tokens.radius-row` is already the radius of the row
+    // highlight sitting behind it; repeating it would read as a misalignment.
+    border-radius: self.height / 2;
+    // Measured text plus air, never wider than the row can spare, never so
+    // narrow the capsule stops reading as a gauge.
+    width: clamp(txt.preferred-width + 16px, 28px, root.avail-width);
+    background: Tokens.track;
+    clip: true;
+
+    Rectangle {
+        x: 0;
+        width: root.fill-w;
+        height: parent.height;
+        background: Tokens.disk-fill(root.level);
+    }
+
+    // Pass 1 — the whole label, over the empty track.
+    txt := Text {
+        x: (parent.width - self.width) / 2;
+        height: parent.height;
+        text: root.label;
+        font-size: 10.5px;
+        font-weight: 400;
+        color: Theme.foreground;
+        vertical-alignment: center;
+    }
+
+    // Pass 2 — same label, same box, clipped to the fill. Centring on the
+    // GAUGE and not on this clip rectangle is what keeps the two passes in
+    // register to the pixel; any drift would show as a doubled edge.
+    Rectangle {
+        x: 0;
+        width: root.fill-w;
+        height: parent.height;
+        clip: true;
+        Text {
+            x: (root.width - self.width) / 2;
+            height: parent.height;
+            text: root.label;
+            font-size: 10.5px;
+            font-weight: 400;
+            color: Tokens.disk-ink(root.level);
+            vertical-alignment: center;
+        }
+    }
+}
+
+// A clickable sidebar entry (icon + label).
+component SidebarItem inherits Rectangle {
+    callback clicked();
+    callback middle-clicked();                 // open in a new tab
+    callback right-clicked(length, length);   // absolute position
+    callback drag-started(length, length);
+    callback drag-moved(length, length);
+    callback drag-dropped(length, length);
+    in property <bool> drag-active: false;
+    in property <bool> draggable: true;
+    in property <string> label;
+    in property <int> kind;   // 0 folder · 1 home · 2 drive · 3 trash · 4 network · 5 phone · 6 unmounted volume · 7 locked volume
+    in property <int> space-level: -1;   // -1 = unmeasurable → no gauge at all
+    in property <float> space-used-ratio;
+    in property <string> space-text;
+    in property <string> space-text-short;
+    in property <string> space-hint;
+    /// Width of the whole side panel, handed down rather than measured.
+    ///
+    /// The gauge sizes itself to its text, so it FEEDS the row's layout. Were
+    /// its content chosen from the row's resolved width, that width would
+    /// depend on the gauge and the gauge on the width — a binding loop the
+    /// compiler rejects outright. The panel width is set by the user and
+    /// depends on nothing below it, which breaks the cycle at the source.
+    in property <length> panel-width;
+    property <length> down-abs-x;
+    property <length> down-abs-y;
+    property <bool> dragging: false;
+    property <bool> suppress-click: false;
+    changed drag-active => {
+        if (!root.drag-active) { root.dragging = false; }
+    }
+
+    // The row trades detail for room as the panel narrows: full figures, then
+    // free space alone — the bar already carries the ratio, so the total is
+    // the one redundant part — then the bare gauge, which still shows the
+    // proportion and the warning colour.
+    //
+    // Fixed costs per row: 12px of section padding, then 8 padding + 16 icon +
+    // 9 + 9 spacing + 8 padding = 50px of row chrome. The thresholds keep at
+    // least 64px for the drive's name, because a row that says how full a disk
+    // is but no longer says WHICH disk has traded away the wrong thing.
+    property <int> space-tier: root.panel-width >= 185px ? 2
+        : root.panel-width >= 170px ? 1
+        : 0;
+
+    // Below the narrowest tier the gauge is dropped entirely rather than shown
+    // bare. A capsule with no figures still costs 28px of a row that has none
+    // to spare, and it says only what the row could no longer name — the
+    // drive's own label matters more than how full it is.
+    property <bool> show-gauge: root.space-level >= 0 && root.space-tier > 0;
+    // An unmounted volume shows its size in place of a gauge it cannot have.
+    property <bool> show-size: (root.kind == 6 || root.kind == 7)
+        && root.space-text-short != ""
+        && root.space-tier > 0;
+
+    height: 30px;
+    border-radius: Tokens.radius-row;
+    opacity: root.dragging ? 0.45 : 1.0;
+    // Both areas count: the gauge's sits on top of the row's, so over the
+    // gauge only IT reports hover — without this the row would lose its
+    // highlight exactly where the pointer is.
+    background: (touch.has-hover || gauge-hover.has-hover)
+        ? Theme.alternate-background
+        : transparent;
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 9px;
+        // Full-height icon slot → vertically centered image (otherwise the
+        // layout pins the 16px image to the top of the row).
+        Rectangle {
+            width: 16px;
+            height: parent.height;
+            Image {
+                width: 16px;
+                height: 16px;
+                x: 0;
+                y: (parent.height - self.height) / 2;
+                colorize: (root.kind == 2 || root.kind == 4 || root.kind == 5)
+                    ? Theme.accent-background
+                    // A volume that is not mounted keeps the drive shape and
+                    // loses the accent: present, but not reachable yet.
+                    : (root.kind == 6 || root.kind == 7)
+                        ? Theme.foreground.with-alpha(0.45)
+                    : Theme.foreground.with-alpha(0.7);
+                source: root.kind == 1 ? @image-url("../../assets/icons/home.svg")
+                    : root.kind == 2 ? @image-url("../../assets/icons/drive.svg")
+                    : root.kind == 3 ? @image-url("../../assets/icons/trash.svg")
+                    : root.kind == 4 ? @image-url("../../assets/icons/network.svg")
+                    : root.kind == 5 ? @image-url("../../assets/icons/phone.svg")
+                    : root.kind == 6 ? @image-url("../../assets/icons/drive.svg")
+                    // An encrypted volume shows what stands between the user
+                    // and it, rather than a drive it cannot open.
+                    : root.kind == 7 ? @image-url("../../assets/icons/lock.svg")
+                    : @image-url("../../assets/icons/folder.svg");
+            }
+        }
+        Text {
+            text: root.label;
+            font-size: 12px;
+            color: (root.kind == 6 || root.kind == 7)
+                ? Theme.foreground.with-alpha(0.6)
+                : Theme.foreground;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        // Capacity gauge, local volumes only and only when the size could
+        // actually be read. Declared inside the SAME layout so it costs no
+        // extra height.
+        //
+        // ALWAYS instantiated, collapsed to nothing when there is no capacity
+        // to show, rather than wrapped in an `if`: a conditional element is
+        // out of scope for the row, which needs its position to tell whether
+        // the pointer is over it. Zero width and hidden is the same
+        // "instantiate and collapse" idiom the Favorites tree uses.
+        gauge-slot := Rectangle {
+            width: root.show-gauge ? gauge.width : 0px;
+            visible: root.show-gauge;
+            // Full-height slot → vertically centred gauge, same reason as the
+            // icon above: the layout would otherwise pin it to the top.
+            height: parent.height;
+            gauge := DriveGauge {
+                y: (parent.height - self.height) / 2;
+                used-ratio: root.space-used-ratio;
+                level: root.space-level;
+                avail-width: max(28px, root.panel-width - 126px);
+                label: root.space-tier == 2 ? root.space-text : root.space-text-short;
+            }
+        }
+        // Size of a volume that is not mounted. No gauge is possible — nothing
+        // has opened its filesystem to measure occupancy — but the figure still
+        // says which disk this is. Same instantiate-and-collapse idiom as the
+        // gauge above, and it hides on a narrow panel for the same reason.
+        size-slot := Rectangle {
+            width: root.show-size ? size-text.width + 12px : 0px;
+            visible: root.show-size;
+            height: parent.height;
+            size-text := Text {
+                x: 6px;
+                y: (parent.height - self.height) / 2;
+                text: root.space-text-short;
+                font-size: 11px;
+                color: Theme.foreground.with-alpha(0.5);
+            }
+        }
+    }
+    // Button handling for the row, shared by the two touch areas below so that
+    // clicking the gauge behaves exactly like clicking anywhere else on the
+    // row — one implementation, not a copy that can drift.
+    function dispatch-pointer(
+        ev: PointerEvent, abs-x: length, abs-y: length, inside: bool
+    ) {
+        // LEFT click on the sidebar closes menus; right-click (drive/
+        // trash menu) does not bump, so it can teleport the menu.
+        if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down) {
+            Dismiss.serial += 1;
+            root.down-abs-x = abs-x;
+            root.down-abs-y = abs-y;
+            root.dragging = false;
+            root.suppress-click = false;
+        }
+        if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.up) {
+            if (root.dragging) {
+                root.drag-dropped(abs-x, abs-y);
+            } else if (inside && !root.suppress-click) {
+                root.clicked();
+            }
+            root.dragging = false;
+            root.suppress-click = false;
+        }
+        if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+            root.right-clicked(abs-x, abs-y);
+        }
+        // Middle-click opens the target in a new tab, unchanged by the drag.
+        if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.middle) {
+            root.middle-clicked();
+        }
+    }
+    function dispatch-move(pressed: bool, abs-x: length, abs-y: length) {
+        if (!pressed || !root.draggable) { return; }
+        if (!root.dragging
+                && (abs(abs-x - root.down-abs-x) > 6px
+                    || abs(abs-y - root.down-abs-y) > 6px)) {
+            root.dragging = true;
+            root.suppress-click = true;
+            Tip.text = "";
+            root.drag-started(abs-x, abs-y);
+        }
+        if (root.dragging) {
+            root.drag-moved(abs-x, abs-y);
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: root.dragging ? grabbing : pointer;
+        pointer-event(ev) => {
+            root.dispatch-pointer(ev,
+                self.absolute-position.x + self.mouse-x,
+                self.absolute-position.y + self.mouse-y,
+                self.mouse-x >= 0px && self.mouse-x <= self.width
+                    && self.mouse-y >= 0px && self.mouse-y <= self.height);
+        }
+        moved => {
+            root.dispatch-move(self.pressed,
+                self.absolute-position.x + self.mouse-x,
+                self.absolute-position.y + self.mouse-y);
+        }
+    }
+
+    // Hover target for the gauge, and the gauge only.
+    //
+    // Declared AFTER `touch` so it sits ON TOP of it and is the one the
+    // pointer reaches — the same front-to-back rule the Favorites tree relies
+    // on. It hands every button straight back to the row, so nothing is lost
+    // by covering it.
+    //
+    // This replaces an earlier attempt that compared the row's `mouse-x`
+    // against the gauge's position. That looked cheaper but was unreliable:
+    // entering the gauge did not raise the hint, moving on to another row did,
+    // and leaving the gauge sideways left it up — the pointer coordinate is
+    // simply not dependable at the moment hovering begins. A real touch area
+    // has one honest state, `has-hover`, and Slint maintains it. Zero width
+    // when there is no gauge, so it cannot intercept anything.
+    gauge-hover := TouchArea {
+        x: gauge-slot.x;
+        y: 0;
+        width: root.show-gauge ? gauge-slot.width : 0px;
+        height: parent.height;
+        mouse-cursor: pointer;
+        // Names each figure, which the gauge alone cannot: "26.0 / 57.3 GB" does
+        // not say which number is which. `absolute-position` is read HERE, in
+        // an event handler where the layout has settled — reading it from a
+        // property derived from the geometry aborted the whole window with
+        // "Recursion detected", the row being inside a ScrollView.
+        changed has-hover => {
+            if (self.has-hover && root.space-hint != "") {
+                Tip.text = root.space-hint;
+                Tip.x = self.absolute-position.x;
+                Tip.y = self.absolute-position.y + self.height + 4px;
+            } else if (Tip.text == root.space-hint) {
+                Tip.text = "";
+            }
+        }
+        pointer-event(ev) => {
+            root.dispatch-pointer(ev,
+                self.absolute-position.x + self.mouse-x,
+                self.absolute-position.y + self.mouse-y,
+                self.mouse-x >= 0px && self.mouse-x <= self.width
+                    && self.mouse-y >= 0px && self.mouse-y <= self.height);
+        }
+        moved => {
+            root.dispatch-move(self.pressed,
+                self.absolute-position.x + self.mouse-x,
+                self.absolute-position.y + self.mouse-y);
+        }
+    }
+}
+
+// Small icon button reserved for the Favorites header actions. Declared before
+// the shared header so its deeper TouchAreas keep priority
+// over the drag surface placed behind them.
+export component SidebarHeaderAction inherits Rectangle {
+    callback clicked();
+    in property <image> icon;
+    in property <string> tooltip;
+    width: 24px;
+    height: 24px;
+    border-radius: 4px;
+    background: touch.has-hover ? Theme.alternate-background : transparent;
+    Image {
+        source: root.icon;
+        width: 14px;
+        height: 14px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        colorize: touch.has-hover ? Theme.foreground : Theme.foreground.with-alpha(0.6);
+    }
+    touch := TouchArea {
+        clicked => { Dismiss.serial += 1; root.clicked(); }
+        changed has-hover => {
+            if (self.has-hover && root.tooltip != "") {
+                Tip.text = root.tooltip;
+                Tip.x = self.absolute-position.x;
+                Tip.y = self.absolute-position.y + self.height + 4px;
+            } else if (Tip.text == root.tooltip) {
+                Tip.text = "";
+            }
+        }
+    }
+}
+
+// Explicitly centers a 24x24 action within the 30px header without
+// modifying `SidebarHeaderAction`, also used in the Open With settings.
+component SidebarHeaderActionSlot inherits Rectangle {
+    callback clicked();
+    in property <image> icon;
+    in property <string> tooltip;
+    width: 24px;
+    height: 30px;
+    SidebarHeaderAction {
+        y: (parent.height - self.height) / 2;
+        icon: root.icon;
+        tooltip: root.tooltip;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Header shared by the four reorderable sections. A release before the
+// 6px threshold keeps the legacy collapse click; past this threshold, the gesture
+// becomes exclusively a drag and never changes the chevron's state.
+export component SidebarSectionHeader inherits Rectangle {
+    callback toggled();
+    callback drag-started(int, length, length); // section, absolute x/y
+    callback drag-moved(int, length, length);
+    callback drag-dropped(int, length, length);
+    callback new-container();
+    callback collapse-all();
+    in property <int> section-code;
+    in property <string> label;
+    in property <bool> collapsed;
+    in property <bool> favorite-actions: false;
+    in property <bool> can-collapse: false;
+    in property <string> new-container-tooltip;
+    in property <string> collapse-tooltip;
+    in property <bool> reorder-drag-active: false;
+    property <length> down-abs-x;
+    property <length> down-abs-y;
+    property <bool> dragging: false;
+
+    height: 30px;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.toggled(); }
+    background: root.dragging
+        ? Theme.accent-background.with-alpha(0.08)
+        : (header-touch.has-hover ? Theme.foreground.with-alpha(0.05) : transparent);
+
+    changed reorder-drag-active => {
+        if (!root.reorder-drag-active) { root.dragging = false; }
+    }
+
+    // Whole surface draggable, below the Favorites action buttons.
+    header-touch := TouchArea {
+        mouse-cursor: root.dragging ? grabbing : grab;
+        pointer-event(ev) => {
+            if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down) {
+                Dismiss.serial += 1;
+                root.down-abs-x = self.absolute-position.x + self.mouse-x;
+                root.down-abs-y = self.absolute-position.y + self.mouse-y;
+                root.dragging = false;
+            }
+            if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.up) {
+                let ax: length = self.absolute-position.x + self.mouse-x;
+                let ay: length = self.absolute-position.y + self.mouse-y;
+                if (root.dragging) {
+                    root.drag-dropped(root.section-code, ax, ay);
+                    root.dragging = false;
+                } else if (self.mouse-x >= 0px && self.mouse-x <= self.width
+                        && self.mouse-y >= 0px && self.mouse-y <= self.height) {
+                    root.toggled();
+                }
+            }
+        }
+        moved => {
+            if (self.pressed) {
+                let ax: length = self.absolute-position.x + self.mouse-x;
+                let ay: length = self.absolute-position.y + self.mouse-y;
+                if (!root.dragging
+                        && (abs(ax - root.down-abs-x) > 6px
+                            || abs(ay - root.down-abs-y) > 6px)) {
+                    root.dragging = true;
+                    Tip.text = "";
+                    root.drag-started(root.section-code, ax, ay);
+                }
+                if (root.dragging) {
+                    root.drag-moved(root.section-code, ax, ay);
+                }
+            }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 4px;
+        Image {
+            width: 10px;
+            height: 10px;
+            y: (parent.height - self.height) / 2;
+            source: root.collapsed
+                ? @image-url("../../assets/icons/chevron-right.svg")
+                : @image-url("../../assets/icons/chevron-down.svg");
+            colorize: Theme.foreground.with-alpha(header-touch.has-hover ? 0.7 : 0.4);
+        }
+        Text {
+            text: root.label;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            color: Theme.foreground.with-alpha(0.5);
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        // The two Favorites actions precede the handle: this way it stays
+        // at the same X, all the way to the right, across all four headers.
+        if root.favorite-actions : SidebarHeaderActionSlot {
+            icon: @image-url("../../assets/icons/plus.svg");
+            tooltip: root.new-container-tooltip;
+            clicked => { root.new-container(); }
+        }
+        if root.favorite-actions : SidebarHeaderActionSlot {
+            icon: root.can-collapse
+                ? @image-url("../../assets/icons/chevron-up.svg")
+                : @image-url("../../assets/icons/chevron-down.svg");
+            tooltip: root.collapse-tooltip;
+            clicked => { root.collapse-all(); }
+        }
+        // 24px full-height slot: the 3x2-dot SVG is centered on both
+        // axes and stays crisp regardless of the header's number of actions.
+        Rectangle {
+            width: 24px;
+            height: 30px;
+            Image {
+                source: @image-url("../../assets/icons/grip-horizontal.svg");
+                width: 16px;
+                height: 10px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                colorize: Theme.foreground;
+                opacity: root.dragging ? 0.90 : (header-touch.has-hover ? 0.65 : 0.32);
+            }
+        }
+    }
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: Tokens.hairline;
+    }
+}
+
+// A semantic section of places. Its header exists even when its
+// model is empty (notably Network), a necessary condition for moving it.
+export component Sidebar inherits Rectangle {
+    in property <[SidebarPlace]> places;
+    in property <int> section-code;
+    in property <string> title;
+    in property <bool> collapsed: false;
+    in property <bool> header-visible: true;
+    in property <bool> reorder-drag-active: false;
+    in property <int> reorder-drag-source: -1;
+    in property <bool> item-drag-active: false;
+    /// Width of the side panel, forwarded to the rows — see `SidebarItem`.
+    in property <length> panel-width;
+    callback place-clicked(string, int);   // (path, kind)
+    callback place-middle-clicked(string, int);   // (path, kind) → new tab
+    callback place-right-clicked(string, int, bool, bool, string, length, length);   // (path, kind, removable, hotplug, device, x, y)
+    callback place-drag-started(length, length);
+    callback place-drag-moved(length, length);
+    callback place-drag-dropped(string, int, length, length);
+    callback section-toggled();
+    callback section-drag-started(int, length, length);
+    callback section-drag-moved(int, length, length);
+    callback section-drag-dropped(int, length, length);
+
+    background: Theme.toolbar;
+    opacity: root.reorder-drag-active && root.reorder-drag-source == root.section-code ? 0.55 : 1.0;
+
+    VerticalLayout {
+        padding: 0px;
+        spacing: 0px;
+        if root.header-visible : SidebarSectionHeader {
+            section-code: root.section-code;
+            label: root.title;
+            collapsed: root.collapsed;
+            reorder-drag-active: root.reorder-drag-active;
+            toggled => { root.section-toggled(); }
+            drag-started(section, x, y) => { root.section-drag-started(section, x, y); }
+            drag-moved(section, x, y) => { root.section-drag-moved(section, x, y); }
+            drag-dropped(section, x, y) => { root.section-drag-dropped(section, x, y); }
+        }
+        // The items scroll on their own. Without this, a long list claims its
+        // full height from the panel's layout and pushes whatever follows past
+        // the bottom edge, out of reach — there was no way to scroll to it.
+        // `min-height: 0` is what lets the layout shrink the list instead;
+        // collapsing then zeroes the height rather than dropping the element,
+        // the same way the Favorites tree does it.
+        places-scroll := ScrollView {
+            vertical-stretch: 1;
+            visible: !root.collapsed;
+            min-height: 0px;
+            // Never taller than its own content, so the next section follows
+            // immediately instead of hanging below an empty gap. Slint
+            // geometry: item 30px + 2px of top padding.
+            max-height: root.collapsed ? 0px : root.places.length * 32px;
+            // Content height stated explicitly, for the reason given on the
+            // Favorites tree: a view told nothing about its content cannot
+            // know it has anything to scroll to.
+            content-height: max(self.height, root.places.length * 32px);
+            VerticalLayout {
+                padding: 0px;
+                spacing: 0px;
+                for p in root.places : HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    padding-top: 2px;
+                    place-item := SidebarItem {
+                        label: p.kind == 1 ? Strings.sidebar-home
+                            : p.kind == 3 ? Strings.sidebar-trash
+                            : (p.kind == 2 && p.label == "") ? Strings.sidebar-root
+                            : p.label;
+                        draggable: p.path != ""
+                            && (p.kind == 0 || p.kind == 1 || p.kind == 2 || p.kind == 4);
+                        drag-active: root.item-drag-active;
+                        kind: p.kind;
+                        space-level: p.space-level;
+                        space-used-ratio: p.space-used-ratio;
+                        space-text: p.space-text;
+                        space-text-short: p.space-text-short;
+                        space-hint: p.space-hint;
+                        panel-width: root.panel-width;
+                        clicked => { root.place-clicked(p.path, p.kind); }
+                        middle-clicked => { root.place-middle-clicked(p.path, p.kind); }
+                        right-clicked(x, y) => { root.place-right-clicked(p.path, p.kind, p.removable, p.hotplug, p.device, x, y); }
+                        drag-started(x, y) => { root.place-drag-started(x, y); }
+                        drag-moved(x, y) => { root.place-drag-moved(x, y); }
+                        drag-dropped(x, y) => { root.place-drag-dropped(p.path, p.kind, x, y); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Activity rail button: centered 16px icon + tooltip on the RIGHT (the rail
+// is at the far left) + optional active state (sidebar toggle).
+// Modeled on WsIconBtn, tooltip repositioned.
+component RailBtn inherits Rectangle {
+    callback clicked();
+    in property <image> icon;
+    in property <string> tooltip;
+    in property <bool> active: false;
+    width: 36px;
+    height: 34px;
+    border-radius: Tokens.radius-row;
+    background: root.active
+        ? Theme.accent-background.with-alpha(0.18)
+        : (touch.has-hover ? Theme.alternate-background : transparent);
+    border-width: root.active ? 1px : 0px;
+    border-color: root.active ? Theme.accent-background.with-alpha(0.5) : transparent;
+    animate background { duration: 110ms; easing: ease-out; }
+    // A shortcut customization can change the text while the
+    // mouse is still on the button: also keeps the global Tip synchronized.
+    changed tooltip => {
+        if (touch.has-hover) { Tip.text = root.tooltip; }
+    }
+    Image {
+        source: root.icon;
+        width: 16px;
+        height: 16px;
+        colorize: root.active
+            ? Theme.accent-background
+            : (touch.has-hover ? Theme.foreground : Theme.foreground.with-alpha(0.7));
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea {
+        clicked => { Dismiss.serial += 1; root.clicked(); }
+        // Tooltip toward the RIGHT (rail at the far left). Sets/clears the
+        // global Tip, rendered at the window level → never hidden by a panel.
+        changed has-hover => {
+            if (self.has-hover && root.tooltip != "") {
+                Tip.text = root.tooltip;
+                Tip.x = self.absolute-position.x + root.width + 6px;
+                Tip.y = self.absolute-position.y + (root.height - 22px) / 2;
+            } else if (Tip.text == root.tooltip) {
+                Tip.text = "";
+            }
+        }
+    }
+}
+
+// Always-visible vertical activity rail: "Places" panel toggle
+// at the top and system actions (Workspaces, Settings) at the bottom.
+export component ActivityRail inherits Rectangle {
+    // Left panel: 0 collapsed · 1 open (Places + Favorites unified).
+    in property <int> left-panel;
+    in property <MenuShortcuts> shortcuts;
+    callback toggle-places();
+    callback open-workspaces();
+    callback open-settings();
+    width: 48px;
+    background: Theme.toolbar;
+    // Right thread only when NO panel is open (otherwise visual
+    // continuity with the panel that shares the same background).
+    if root.left-panel == 0 : Rectangle {
+        x: parent.width - 1px;
+        width: 1px;
+        background: Tokens.hairline;
+    }
+    VerticalLayout {
+        padding-top: 4px;
+        padding-bottom: 6px;
+        padding-left: 6px;
+        padding-right: 6px;
+        spacing: 4px;
+        // Toggle for the unified side panel (Places + Favorites). Re-click = collapses.
+        RailBtn {
+            icon: @image-url("../../assets/icons/sidebar.svg");
+            tooltip: Strings.sidebar-tooltip;
+            active: root.left-panel == 1;
+            clicked => { root.toggle-places(); }
+        }
+        // Thin separator between the panel toggle and the system actions.
+        Rectangle {
+            height: 9px;
+            Rectangle { y: 4px; height: 1px; background: Tokens.hairline; }
+        }
+        RailBtn {
+            icon: @image-url("../../assets/icons/workspaces.svg");
+            tooltip: Strings.ws-tooltip
+                + (root.shortcuts.open-workspaces != ""
+                    ? "  (" + root.shortcuts.open-workspaces + ")" : "");
+            clicked => { root.open-workspaces(); }
+        }
+        RailBtn {
+            icon: @image-url("../../assets/icons/gear.svg");
+            tooltip: Strings.settings-tooltip
+                + (root.shortcuts.open-settings != ""
+                    ? "  (" + root.shortcuts.open-settings + ")" : "");
+            clicked => { root.open-settings(); }
+        }
+        // Spacer: takes up the bottom of the rail (buttons grouped at the top).
+        Rectangle { vertical-stretch: 1; }
+    }
+}

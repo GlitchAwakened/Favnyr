@@ -1,0 +1,252 @@
+import { Strings } from "../strings.slint";
+import { ChoiceList } from "choice.slint";
+import { WidgetStyle } from "style.slint";
+
+export component LineEdit inherits Rectangle {
+    in-out property <string> text <=> input.text;
+    in property <bool> enabled: true;
+    in property <bool> read-only: false;
+    in property <bool> clear-button-enabled: true;
+    in property <bool> frame: true;
+    in property <length> text-padding: 12px;
+    in property <string> placeholder-text;
+    in property <InputType> input-type: InputType.text;
+    in property <InputMethodHints> input-method-hints <=> input.input-method-hints;
+    in property <length> font-size <=> input.font-size;
+    in property <int> font-weight <=> input.font-weight;
+    in property <string> font-family <=> input.font-family;
+    in property <bool> font-italic <=> input.font-italic;
+    in property <TextHorizontalAlignment> horizontal-alignment: left;
+    out property <bool> has-focus: input.has-focus;
+    callback edited(string);
+    callback accepted(string);
+    callback key-pressed(KeyEvent) -> EventResult;
+    callback key-released(KeyEvent) -> EventResult;
+    property <bool> password-revealed;
+    property <length> text-offset;
+    property <length> menu-x;
+    property <length> menu-y;
+    property <bool> trailing-action: root.enabled && root.has-focus && root.text != ""
+        && (root.input-type == InputType.password || (!root.read-only && root.clear-button-enabled));
+    forward-focus: input;
+    min-width: 160px; min-height: max(root.frame ? 32px : 0px, input.preferred-height);
+    horizontal-stretch: 1; vertical-stretch: 0;
+    border-radius: 4px; border-width: root.frame ? 1px : 0px;
+    border-color: WidgetStyle.input-border;
+    background: !root.frame ? transparent : !root.enabled ? WidgetStyle.disabled : root.has-focus ? WidgetStyle.input-active : WidgetStyle.control;
+    accessible-role: text-input;
+    accessible-enabled: root.enabled;
+    accessible-read-only: root.read-only;
+    accessible-placeholder-text: root.placeholder-text;
+    accessible-value: root.input-type == InputType.password ? "" : root.text;
+    accessible-action-set-value(value) => {
+        if root.enabled && !root.read-only { root.text = value; root.edited(value); }
+    }
+    accessible-action-set-selection-offsets(anchor, focus) => { input.set-selection-offsets(anchor, focus); }
+    public function set-selection-offsets(anchor: int, focus: int) { input.set-selection-offsets(anchor, focus); }
+    public function select-all() { input.select-all(); }
+    public function clear-selection() { input.clear-selection(); }
+    public function copy() { input.copy(); }
+    public function cut() { if root.enabled && !root.read-only { input.cut(); } }
+    public function paste() { if root.enabled && !root.read-only { input.paste(); } }
+    changed has-focus => { if !root.has-focus { root.password-revealed = false; } }
+    changed enabled => { if !root.enabled { root.password-revealed = false; editing-menu.close(); } }
+    function open-menu(x: length, y: length) {
+        if root.enabled {
+            root.menu-x = x; root.menu-y = y;
+            editing-menu.show();
+        }
+    }
+    // The built-in text engine retains IME composition, selection and undo history.
+    field-touch := TouchArea {
+        enabled: root.enabled;
+        pointer-event(e) => {
+            if e.button == PointerEventButton.right && e.kind == PointerEventKind.up {
+                root.open-menu(self.mouse-x, self.mouse-y);
+            }
+        }
+        clicked => { input.focus(); }
+        text-clip := Rectangle {
+            x: root.text-padding; height: parent.height;
+            width: max(1px, parent.width - 2 * root.text-padding - (root.trailing-action ? 16px : 0px));
+            clip: true;
+            Text {
+                width: parent.width; height: parent.height;
+                text: root.text == "" && input.preedit-text == "" ? root.placeholder-text : "";
+                color: root.enabled ? WidgetStyle.secondary : WidgetStyle.disabled-text;
+                font-size: input.font-size; font-family: input.font-family;
+                font-weight: input.font-weight; font-italic: input.font-italic;
+                vertical-alignment: center; horizontal-alignment: root.horizontal-alignment;
+                overflow: elide; accessible-role: none;
+            }
+            input := TextInput {
+                x: root.text-offset.clamp(min(0px, parent.width - self.width - self.text-cursor-width), 0px);
+                width: max(parent.width - self.text-cursor-width, self.preferred-width);
+                height: parent.height;
+                enabled: root.enabled; read-only: root.read-only;
+                input-type: root.password-revealed ? InputType.text : root.input-type;
+                single-line: true; vertical-alignment: center;
+                horizontal-alignment: root.horizontal-alignment;
+                color: root.enabled ? WidgetStyle.foreground : WidgetStyle.disabled-text;
+                selection-background-color: WidgetStyle.selection;
+                selection-foreground-color: WidgetStyle.selection-foreground;
+                accessible-role: none;
+                cursor-position-changed(position) => {
+                    let margin = 2 * root.text-padding;
+                    if position.x + root.text-offset < margin {
+                        root.text-offset = margin - position.x;
+                    } else if position.x + root.text-offset > text-clip.width - margin - self.text-cursor-width {
+                        root.text-offset = text-clip.width - margin - self.text-cursor-width - position.x;
+                    }
+                }
+                edited => { root.edited(self.text); }
+                accepted => { root.accepted(self.text); }
+                key-pressed(e) => {
+                    if e.text == Key.Menu || (e.text == Key.F10 && e.modifiers.shift) {
+                        root.open-menu(10px, root.height); return accept;
+                    }
+                    root.key-pressed(e)
+                }
+                key-released(e) => { root.key-released(e) }
+            }
+        }
+    }
+    if root.trailing-action: Rectangle {
+        x: parent.width - 28px;
+        width: 16px; height: parent.height;
+        accessible-role: button;
+        accessible-label: root.input-type != InputType.password ? Strings.edit-clear
+            : root.password-revealed ? Strings.edit-hide-password : Strings.edit-show-password;
+        accessible-action-default => { root.trailing-click(); }
+        Image {
+            y: (parent.height - 16px) / 2; width: 16px; height: 16px;
+            source: root.input-type != InputType.password ? @image-url("../../../assets/icons/close.svg")
+                : root.password-revealed ? @image-url("../../../assets/icons/eye-off.svg") : @image-url("../../../assets/icons/eye.svg");
+            colorize: WidgetStyle.foreground;
+        }
+        TouchArea { clicked => { root.trailing-click(); } }
+    }
+    if root.frame && root.has-focus && root.enabled: Rectangle {
+        x: 4px; y: parent.height - 2px; width: parent.width - 8px; height: 2px;
+        border-radius: 1px; background: WidgetStyle.accent;
+    }
+    function trailing-click() {
+        if !root.enabled { return; }
+        if root.input-type == InputType.password { root.password-revealed = !root.password-revealed; }
+        else if !root.read-only { root.text = ""; root.edited(""); }
+        input.focus();
+    }
+    editing-menu := PopupWindow {
+        x: root.menu-x; y: root.menu-y; width: 200px; height: choices.height;
+        close-policy: close-on-click-outside;
+        forward-focus: choices;
+        choices := ChoiceList {
+            enabled: root.enabled;
+            // Undo and redo are left out on purpose: the text engine binds
+            // their shortcuts itself, and a field holding one short value has
+            // nothing worth stepping back through from a menu.
+            model: [Strings.ctx-cut, Strings.ctx-copy, Strings.ctx-paste,
+                Strings.edit-select-all];
+            allowed: [!root.read-only, root.text != "", !root.read-only,
+                root.text != ""];
+            selected(index) => {
+                editing-menu.close();
+                input.focus();
+                if index == 0 { root.cut(); }
+                else if index == 1 { root.copy(); }
+                else if index == 2 { root.paste(); }
+                else { root.select-all(); }
+            }
+            dismissed => { editing-menu.close(); }
+        }
+    }
+}
+
+export component SpinBox inherits Rectangle {
+    in property <bool> enabled: true;
+    in property <bool> read-only: false;
+    in property <int> minimum: 0;
+    in property <int> maximum: 100;
+    in property <int> step-size: 1;
+    in property <TextHorizontalAlignment> horizontal-alignment: left;
+    in-out property <int> value: root.minimum;
+    out property <bool> has-focus: edit.has-focus;
+    callback edited(int);
+    forward-focus: edit;
+    min-width: 128px; min-height: max(30px, edit.min-height + 8px);
+    horizontal-stretch: 1; vertical-stretch: 0;
+    border-radius: 4px; border-width: 1px;
+    border-color: !root.enabled || root.has-focus ? WidgetStyle.border : WidgetStyle.input-border;
+    background: !root.enabled ? WidgetStyle.disabled : root.has-focus ? WidgetStyle.input-active : WidgetStyle.control;
+    accessible-role: spinbox;
+    accessible-enabled: root.enabled;
+    accessible-read-only: root.read-only;
+    accessible-value: root.value;
+    accessible-value-minimum: root.minimum;
+    accessible-value-maximum: root.maximum;
+    accessible-value-step: root.step-size;
+    accessible-action-increment => { root.step(1); }
+    accessible-action-decrement => { root.step(-1); }
+    accessible-action-set-value(value) => { if value.is-float() { root.commit(round(value.to-float())); } }
+    function commit(value: int) {
+        if root.enabled && !root.read-only && value >= root.minimum && value <= root.maximum && value != root.value {
+            root.value = value; root.edited(value);
+        }
+    }
+    function step(direction: int) {
+        root.commit((root.value + direction * root.step-size).clamp(root.minimum, root.maximum));
+        edit.text = root.value;
+        edit.set-selection-offsets(99999, 99999);
+    }
+    changed value => { edit.text = root.value; }
+    changed has-focus => { if !root.has-focus { edit.text = root.value; } }
+    TouchArea {
+        enabled: root.enabled && !root.read-only;
+        scroll-event(e) => {
+            if e.delta-y == 0px { return reject; }
+            root.step(e.delta-y > 0px ? 1 : -1); return accept;
+        }
+        edit := LineEdit {
+            x: 12px; y: 4px;
+            width: max(1px, parent.width - 14px - (root.enabled && !root.read-only ? 64px : 0px));
+            height: parent.height - 8px;
+            enabled: root.enabled; read-only: root.read-only;
+            clear-button-enabled: false;
+            frame: false; text-padding: 0px;
+            horizontal-alignment: root.horizontal-alignment;
+            text: root.value;
+            input-type: number;
+            accessible-role: none;
+            edited(text) => {
+                if text.is-float() && text.to-float() == round(text.to-float()) { root.commit(round(text.to-float())); }
+            }
+            accepted => { self.text = root.value; }
+            key-pressed(e) => {
+                if !root.read-only && (e.text == Key.UpArrow || e.text == Key.DownArrow) {
+                    root.step(e.text == Key.UpArrow ? 1 : -1); return accept;
+                }
+                reject
+            }
+        }
+    }
+    for direction[index] in [1, -1]: Rectangle {
+        visible: root.enabled && !root.read-only;
+        x: parent.width - 62px + index * 32px; y: 4px;
+        width: 28px; height: parent.height - 8px;
+        background: touch.pressed ? WidgetStyle.subtle : transparent;
+        border-radius: 3px;
+        Image {
+            x: 8px; y: (parent.height - 12px) / 2; width: 12px; height: 12px;
+            source: direction == 1 ? @image-url("../../../assets/icons/chevron-up.svg") : @image-url("../../../assets/icons/chevron-down.svg");
+            colorize: WidgetStyle.secondary;
+        }
+        touch := TouchArea {
+            enabled: root.enabled && !root.read-only;
+            clicked => { root.step(direction); }
+        }
+    }
+    if root.has-focus && root.enabled: Rectangle {
+        x: 4px; y: parent.height - 2px; width: parent.width - 8px; height: 2px;
+        border-radius: 1px; background: WidgetStyle.accent;
+    }
+}

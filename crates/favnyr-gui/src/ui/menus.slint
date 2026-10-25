@@ -1,0 +1,523 @@
+// Rows and helpers shared by the context menus and their flyouts.
+
+import { CascadeAnchor, ShellCtxEntry } from "types.slint";
+import { CtxNav } from "globals.slint";
+import { Theme, Tokens } from "theme.slint";
+
+/// Closes a flyout after a short delay when neither the parent entry nor the
+/// flyout itself is hovered (tolerates passing the cursor through the gap
+/// between them). Shared by context-menu flyouts. A flyout driven from the
+/// keyboard stays open even when the pointer is nowhere near it.
+export component FlyoutCloseTimer inherits Rectangle {
+    in-out property <bool> open;
+    in property <bool> parent-hover;
+    in property <bool> flyout-hover;
+    width: 0px;
+    height: 0px;
+    Timer {
+        interval: 260ms;
+        running: root.open;
+        triggered => {
+            if (!root.parent-hover && !root.flyout-hover && !CtxNav.keyboard-holds) {
+                root.open = false;
+            }
+        }
+    }
+}
+
+// Row of assignable folder colours, laid inside a menu flyout.
+//
+// The geometry is derived from the menu rather than chosen: a 240px panel less
+// its 4px padding leaves 232px, less the 12px MenuItem uses on each side leaves
+// 208px, and 208 / 8 is 26px — the same 26px a MenuItem is tall. So the strip
+// costs exactly one entry of height, its swatches line up under the labels
+// above them, and the cells tile with no dead strip between two targets.
+//
+// The first cell is drawn hollow: it restores the default rather than assigning
+// a ninth colour, and it keeps the default hue in its ring so the user sees
+// what reverting gives back. That is why there is no "remove colour" entry.
+export component FolderSwatchRow inherits Rectangle {
+    callback picked(int);
+    // Slot already applied to the target, so the strip can point at it.
+    in property <int> current: 0;
+    height: 26px;
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 0px;
+        for slot in [0, 1, 2, 3, 4, 5, 6, 7] : Rectangle {
+            width: 26px;
+            Rectangle {
+                x: 3px;
+                y: 3px;
+                width: 20px;
+                height: 20px;
+                border-radius: 4px;
+                background: slot == 0 ? transparent : Tokens.folder-color(slot);
+                border-width: slot == 0 ? 2px : 0px;
+                border-color: Tokens.folder-color(0);
+                // The applied slot carries the same check the column list uses.
+                // On a filled swatch the palette supplies contrasting ink; on
+                // the hollow one it falls back to the ordinary text colour,
+                // which sits on the menu rather than on a swatch.
+                if root.current == slot : Image {
+                    source: @image-url("../../assets/icons/check.svg");
+                    width: 12px;
+                    height: 12px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    colorize: slot == 0
+                        ? Theme.foreground
+                        : Tokens.folder-ink(slot);
+                }
+            }
+            // Hover ring drawn OUTSIDE the swatch, so the colour it points at
+            // is never covered. Ring means "pointing at", check means
+            // "applied" — separating them by kind lets both show at once.
+            if cell-ta.has-hover : Rectangle {
+                x: 1px;
+                y: 1px;
+                width: 24px;
+                height: 24px;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: Theme.foreground.with-alpha(0.45);
+            }
+            cell-ta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.picked(slot); }
+            }
+        }
+    }
+}
+
+export component MenuItem inherits Rectangle {
+    callback clicked();
+    in property <string> label;
+    in property <bool> enabled: true;
+    /// Keyboard shortcut shown in grey on the right (empty = hidden). Common
+    /// pattern: font-size: 11px, color foreground.with-alpha(0.4).
+    in property <string> shortcut;
+
+    height: 26px;
+    border-radius: 4px;
+    opacity: root.enabled ? 1.0 : 0.45;
+    background: (touch.has-hover || root.nav-on) && root.enabled
+        ? Theme.alternate-background
+        : transparent;
+
+    // --- Keyboard navigation (see `CtxNav`) ---
+    // Zero keeps rows from unrelated menus out of context-menu navigation.
+    in property <int> nav-level: 0;
+    property <bool> nav-on: CtxNav.on(self.nav-level, self.y);
+    // A disabled entry keeps quiet, so the highlight never lands where Enter
+    // would do nothing.
+    property <int> nav-poll: CtxNav.poll;
+    changed nav-poll => { if (root.enabled) { CtxNav.offer(self.nav-level, self.y); } }
+    // Firing is broadcast: every entry hears it, the highlighted one acts.
+    property <int> activate-watch: CtxNav.activate;
+    changed activate-watch => {
+        if (self.nav-on && root.enabled) {
+            root.clicked();
+        }
+    }
+
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 12px;
+        Text {
+            text: root.label;
+            font-size: 12px;
+            color: Theme.foreground;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        if root.shortcut != "" : Text {
+            text: root.shortcut;
+            font-size: 11px;
+            color: Theme.foreground.with-alpha(0.4);
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+        changed has-hover => {
+            if (self.has-hover) { CtxNav.point(root.nav-level, root.y); }
+        }
+    }
+}
+
+// Shared flyout row: pointer hover, keyboard opening and parent highlight.
+export component SubmenuRow inherits Rectangle {
+    in property <string> label;
+    /// True while THIS row's flyout is on screen.
+    in property <bool> open: false;
+    in property <bool> flyout-hover: false;
+    /// Asks for the flyout beside this row; `Flyout` picks the side.
+    callback show(CascadeAnchor);
+    callback hovered(bool);
+
+    height: 26px;
+    border-radius: 4px;
+    // Delayed closing must not keep this row lit over a neighbouring entry.
+    background: (ta.has-hover || root.nav-on
+            || (root.open && (root.flyout-hover || CtxNav.holds-parent(root.nav-level, root.y))))
+        ? Theme.alternate-background
+        : transparent;
+
+    // --- Keyboard navigation (see `MenuItem`) ---
+    in property <int> nav-level: 0;
+    property <bool> nav-on: CtxNav.on(self.nav-level, self.y);
+    property <int> nav-poll: CtxNav.poll;
+    changed nav-poll => { CtxNav.offer(self.nav-level, self.y); }
+    /// One route for the pointer and for the keyboard, and it matters: opening
+    /// a submenu hands it its own level, without which its entries would
+    /// answer for the menu they were opened from.
+    function open-submenu(select-first: bool) {
+        CtxNav.enter-submenu(!root.open, select-first);
+        root.show({ left: ta.absolute-position.x, width: ta.width,
+                    top: ta.absolute-position.y });
+    }
+    // The right arrow opens the flyout; so does Enter, which reads the same on
+    // a row that opens rather than acts.
+    property <int> expand-watch: CtxNav.expand;
+    changed expand-watch => { if (self.nav-on) { self.open-submenu(true); } }
+    property <int> activate-watch: CtxNav.activate;
+    changed activate-watch => { if (self.nav-on) { self.open-submenu(true); } }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        Text {
+            text: root.label;
+            font-size: 12px;
+            color: Theme.foreground;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: "›";
+            font-size: 15px;
+            color: Theme.foreground.with-alpha(0.5);
+            vertical-alignment: center;
+        }
+    }
+    ta := TouchArea {
+        changed has-hover => {
+            root.hovered(self.has-hover);
+            if (self.has-hover) {
+                CtxNav.point(root.nav-level, root.y);
+                root.open-submenu(false);
+            }
+        }
+    }
+}
+
+// Shared command icon renderer. Recipe icons are embedded SVGs and take
+// precedence over an executable icon so their identity survives wrapper
+// scripts and platform changes. Kind values mirror `OpenerIcon::as_i32`.
+export component CommandIcon inherits Rectangle {
+    in property <int> kind: 0;
+    in property <image> extracted;
+    in property <bool> available: true;
+    in property <float> fallback-alpha: 0.7;
+    width: 18px;
+
+    if root.kind == 1 : Image {
+        source: @image-url("../../assets/icons/recipe-7zip.svg");
+        width: 16px; height: 16px;
+        x: 0; y: (parent.height - self.height) / 2;
+        colorize: Theme.foreground.with-alpha(root.available ? 0.8 : 0.35);
+    }
+    if root.kind == 2 : Image {
+        source: @image-url("../../assets/icons/recipe-archive.svg");
+        width: 16px; height: 16px;
+        x: 0; y: (parent.height - self.height) / 2;
+        colorize: Theme.foreground.with-alpha(root.available ? 0.8 : 0.35);
+    }
+    if root.kind == 3 : Image {
+        source: @image-url("../../assets/icons/recipe-email.svg");
+        width: 16px; height: 16px;
+        x: 0; y: (parent.height - self.height) / 2;
+        colorize: Theme.foreground.with-alpha(root.available ? 0.8 : 0.35);
+    }
+    if root.kind == 4 : Image {
+        source: @image-url("../../assets/icons/recipe-device.svg");
+        width: 16px; height: 16px;
+        x: 0; y: (parent.height - self.height) / 2;
+        colorize: Theme.foreground.with-alpha(root.available ? 0.8 : 0.35);
+    }
+    if root.kind == 0 && root.extracted.width > 0 : Image {
+        source: root.extracted;
+        width: 16px; height: 16px;
+        x: 0; y: (parent.height - self.height) / 2;
+        opacity: root.available ? 1.0 : 0.4;
+    }
+    if root.kind == 0 && root.extracted.width == 0 : Image {
+        source: @image-url("../../assets/icons/application.svg");
+        width: 15px; height: 15px;
+        x: 0; y: (parent.height - self.height) / 2;
+        colorize: root.available
+            ? Theme.foreground.with-alpha(root.fallback-alpha)
+            : Tokens.danger;
+    }
+}
+
+// Context menu row WITH ICON — pinned user commands
+//. Same visual template as `ShellMenuRow` (16px icon + generic fallback)
+// so both families of entries line up in the menu.
+export component IconMenuRow inherits Rectangle {
+    callback clicked();
+    in property <string> label;
+    in property <image> icon;
+    in property <int> icon-kind: 0;
+    height: 26px;
+    border-radius: 4px;
+    background: (im-ta.has-hover || root.nav-on) ? Theme.alternate-background : transparent;
+
+    // --- Keyboard navigation (see `MenuItem`) ---
+    in property <int> nav-level: 0;
+    property <bool> nav-on: CtxNav.on(self.nav-level, self.y);
+    property <int> nav-poll: CtxNav.poll;
+    changed nav-poll => { CtxNav.offer(self.nav-level, self.y); }
+    property <int> activate-watch: CtxNav.activate;
+    changed activate-watch => {
+        if (self.nav-on) {
+            root.clicked();
+        }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 12px;
+        spacing: 8px;
+        CommandIcon {
+            kind: root.icon-kind;
+            extracted: root.icon;
+            fallback-alpha: 0.45;
+        }
+        Text {
+            text: root.label;
+            font-size: 12px;
+            color: Theme.foreground;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+    }
+    im-ta := TouchArea {
+        clicked => { root.clicked(); }
+        changed has-hover => {
+            if (self.has-hover) { CtxNav.point(root.nav-level, root.y); }
+        }
+    }
+}
+
+// Row of a WINDOWS CONTEXT MENU entry (shell extensions):
+// program icon + label + "›" if cascading. A cascade opens as a FLYOUT
+// on hover (same mechanism as "Open with"): `sub-hover` reports the
+// absolute coordinates, `hover-changed` feeds the deferred close.
+export component ShellMenuRow inherits Rectangle {
+    callback run(int);
+    callback sub-hover(CascadeAnchor);    // the row it hangs from (cascade only)
+    callback hover-changed(bool);
+    in property <ShellCtxEntry> entry;
+    in property <bool> sub-open: false;   // THIS row's flyout is open
+    in property <bool> flyout-hover: false;
+    height: 26px;
+    border-radius: 4px;
+    background: (sm-ta.has-hover || root.nav-on
+            || (root.sub-open && (root.flyout-hover || CtxNav.holds-parent(root.nav-level, root.y))))
+        ? Theme.alternate-background
+        : transparent;
+
+    // --- Keyboard navigation (see `MenuItem`) ---
+    in property <int> nav-level: 0;
+    property <bool> nav-on: CtxNav.on(self.nav-level, self.y);
+    property <int> nav-poll: CtxNav.poll;
+    changed nav-poll => { CtxNav.offer(self.nav-level, self.y); }
+    /// One route for the pointer and for the keyboard (see `SubmenuRow`).
+    function open-cascade(select-first: bool) {
+        CtxNav.enter-submenu(!root.sub-open, select-first);
+        root.sub-hover({ left: sm-ta.absolute-position.x, width: sm-ta.width,
+                         top: sm-ta.absolute-position.y });
+    }
+    property <int> expand-watch: CtxNav.expand;
+    changed expand-watch => {
+        if (self.nav-on && root.entry.has-sub) { self.open-cascade(true); }
+    }
+    // An entry that carries a cascade opens it, the others run.
+    property <int> activate-watch: CtxNav.activate;
+    changed activate-watch => {
+        if (self.nav-on) {
+            if (root.entry.has-sub) { self.open-cascade(true); }
+            else { root.run(root.entry.id); }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 12px;
+        spacing: 8px;
+        Rectangle {
+            // Stable gutter: if the shell extension doesn't publish a valid
+            // icon, we leave it empty instead of inventing a generic
+            // application pictogram. This keeps the labels aligned.
+            width: 18px;
+            if root.entry.icon.width > 0 : Image {
+                source: root.entry.icon;
+                // Re-tint a monochrome system glyph to the theme foreground
+                // (white in dark); `transparent` = no colorization, keeps
+                // coloured app icons intact.
+                colorize: root.entry.monochrome ? Theme.foreground : transparent;
+                width: 16px;
+                height: 16px;
+                x: 0;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+        Text {
+            text: root.entry.label;
+            font-size: 12px;
+            color: Theme.foreground;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        if root.entry.has-sub : Text {
+            text: "›";
+            font-size: 15px;
+            color: Theme.foreground.with-alpha(0.5);
+            vertical-alignment: center;
+        }
+    }
+    sm-ta := TouchArea {
+        clicked => {
+            if (!root.entry.has-sub) { root.run(root.entry.id); }
+        }
+        changed has-hover => {
+            root.hover-changed(self.has-hover);
+            if (self.has-hover) {
+                CtxNav.point(root.nav-level, root.y);
+                if (root.entry.has-sub) { root.open-cascade(false); }
+            }
+        }
+    }
+}
+
+// "Split" menu entry: orientation icon + label.
+// Icon supplied by the caller, so the row does not have to know the list of
+// things this menu can offer.
+// (two-horizontal-bars glyph drawn inline).
+export component SplitMenuItem inherits Rectangle {
+    callback clicked();
+    in property <string> label;
+    in property <image> icon;
+    in property <string> shortcut;    // shortcut shown on the right (grey)
+
+    height: 36px;
+    border-radius: 4px;
+    background: smi-touch.has-hover ? Theme.accent-background.with-alpha(0.18) : transparent;
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 14px;
+        spacing: 10px;
+        alignment: start;
+
+        // Orientation icon, centered within 18px.
+        Rectangle {
+            width: 18px;
+            height: parent.height;
+            Image {
+                source: root.icon;
+                width: 16px;
+                height: 16px;
+                colorize: Theme.foreground;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        Text {
+            text: root.label;
+            font-size: 12px;
+            color: Theme.foreground;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        // Shortcut, in grey on the right (learning by exposure).
+        Text {
+            text: root.shortcut;
+            font-size: 11px;
+            color: Theme.foreground.with-alpha(0.45);
+            vertical-alignment: center;
+        }
+    }
+
+    smi-touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// Radio menu row with an optional icon and a current-option checkmark.
+export component TabBarMenuItem inherits Rectangle {
+    callback clicked();
+    in property <image> icon;
+    in property <string> label;
+    in property <bool> selected;
+    in property <bool> interactive: true;
+
+    height: 36px;
+    border-radius: 4px;
+    background: root.interactive && tbmi-touch.has-hover
+        ? Theme.accent-background.with-alpha(0.18) : transparent;
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 12px;
+        spacing: 10px;
+        alignment: start;
+
+        if root.icon.width > 0 : Rectangle {
+            width: 18px;
+            height: parent.height;
+            Image {
+                source: root.icon;
+                width: 16px;
+                height: 16px;
+                colorize: root.selected ? Theme.accent-background : Theme.foreground;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        Text {
+            text: root.label;
+            font-size: 12px;
+            color: Theme.foreground;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Rectangle {
+            width: 16px;
+            height: parent.height;
+            if root.selected : Image {
+                source: @image-url("../../assets/icons/check.svg");
+                width: 13px;
+                height: 13px;
+                colorize: Theme.accent-background;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    tbmi-touch := TouchArea {
+        enabled: root.interactive;
+        clicked => { root.clicked(); }
+    }
+}

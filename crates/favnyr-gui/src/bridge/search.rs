@@ -360,7 +360,7 @@ pub(super) fn refresh(window: &MainWindow, state: &AppState, path: &Path) -> boo
         }
         1 => start(window, state, index, query),
         _ => {
-            if !window.get_search_interaction_busy() {
+            if !window.get_rows_interaction_busy() {
                 reorder(state, index);
             }
             update_panels_ui(window, state);
@@ -379,7 +379,7 @@ fn poll(window: &MainWindow, state: &AppState, id: u64) {
     let Some(index) = index else { return };
     // Publishing rows during a gesture can invalidate row indexes under the
     // pointer. Bounded channels apply backpressure while interaction owns them.
-    if !window.get_search_interaction_busy() {
+    if !window.get_rows_interaction_busy() {
         let delivery = state.panels.borrow()[index]
             .search
             .as_ref()
@@ -432,7 +432,7 @@ fn poll(window: &MainWindow, state: &AppState, id: u64) {
             publish(window, state, index);
         }
     }
-    let interval = if !window.get_search_interaction_busy()
+    let interval = if !window.get_rows_interaction_busy()
         && !state.panels.borrow()[index]
             .search
             .as_ref()
@@ -951,6 +951,7 @@ mod tests {
                 kind: FileKind::Folder,
                 hidden: false,
                 is_symlink: false,
+                is_share: false,
                 executable: false,
             };
             assert_eq!(row_path(&entry_to_row(&entry, root, &context)), entry.path);
@@ -978,6 +979,7 @@ mod tests {
                 kind: FileKind::File,
                 hidden: false,
                 is_symlink: false,
+                is_share: false,
                 executable: false,
             })
             .collect();

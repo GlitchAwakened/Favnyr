@@ -147,6 +147,9 @@ fn sidebar_section_order_is_default(order: &[SidebarSection; SidebarSection::COU
 pub struct Config {
     pub language: Lang,
     pub theme: Theme,
+    /// Extended theme identity; the legacy preference remains its fallback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme_id: Option<String>,
     pub window_width: u32,
     pub window_height: u32,
     /// Asks for confirmation before permanent deletion (bypassing the trash).
@@ -184,6 +187,15 @@ pub struct Config {
     /// stays readable and reordering the list never changes what it means.
     #[serde(default)]
     pub letter_shortcut_layout: String,
+    /// Terminal to open for this application, empty for automatic.
+    ///
+    /// Scoped to Favnyr on purpose: the point is to prefer one terminal here
+    /// without touching what the system opens everywhere else. Holds either a
+    /// program name looked up in the `PATH` or a full path, which is what
+    /// browsing for one gives and what Windows usually requires, its terminals
+    /// rarely being on the `PATH`.
+    #[serde(default)]
+    pub terminal: String,
     /// Whether the one-off hint about `letter_shortcut_layout` was shown.
     ///
     /// The hint appears when a letter shortcut goes unanswered on a non-Latin
@@ -193,7 +205,8 @@ pub struct Config {
     pub letter_layout_notice_seen: bool,
     /// Depth for computing folders' **recursive** modification date.
     /// `0` = disabled (folder's own mtime, default); `N > 0` = show the
-    /// most recent date among descendants up to `N` levels. Bounded →
+    /// most recent regular file date up to `N` levels, or the folder's own
+    /// date if no file date is available within that depth. Bounded →
     /// controlled cost. Computed in the background (never freezes the UI).
     #[serde(default)]
     pub recursive_mtime_depth: i32,
@@ -269,7 +282,7 @@ pub struct Config {
     #[serde(default)]
     pub clock_utc: bool,
     /// Shows Windows context-menu entries (shell extensions from
-    /// installed programs: PeaZip, Git, TortoiseGit…) in views' context
+    /// installed programs: archivers, version control clients…) in views' context
     /// menu. This setting allows disabling their loading in case of a
     /// slow or unstable third-party extension, since they run in-process.
     #[serde(default = "default_true")]
@@ -327,6 +340,7 @@ impl Default for Config {
         Self {
             language: Lang::default(),
             theme: Theme::default(),
+            theme_id: None,
             window_width: DEFAULT_WINDOW_WIDTH,
             window_height: DEFAULT_WINDOW_HEIGHT,
             confirm_permanent_delete: true,
@@ -336,6 +350,7 @@ impl Default for Config {
             sidebar_shortcut_redirects: std::collections::BTreeMap::new(),
             default_columns: crate::columns::default_columns(),
             shortcut_overrides: std::collections::BTreeMap::new(),
+            terminal: String::new(),
             letter_shortcut_layout: String::new(),
             letter_layout_notice_seen: false,
             recursive_mtime_depth: 0,
@@ -438,6 +453,62 @@ impl Config {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn extended_theme_keeps_legacy_fallback_and_survives_unrelated_edits() {
+        for value in ["auto", "light", "dark"] {
+            let old: Config = toml::from_str(&format!("theme = \"{value}\"\n")).unwrap();
+            assert!(old.theme_id.is_none());
+            assert_eq!(old.theme.code(), value);
+        }
+        let mut config: Config =
+            toml::from_str("theme = \"dark\"\ntheme_id = \"user:my_theme.toml\"\n").unwrap();
+        config.window_width = 1400;
+        let text = toml::to_string(&config.sanitized()).unwrap();
+        let restored: Config = toml::from_str(&text).unwrap();
+        assert_eq!(restored.theme_id.as_deref(), Some("user:my_theme.toml"));
+        assert_eq!(restored.theme, Theme::Dark);
+        assert_eq!(restored.window_width, 1400);
+        let unknown: Config = toml::from_str("theme_id = \"builtin:unknown\"").unwrap();
+        assert_eq!(unknown.theme_id.as_deref(), Some("builtin:unknown"));
+    }
+
+    #[test]
+    fn theme_changes_preserve_other_preferences() {
+        for clock_utc in [false, true] {
+            let config = Config {
+                clock_utc,
+                default_preview_mode: false,
+                default_item_arrangement: ItemArrangement::Grid,
+                default_show_hidden: true,
+                tab_path_tooltip: false,
+                grid_name_tooltip: false,
+                search_path_tooltip: false,
+                workspace_panel_save: Some(WorkspaceLoadPolicy::Discard),
+                workspace_shortcut_save: WorkspaceLoadPolicy::Save,
+                ..Config::default()
+            };
+            let mut expected = toml::Value::try_from(&config).unwrap();
+            expected.as_table_mut().unwrap().remove("theme");
+            for (theme, theme_id) in [
+                (Theme::Light, None),
+                (Theme::Dark, Some("user:my_theme.toml".to_string())),
+                (Theme::Auto, None),
+            ] {
+                let mut changed: Config =
+                    toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+                changed.theme = theme;
+                changed.theme_id = theme_id;
+                let text = toml::to_string(&changed.sanitized()).unwrap();
+                let restored: Config = toml::from_str(&text).unwrap();
+                let mut actual = toml::Value::try_from(&restored).unwrap();
+                let table = actual.as_table_mut().unwrap();
+                table.remove("theme");
+                table.remove("theme_id");
+                assert_eq!(actual, expected);
+            }
+        }
+    }
 
     #[test]
     fn tooltip_preferences_keep_existing_configs_enabled_and_restore_user_choices() {
@@ -569,6 +640,25 @@ mod tests {
     }
 
     #[test]
+    fn the_terminal_defaults_to_automatic_and_survives_a_round_trip() {
+        // A file written before this setting existed opens the terminal the
+        // system offers, as it always did.
+        let old: Config = toml::from_str("").unwrap();
+        assert!(old.terminal.is_empty());
+
+        // A name resolved through the PATH and a full path are both kept
+        // exactly as given.
+        for value in ["my_terminal", "/opt/folder01/my_terminal"] {
+            let config = Config {
+                terminal: value.into(),
+                ..Config::default()
+            };
+            let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(restored.terminal, value);
+        }
+    }
+
+    #[test]
     fn an_unknown_layout_costs_only_that_setting() {
         // Hand-edited, or written by a later version that knows more
         // layouts. The rest of the file must still load.
@@ -624,8 +714,17 @@ mod tests {
         let path = dir.join("config.toml");
         let cfg = Config::load_or_default(&path).unwrap();
         assert_eq!(cfg.language, Lang::default());
-        assert!(cfg.default_preview_mode);
-        assert!(Config::load_or_default(&path).unwrap().default_preview_mode);
+        for config in [cfg, Config::load_or_default(&path).unwrap()] {
+            assert!(!config.clock_utc);
+            assert!(config.default_preview_mode);
+            assert_eq!(config.default_item_arrangement, ItemArrangement::List);
+            assert!(!config.default_show_hidden);
+            assert!(config.tab_path_tooltip);
+            assert!(config.grid_name_tooltip);
+            assert!(config.search_path_tooltip);
+            assert_eq!(config.panel_save_policy(), WorkspaceLoadPolicy::Ask);
+            assert_eq!(config.workspace_shortcut_save, WorkspaceLoadPolicy::Ask);
+        }
         assert!(path.exists());
     }
 

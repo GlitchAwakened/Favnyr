@@ -17,6 +17,7 @@
 mod imp {
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicIsize, Ordering};
+    use tracing::info;
 
     type Hwnd = isize;
 
@@ -30,6 +31,21 @@ mod imp {
         dw_data: usize,
         cb_data: u32,
         lp_data: *const core::ffi::c_void,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    /// Largest visible ownerless window found on the UI thread so far.
+    struct MainWindowPick {
+        hwnd: Hwnd,
+        area: i64,
     }
 
     #[link(name = "user32")]
@@ -63,6 +79,10 @@ mod imp {
         ) -> i32;
         fn IsWindowVisible(hwnd: Hwnd) -> i32;
         fn GetWindow(hwnd: Hwnd, cmd: u32) -> Hwnd;
+        fn GetWindowRect(hwnd: Hwnd, rect: *mut Rect) -> i32;
+        fn GetWindowTextW(hwnd: Hwnd, buf: *mut u16, count: i32) -> i32;
+        fn GetWindowTextLengthW(hwnd: Hwnd) -> i32;
+        fn GetClassNameW(hwnd: Hwnd, buf: *mut u16, count: i32) -> i32;
         // Cross-instance hover: ASYNCHRONOUS (fire-and-forget) → adds no
         // latency to the source's drag (unlike SendMessage).
         fn PostMessageW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> i32;
@@ -188,15 +208,100 @@ mod imp {
         });
     }
 
-    unsafe extern "system" fn find_main_cb(hwnd: Hwnd, lparam: isize) -> i32 {
+    /// EnumThreadWindows already excludes child windows. Restrict its results
+    /// to visible windows without an owner before comparing their surfaces.
+    unsafe fn is_candidate_window(hwnd: Hwnd) -> bool {
+        unsafe { IsWindowVisible(hwnd) != 0 && GetWindow(hwnd, GW_OWNER) == 0 }
+    }
+
+    /// A UI thread can also own small visible service windows. Examine every
+    /// candidate so their enumeration order cannot decide where IPC and OLE
+    /// are registered. Class names and implementation-specific styles are
+    /// deliberately not selection criteria.
+    ///
+    /// Two traits are required rather than one, because the scan runs on a
+    /// retrying timer whose first attempt can land before the application
+    /// window is on screen. A positive area does not rule a service window
+    /// out, as it has one too, so the area alone would answer the service
+    /// window whenever it is the only candidate, and that answer is final: the
+    /// caller stops retrying and the subclass, the inter-instance marking and
+    /// the drop target stay on it for the whole session. Finding nothing is
+    /// harmless by comparison, since it only costs one more attempt.
+    unsafe extern "system" fn pick_main_cb(hwnd: Hwnd, lparam: isize) -> i32 {
         unsafe {
-            // The first VISIBLE TOP-LEVEL window (no owner) of the thread = the
-            // main window. `lparam` points to a `Hwnd` to fill in.
-            if IsWindowVisible(hwnd) != 0 && GetWindow(hwnd, GW_OWNER) == 0 {
-                *(lparam as *mut Hwnd) = hwnd;
-                return 0; // stop
+            if !is_candidate_window(hwnd) {
+                return 1;
             }
-            1 // continue
+            // The window the application named is the one it put on screen. A
+            // service window carries no title, so an untitled candidate is
+            // passed over even when nothing else is there.
+            if GetWindowTextLengthW(hwnd) == 0 {
+                return 1;
+            }
+            let mut rect = Rect::default();
+            if GetWindowRect(hwnd, &mut rect) == 0 {
+                return 1;
+            }
+            let width = (i64::from(rect.right) - i64::from(rect.left)).max(0);
+            let height = (i64::from(rect.bottom) - i64::from(rect.top)).max(0);
+            let area = width.saturating_mul(height);
+            let pick = &mut *(lparam as *mut MainWindowPick);
+            if area > pick.area {
+                pick.hwnd = hwnd;
+                pick.area = area;
+            }
+            1 // Every candidate must be examined.
+        }
+    }
+
+    /// This thread's main window, or `None` while no titled window of its own
+    /// has a surface yet, which leaves initialization retryable.
+    fn pick_main_window() -> Option<Hwnd> {
+        let mut pick = MainWindowPick { hwnd: 0, area: 0 };
+        unsafe {
+            EnumThreadWindows(
+                GetCurrentThreadId(),
+                pick_main_cb,
+                &mut pick as *mut MainWindowPick as isize,
+            );
+        }
+        (pick.area > 0).then_some(pick.hwnd)
+    }
+
+    /// Records the candidates once after successful initialization. Their
+    /// dimensions and selection make a registration on a service window
+    /// diagnosable even when no drag callback ever reaches the application.
+    fn describe_thread_windows(picked: Hwnd) {
+        unsafe {
+            EnumThreadWindows(GetCurrentThreadId(), describe_window_cb, picked);
+        }
+    }
+
+    unsafe extern "system" fn describe_window_cb(hwnd: Hwnd, lparam: isize) -> i32 {
+        unsafe {
+            if !is_candidate_window(hwnd) {
+                return 1;
+            }
+            let mut rect = Rect::default();
+            let rect_available = GetWindowRect(hwnd, &mut rect) != 0;
+            let mut buffer = [0u16; 128];
+            let read = GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+            let class = String::from_utf16_lossy(&buffer[..read.max(0) as usize]);
+            let read = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+            let title = String::from_utf16_lossy(&buffer[..read.max(0) as usize]);
+            info!(
+                hwnd,
+                class = %class,
+                title = %title,
+                rect_available,
+                left = rect.left,
+                top = rect.top,
+                width = i64::from(rect.right) - i64::from(rect.left),
+                height = i64::from(rect.bottom) - i64::from(rect.top),
+                picked = hwnd == lparam,
+                "candidate window of the Favnyr UI thread"
+            );
+            1
         }
     }
 
@@ -265,16 +370,13 @@ mod imp {
         if SELF_HWND.load(Ordering::SeqCst) != 0 {
             return true; // already initialized
         }
+        let Some(hwnd) = pick_main_window() else {
+            // Nothing on screen carries the application's name yet. The timer
+            // behind this call keeps trying, so the only cost is one attempt.
+            info!("no titled window with a surface yet");
+            return false;
+        };
         unsafe {
-            let mut hwnd: Hwnd = 0;
-            EnumThreadWindows(
-                GetCurrentThreadId(),
-                find_main_cb,
-                &mut hwnd as *mut Hwnd as isize,
-            );
-            if hwnd == 0 {
-                return false; // window not (yet) visible → caller retries
-            }
             if SetWindowSubclass(hwnd, subclass_proc, SUBCLASS_ID, 0) == 0 {
                 return false; // subclassing refused → IPC inactive, retryable
             }
@@ -289,6 +391,7 @@ mod imp {
             );
             SELF_HWND.store(hwnd, Ordering::SeqCst);
         }
+        describe_thread_windows(hwnd);
         HANDLER.with(|h| *h.borrow_mut() = Some(Box::new(handler)));
         true
     }

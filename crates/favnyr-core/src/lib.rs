@@ -23,6 +23,7 @@ pub mod places;
 pub mod process_lock;
 pub mod properties;
 pub mod shortcuts;
+pub mod theme;
 pub mod thumbnail;
 pub mod workspace;
 

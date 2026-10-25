@@ -1,0 +1,139 @@
+# Atom One Light and One Dark palettes, adapted to application semantic roles.
+# The surfaces, text and accents follow a community theme released into the
+# public domain under the Unlicense. Its syntax colors come from the Atom
+# editor's One Light and One Dark themes, whose license notice is embedded with
+# the palette for redistribution.
+#
+# Copyright (c) 2016 GitHub Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+#
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+schema_version = 1
+
+# One Light: content on the near-white primary surface, side bars and headers
+# on the light gray secondary surface, darker gray behind them. The accent
+# keeps the upstream blue hue, slightly deepened so white text reaches the
+# contrast required on buttons. Separators are a step darker than the
+# secondary surface so they stay visible on it.
+[light.opacity]
+hidden = 0.58
+age = 0.16
+
+[light.colors]
+background = "#DBDBDC"
+surface = "#FAFAFA"
+toolbar = "#EAEAEB"
+alternate_background = "#DBDBDC"
+foreground = "#383A42"
+border = "#D0D0D2"
+accent_background = "#4E68EF"
+accent_foreground = "#FFFFFF"
+danger = "#D72020"
+danger_foreground = "#FFFFFF"
+success = "#4EA24C"
+warning = "#986800"
+extension = "#3D74F6"
+track = "#DBDBDC"
+disk_normal = "#A9ABB1"
+tooltip_background = "#383A42"
+tooltip_foreground = "#FAFAFA"
+shadow = "#000000"
+modal_overlay = "#383A4273"
+file_application = "#4EA24C"
+file_archive = "#986800"
+file_audio = "#A625A4"
+file_document = "#3D74F6"
+file_image = "#E75545"
+file_video = "#0084BC"
+file_registry = "#8E8E90"
+# The default folder uses a lighter tone of the palette's orange; pink is the
+# midpoint between its red and purple, the palette having no pink of its own.
+folder_default = "#C18401"
+folder_red = "#E75545"
+folder_green = "#4EA24C"
+folder_teal = "#0084BC"
+folder_blue = "#3D74F6"
+folder_violet = "#A625A4"
+folder_pink = "#C63D74"
+folder_slate = "#8E8E90"
+age_hour = "#E75545"
+age_hours = "#986800"
+age_day = "#C18401"
+age_week = "#4EA24C"
+age_month = "#0084BC"
+age_year = "#3D74F6"
+age_older = "#8E8E90"
+
+# One Dark: content on the blue-gray primary surface, side bars and headers on
+# the darker secondary surface, the darkest one behind them. Accent deepened
+# the same way as in light; the syntax colors serve as semantic colors, with
+# dark text on their fills.
+[dark.opacity]
+hidden = 0.55
+age = 0.20
+
+[dark.colors]
+background = "#1A1E24"
+surface = "#272B34"
+toolbar = "#20242B"
+alternate_background = "#353B47"
+foreground = "#DCDDDE"
+border = "#424958"
+accent_background = "#4473CA"
+accent_foreground = "#FFFFFF"
+danger = "#E06C75"
+danger_foreground = "#20242B"
+success = "#98C379"
+warning = "#E5C07B"
+extension = "#61AFEF"
+tooltip_background = "#1A1E24"
+tooltip_foreground = "#DCDDDE"
+shadow = "#000000"
+modal_overlay = "#00000099"
+file_application = "#98C379"
+file_archive = "#D19A66"
+file_audio = "#C678DD"
+file_document = "#61AFEF"
+file_image = "#E06C75"
+file_video = "#56B6C2"
+file_registry = "#ABB2BF"
+# Pink is the midpoint between the palette's red and purple.
+folder_default = "#E5C07B"
+folder_red = "#E06C75"
+folder_green = "#98C379"
+folder_teal = "#56B6C2"
+folder_blue = "#61AFEF"
+folder_violet = "#C678DD"
+folder_pink = "#D372A9"
+folder_slate = "#ABB2BF"
+folder_red_foreground = "#20242B"
+folder_green_foreground = "#20242B"
+folder_teal_foreground = "#20242B"
+folder_blue_foreground = "#20242B"
+folder_violet_foreground = "#20242B"
+folder_pink_foreground = "#20242B"
+folder_slate_foreground = "#20242B"
+age_hour = "#E06C75"
+age_hours = "#D19A66"
+age_day = "#E5C07B"
+age_week = "#98C379"
+age_month = "#56B6C2"
+age_year = "#61AFEF"
+age_older = "#888888"

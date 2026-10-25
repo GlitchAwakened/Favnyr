@@ -1,0 +1,124 @@
+# Rose Pine and Rose Pine Dawn, adapted to application semantic roles.
+# Base colors come from the upstream palette; leaf and separator shades come
+# from its Neovim port. Their MIT notices are retained below.
+#
+# MIT License
+# Copyright (c) mvllow
+# Copyright (c) 2023 Rosé Pine
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+schema_version = 1
+
+# Dawn's warm paper and rose accent retain their original colors. Small
+# age labels use deeper shades; pastel folder fills keep the original hues.
+# Notification backgrounds and ink on colored fills use the shared resolver.
+[light.opacity]
+hidden = 0.58
+age = 0.10
+
+[light.colors]
+background = "#F2E9E1"
+surface = "#FAF4ED"
+toolbar = "#FFFAF3"
+alternate_background = "#F2E9E1"
+foreground = "#464261"
+border = "#CECACD"
+accent_background = "#D7827E"
+accent_foreground = "#191724"
+danger = "#B4637A"
+success = "#6D8F89"
+warning = "#EA9D34"
+extension = "#286983"
+track = "#DFDAD9"
+disk_normal = "#CECACD"
+tooltip_background = "#464261"
+tooltip_foreground = "#FAF4ED"
+shadow = "#191724"
+modal_overlay = "#19172473"
+file_application = "#6D8F89"
+file_archive = "#EA9D34"
+file_audio = "#907AA9"
+file_document = "#286983"
+file_image = "#B4637A"
+file_video = "#56949F"
+file_registry = "#797593"
+folder_default = "#EA9D34"
+folder_red = "#B4637A"
+folder_green = "#6D8F89"
+folder_teal = "#56949F"
+folder_blue = "#286983"
+folder_violet = "#907AA9"
+folder_pink = "#D7827E"
+folder_slate = "#797593"
+age_hour = "#9C4963"
+age_hours = "#994945"
+age_day = "#875218"
+age_week = "#456C61"
+age_month = "#306A75"
+age_year = "#286983"
+age_older = "#666078"
+
+# The original Rose Pine variant, not Moon. Pine remains a folder color;
+# document and age labels use a brighter blue for readability. Leaf provides
+# a distinct green slot, while the selection uses the upstream rose accent.
+[dark.opacity]
+hidden = 0.55
+age = 0.10
+
+[dark.colors]
+background = "#191724"
+surface = "#1F1D2E"
+toolbar = "#191724"
+alternate_background = "#26233A"
+foreground = "#E0DEF4"
+border = "#403D52"
+accent_background = "#EBBCBA"
+accent_foreground = "#191724"
+danger = "#EB6F92"
+danger_foreground = "#191724"
+success = "#95B1AC"
+warning = "#F6C177"
+extension = "#9CCFD8"
+tooltip_background = "#26233A"
+tooltip_foreground = "#E0DEF4"
+shadow = "#16141F"
+modal_overlay = "#16141F99"
+file_application = "#95B1AC"
+file_archive = "#F6C177"
+file_audio = "#C4A7E7"
+file_document = "#74AEC5"
+file_image = "#EB6F92"
+file_video = "#9CCFD8"
+file_registry = "#908CAA"
+folder_default = "#F6C177"
+folder_red = "#EB6F92"
+folder_green = "#95B1AC"
+folder_teal = "#9CCFD8"
+folder_blue = "#31748F"
+folder_violet = "#C4A7E7"
+folder_pink = "#EBBCBA"
+folder_slate = "#908CAA"
+age_hour = "#F07E9C"
+age_hours = "#EBBCBA"
+age_day = "#F6C177"
+age_week = "#95B1AC"
+age_month = "#9CCFD8"
+age_year = "#74AEC5"
+age_older = "#A09BB8"

@@ -1,7 +1,7 @@
 //! Windows SHELL context menu — `IContextMenu` hosting.
 //!
-//! Enumerates the entries that installed programs (PeaZip, Git, TortoiseGit,
-//! Beyond Compare, Visual Studio…) add to Explorer's context menu, re-renders
+//! Enumerates the entries that installed programs (archivers, version control
+//! clients, comparison tools, IDEs…) add to Explorer's context menu, re-renders
 //! them in Favnyr's Slint menu, then invokes the chosen entry.
 //!
 //! Principle (the same native Shell flow as Explorer):
@@ -11,13 +11,14 @@
 //! 2. `QueryContextMenu` fills in a native `HMENU` (never displayed);
 //! 3. we WALK the `HMENU` (`GetMenuItemInfoW`) to extract labels,
 //!    ids, and submenus (filled on the fly via `IContextMenu2::HandleMenuMsg`
-//!    + `WM_INITMENUPOPUP` — the PeaZip/TortoiseGit case);
+//!    + `WM_INITMENUPOPUP`, the case of cascading extensions);
 //! 4. on click: `InvokeCommand` with the id offset.
 //!
 //! "Dead zone" TRICK: we query the menu of the CURRENT FOLDER AS AN ITEM
-//! (not the folder's "background" menu) — that's what exposes PeaZip's FULL
-//! dropdown menu ("Add to archive"…), BC's "Select left folder for compare",
-//! etc., whereas the background menu only offers a "Browse path with PeaZip".
+//! (not the folder's "background" menu), that's what exposes an archiver's FULL
+//! dropdown menu ("Add to archive"…), a comparison tool's "select this folder
+//! for comparison" entry, etc., whereas the same program's background menu may
+//! offer nothing more than a single "browse this path" entry.
 //!
 //! FILTERING: canonical verbs already covered by Favnyr (open, copy,
 //! delete, properties, sendto…) are discarded (`VERB_BLOCKLIST`) — we only
@@ -61,7 +62,7 @@ mod imp {
     const ID_LAST: u32 = 0x7FFF;
     /// Cap on re-rendered entries (chatty extensions get truncated).
     const MAX_ENTRIES: usize = 24;
-    /// Max depth of flattened submenus (PeaZip/TortoiseGit = 1 level).
+    /// Max depth of flattened submenus (archiver and version control cascades = 1 level).
     const MAX_DEPTH: u8 = 1;
 
     /// Canonical verbs DISCARDED: already covered by Favnyr (or meaningless
@@ -161,7 +162,7 @@ mod imp {
     }
 
     /// A shell menu entry (1-level tree): non-empty `children` =
-    /// cascade (PeaZip, TortoiseGit…) rendered as a dedicated FLYOUT; `id` =
+    /// cascade (e.g. an archiver's submenu) rendered as a dedicated FLYOUT; `id` =
     /// command OFFSET (invoke, leaves only); `icon` = the menu bitmap
     /// converted to RGBA (via `winutil::hbitmap_to_rgba`), `None` if
     /// absent/owner-drawn.
@@ -321,7 +322,7 @@ mod imp {
                 }
                 let icon = stable_menu_icon(&label, menu_item_bitmap_rgba(&mii));
                 if !mii.hSubMenu.is_invalid() {
-                    // Cascade (PeaZip/TortoiseGit…): filled ON THE FLY by the
+                    // Cascade (e.g. an archiver's submenu): filled ON THE FLY by the
                     // extension on WM_INITMENUPOPUP → simulated via HandleMenuMsg.
                     if depth >= MAX_DEPTH {
                         continue;

@@ -38,9 +38,11 @@ Favnyr runs with ordinary user permissions. It installs no service and no backgr
 
 **Views.** Split the window horizontally or vertically, up to 32 views. Each keeps its own tabs, history, sorting and columns.
 
-**Workspaces.** A workspace is a saved set of views and tabs. Keep one per project and restore the whole arrangement in one click, or assign it a number to load it with a keyboard shortcut. Settings provide separate save policies for the Workspaces panel and numbered shortcuts (CTRL+1, CTRl+2...).
+**Workspaces.** A workspace is a saved set of views and tabs. Keep one per project and restore the whole arrangement in one click, or assign it a number to load it with a keyboard shortcut. Settings provide separate save policies for the Workspaces panel and numbered shortcuts (CTRL+1, CTRl+2...). A workspace can have its own theme, independently of the global theme.
 
 **Favorites.** Shared across every workspace, so your usual places do not depend on which layout is open.
+
+**Terminal.** Open one in the current folder, from the right-click menu or the keyboard. **Settings > General > Terminal** chooses which one.
 
 **Custom commands.** Run any program on the selection with your own arguments, using placeholders: `{file}`, `{files}` (the whole selection), `{dir}`, `{dirname}`, `{setname}`, `{name}`, `{stem}`, `{ext}`, `{names}`, `{uri}`. A command can be pinned to the right-click menu, and restricted to the extensions where it makes sense.
 
@@ -64,7 +66,9 @@ So if 7-Zip is installed (7zz, 7z or 7za), Favnyr compresses and extracts withou
 
 **Properties.** A built-in panel for when no desktop file manager offers one: type, location, sizes and dates, Unix permissions and ownership, and MD5, SHA-1, SHA-256 and SHA-512 checksums computed on request. Every value is selectable.
 
-**Interface.** English, French, Spanish, German, Italian, Russian, Simplified Chinese and Japanese. Light and dark themes. Adjustable scaling.
+**Languages.** English, French, Spanish, German, Italian, Russian, Simplified Chinese, and Japanese.
+
+**Themes.** Nord, Atom, Tokyo Night, Sonokai Atlantis, Catppuccin Frappé, Macchiato, Mocha, Rosé Pine, Everforest, Gruvbox Hard, Fluvy... each available in light and dark variants. You can also [create your own themes](#custom-themes).
 
 ## Thumbnails
 
@@ -88,7 +92,6 @@ Videos (`.mp4`, `.mkv`, `.mov`, `.avi`, `.webm`, `.wmv`, `.flv`, `.m4v`, `.mpg`,
 
 - **Windows** -> the shell's thumbnail providers, so nothing extra to install.
 - **Linux** -> `ffmpeg` for video, Poppler (`pdftoppm` or `pdftocairo`) for PDF. Both optional; without them Favnyr simply shows the file-type icon.
-
 
 ## Pro tips
 
@@ -132,6 +135,38 @@ A few things that are easy to miss.
   policy for that action's source. Cancel leaves both the workspace and the
   policy unchanged. If saving fails, the load or new workspace is stopped and
   an error is shown.
+
+## Custom themes
+
+Favnyr's themes are plain TOML files, so the simplest way to make a theme is to copy one that already
+exists, for instance `crates/favnyr-core/src/theme/builtins/atom.toml`, and edit the colors you want to change.
+
+Drop the file in Favnyr's themes directory, under any name you like:
+
+- **Linux** -> `~/.local/share/favnyr/themes` (or `XDG_DATA_HOME`)
+- **Windows** -> `%APPDATA%\favnyr\themes`
+
+A theme declares **both appearances**, `light` and `dark`.
+Every role you leave out is inherited from Nord, Favnyr's base theme, so a complete and valid theme can be this short:
+
+```toml
+schema_version = 1
+
+[light.colors]
+accent_background = "#1F7A54"
+
+[dark.colors]
+accent_background = "#A0D6BC"
+```
+
+`crates/favnyr-core/src/theme/builtins/nord.toml` is the exhaustive reference:
+it carries all 56 color roles in both appearances, with the names to use. Colors are written `#RRGGBB`, and
+`#RRGGBBAA` is accepted only for `track`, `disk_normal`, `disk_warning`,
+`disk_critical` and `modal_overlay`, the roles that are drawn over something
+else. Each appearance also takes an optional `[<appearance>.opacity]` table
+with `hidden` and `age`, two numbers between zero and one that dim hidden items
+and the background of file-age badges.
+
 
 ## About AI-assisted development
 

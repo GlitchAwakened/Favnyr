@@ -1,0 +1,127 @@
+# Tokyo Night and Tokyo Night Light, adapted to application semantic roles.
+# The upstream license notice is embedded with the palette for redistribution.
+#
+# The MIT License (MIT)
+#
+# Copyright (c) 2018-present Enkia
+#
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+schema_version = 1
+
+# Light uses cool gray surfaces, blue focus and the original muted accents.
+# Notification tints and unspecified contrasting inks use the shared resolver.
+[light.opacity]
+hidden = 0.58
+age = 0.16
+
+[light.colors]
+background = "#DCDEE3"
+surface = "#E6E7ED"
+toolbar = "#D6D8DF"
+alternate_background = "#CDCED1"
+foreground = "#343B58"
+border = "#ACB0BF"
+accent_background = "#2959AA"
+accent_foreground = "#FFFFFF"
+danger = "#8C4351"
+danger_foreground = "#FFFFFF"
+success = "#385F0D"
+warning = "#8F5E15"
+extension = "#2959AA"
+track = "#CDCED1"
+disk_normal = "#ACB0BF"
+tooltip_background = "#343B58"
+tooltip_foreground = "#E6E7ED"
+shadow = "#000000"
+modal_overlay = "#343B5873"
+file_application = "#385F0D"
+file_archive = "#965027"
+file_audio = "#5A3E8E"
+file_document = "#2959AA"
+file_image = "#8C4351"
+file_video = "#006C86"
+file_registry = "#6C6E75"
+folder_default = "#8F5E15"
+folder_red = "#8C4351"
+folder_green = "#385F0D"
+folder_teal = "#33635C"
+folder_blue = "#2959AA"
+folder_violet = "#5A3E8E"
+folder_pink = "#A8626A"
+folder_slate = "#6C6E75"
+age_hour = "#8C4351"
+age_hours = "#965027"
+age_day = "#8F5E15"
+age_week = "#385F0D"
+age_month = "#33635C"
+age_year = "#2959AA"
+age_older = "#6C6E75"
+
+# Night keeps chrome close to content brightness and uses brighter body text.
+[dark.opacity]
+hidden = 0.55
+age = 0.20
+
+[dark.colors]
+background = "#16161E"
+surface = "#1A1B26"
+toolbar = "#16161E"
+alternate_background = "#24283B"
+foreground = "#C0CAF5"
+border = "#414868"
+accent_background = "#7AA2F7"
+accent_foreground = "#1A1B26"
+danger = "#F7768E"
+danger_foreground = "#1A1B26"
+success = "#9ECE6A"
+warning = "#E0AF68"
+extension = "#7DCFFF"
+tooltip_background = "#16161E"
+tooltip_foreground = "#C0CAF5"
+shadow = "#000000"
+modal_overlay = "#16161E99"
+file_application = "#9ECE6A"
+file_archive = "#FF9E64"
+file_audio = "#BB9AF7"
+file_document = "#7AA2F7"
+file_image = "#F7768E"
+file_video = "#7DCFFF"
+file_registry = "#9AA5CE"
+folder_default = "#E0AF68"
+folder_red = "#F7768E"
+folder_green = "#9ECE6A"
+folder_teal = "#73DACA"
+folder_blue = "#7AA2F7"
+folder_violet = "#BB9AF7"
+folder_pink = "#DE9AAF"
+folder_slate = "#9AA5CE"
+folder_red_foreground = "#1A1B26"
+folder_green_foreground = "#1A1B26"
+folder_teal_foreground = "#1A1B26"
+folder_blue_foreground = "#1A1B26"
+folder_violet_foreground = "#1A1B26"
+folder_pink_foreground = "#1A1B26"
+folder_slate_foreground = "#1A1B26"
+age_hour = "#F7768E"
+age_hours = "#FF9E64"
+age_day = "#E0AF68"
+age_week = "#9ECE6A"
+age_month = "#73DACA"
+age_year = "#7AA2F7"
+age_older = "#9AA5CE"

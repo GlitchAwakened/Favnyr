@@ -98,6 +98,11 @@ pub struct Entry {
     /// this flag is used for the visual marker — a "folder + arrow" icon for
     /// a folder-link, to distinguish it from a real folder.
     pub is_symlink: bool,
+    /// Folder that is the root of a network share: a share of a remote
+    /// server, a remote filesystem mounted here, or a folder this machine
+    /// shares. Drives a dedicated icon, since such a folder may not accept
+    /// what a regular one does. Always `false` for a file or a link.
+    pub is_share: bool,
     /// Unix executable bit computed during listing (avoids a second `stat`
     /// in the GUI for the "launch with dropped files" feedback).
     /// Always `false` on Windows, where extensions define this action.
@@ -408,6 +413,7 @@ fn list_server_shares(server: &str) -> Result<(Vec<Entry>, usize)> {
                     kind: FileKind::Folder,
                     hidden: false,
                     is_symlink: false,
+                    is_share: true,
                     executable: false,
                 })
                 .collect();
@@ -423,6 +429,61 @@ fn list_server_shares(server: &str) -> Result<(Vec<Entry>, usize)> {
             "network server unreachable",
         )
         .into()),
+    }
+}
+
+/// Recognizes, within one listing, the folders that are the root of a
+/// network share (see [`Entry::is_share`]). What it needs is read once per
+/// listing, so the test on each folder is a comparison. Only the rare child
+/// mounted from another device costs a read of the mount table.
+struct ShareProbe {
+    /// Folders this machine shares, folded like stored paths.
+    local: Vec<PathBuf>,
+    /// Device of the listed folder: a child on another one is a mount point.
+    #[cfg(target_os = "linux")]
+    parent_dev: Option<u64>,
+    /// The listed folder is the GVFS directory, whose children are mounts.
+    #[cfg(target_os = "linux")]
+    in_gvfs: bool,
+}
+
+impl ShareProbe {
+    fn for_dir(dir: &Path) -> Self {
+        #[cfg(not(target_os = "linux"))]
+        let _ = dir;
+        Self {
+            local: crate::places::local_shared_folders()
+                .iter()
+                .map(|folder| crate::paths::fold_for_storage(folder))
+                .collect(),
+            #[cfg(target_os = "linux")]
+            parent_dev: {
+                use std::os::unix::fs::MetadataExt;
+                std::fs::metadata(dir).ok().map(|md| md.dev())
+            },
+            #[cfg(target_os = "linux")]
+            in_gvfs: crate::places::is_gvfs_root(dir),
+        }
+    }
+
+    /// `own_md` is the folder's own metadata, links not followed.
+    fn is_share(&self, name: &str, path: &Path, own_md: &std::fs::Metadata) -> bool {
+        if !self.local.is_empty() && self.local.contains(&crate::paths::fold_for_storage(path)) {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if self.in_gvfs {
+                return crate::places::is_remote_gvfs_mount(name);
+            }
+            if self.parent_dev.is_some_and(|dev| dev != own_md.dev()) {
+                return crate::places::is_remote_mount(path);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (name, own_md);
+        false
     }
 }
 
@@ -457,6 +518,8 @@ pub fn visit_dir_while(
     }
     let read = std::fs::read_dir(path)?;
     let mut hidden_count = 0usize;
+    // Built at the first folder met, so a listing of files alone skips it.
+    let mut shares: Option<ShareProbe> = None;
     for entry_res in read {
         if stop() {
             break;
@@ -508,7 +571,7 @@ pub fn visit_dir_while(
             .file_type()
             .map(|t| t.is_symlink())
             .unwrap_or(false);
-        let (is_dir, size_bytes, mtime_unix, created_unix, executable) = match md_res {
+        let (is_dir, size_bytes, mtime_unix, created_unix, executable, is_share) = match md_res {
             Ok(md) => {
                 // A link describes itself, not what it points at: its own
                 // length is the size of the stored path and its own timestamp
@@ -546,12 +609,18 @@ pub fn visit_dir_while(
                 };
                 #[cfg(not(unix))]
                 let executable = false;
-                (is_dir, size, mtime, created, executable)
+                // A link already has its own icon, whatever it points at.
+                let is_share = is_dir
+                    && !is_symlink
+                    && shares
+                        .get_or_insert_with(|| ShareProbe::for_dir(path))
+                        .is_share(&name, &full_path, &md);
+                (is_dir, size, mtime, created, executable, is_share)
             }
             Err(err) => {
                 tracing::debug!(error = %err, path = %full_path.display(), "metadata failed");
                 // The entry is kept but without size/mtime, assuming a file.
-                (false, None, None, None, false)
+                (false, None, None, None, false, false)
             }
         };
 
@@ -571,6 +640,7 @@ pub fn visit_dir_while(
             kind,
             hidden,
             is_symlink,
+            is_share,
             executable,
         });
     }
@@ -1059,7 +1129,7 @@ pub fn format_used_total(used: u64, total: u64, units: SizeUnits<'_>) -> String 
 }
 
 /// A single bounded walk over `path` computing BOTH its recursive **max mtime**
-/// (the most recent modification date among the folder and its descendants, up
+/// (the most recent regular file modification date among descendants, up
 /// to `mtime_depth` levels) AND its recursive **total size** (sum of descendant
 /// files' bytes, up to `size_depth` levels). `depth = 1` = direct children, `2`
 /// = grandchildren, …; a depth of `0` DISABLES that metric (its result is
@@ -1068,7 +1138,8 @@ pub fn format_used_total(used: u64, total: u64, units: SizeUnits<'_>) -> String 
 ///
 /// Symbolic links are NOT followed (`DirEntry::metadata`) → no loops or runaway
 /// cost; only regular FILES add to the size. Errors (permission, broken link)
-/// are ignored: a partial result beats none.
+/// are ignored: a partial result beats none. If no readable file date is found
+/// within the requested depth, the root folder's own date is used as a fallback.
 pub fn recursive_folder_stats(
     path: &Path,
     mtime_depth: u32,
@@ -1099,6 +1170,7 @@ pub fn recursive_folder_stats(
                 continue; // does not follow symbolic links
             };
             if mtime_left > 0
+                && md.is_file()
                 && let Some(m) = to_unix(&md)
                 && max_mtime.is_none_or(|cur| m > cur)
             {
@@ -1121,13 +1193,9 @@ pub fn recursive_folder_stats(
             }
         }
     }
-    // Bases: the folder's own mtime; a directory has no intrinsic size, so the
-    // size accumulator starts at 0 and only files add to it.
-    let mut max_mtime = if mtime_depth > 0 {
-        std::fs::metadata(path).ok().as_ref().and_then(to_unix)
-    } else {
-        None
-    };
+    // Directory timestamps describe changes to directory entries, not file
+    // contents. They must never compete with descendant file timestamps.
+    let mut max_mtime = None;
     let mut total_size = if size_depth > 0 { Some(0) } else { None };
     walk(
         path,
@@ -1136,6 +1204,9 @@ pub fn recursive_folder_stats(
         &mut max_mtime,
         &mut total_size,
     );
+    if mtime_depth > 0 && max_mtime.is_none() {
+        max_mtime = std::fs::metadata(path).ok().as_ref().and_then(to_unix);
+    }
     (max_mtime, total_size)
 }
 
@@ -1914,6 +1985,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[test]
+    fn share_probe_marks_shared_folders_only() {
+        let tmp = std::env::temp_dir().join(format!("favnyr-share-probe-{}", nano()));
+        let shared = tmp.join("folder01");
+        let plain = tmp.join("folder02");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+        let own_md = |path: &Path| std::fs::symlink_metadata(path).unwrap();
+
+        // A regular listing marks no folder.
+        let (entries, _) = list_dir_counted(&tmp, false).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| e.is_dir && !e.is_share));
+
+        let mut probe = ShareProbe::for_dir(&tmp);
+        probe.local = vec![crate::paths::fold_for_storage(&shared)];
+        assert!(probe.is_share("folder01", &shared, &own_md(&shared)));
+        assert!(!probe.is_share("folder02", &plain, &own_md(&plain)));
+        // Windows paths compare without case, as the shell does.
+        #[cfg(windows)]
+        assert!(probe.is_share("FOLDER01", &tmp.join("FOLDER01"), &own_md(&shared)));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[cfg(unix)]
     #[test]
     fn list_dir_reports_target_executable_bits_including_symlinks() {
@@ -1970,11 +2065,69 @@ mod tests {
         assert_eq!(recursive_max_mtime(&tmp, 2), Some(future));
         let d1 = recursive_max_mtime(&tmp, 1).unwrap();
         assert!(d1 < future, "depth 1 must NOT reach level 2");
-        // depth 0 = the folder's own mtime only (≤ depth 1).
+        // depth 0 = the folder's own mtime, independent of descendant dates.
         let d0 = recursive_max_mtime(&tmp, 0).unwrap();
-        assert!(d0 <= d1);
+        assert!(d0 < future);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn recursive_folder_dates_ignore_directory_changes_and_fall_back_when_empty() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let root = std::env::temp_dir().join(format!("favnyr-folder-dates-{}", nano()));
+        std::fs::create_dir_all(root.join("folder01").join("folder02")).unwrap();
+        let direct = root.join("my_file.txt");
+        let nested = root.join("folder01").join("my_file.txt");
+        for (path, timestamp) in [(&direct, 1_000_000_000), (&nested, 1_100_000_000)] {
+            std::fs::write(path, b"data").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(timestamp))
+                .unwrap();
+        }
+        let own_date = recursive_max_mtime(&root, 0);
+        assert!(own_date.unwrap() > 1_100_000_000);
+        assert_eq!(
+            recursive_folder_stats(&root, 1, 2),
+            (Some(1_000_000_000), Some(8))
+        );
+        assert_eq!(
+            recursive_folder_stats(&root, 2, 1),
+            (Some(1_100_000_000), Some(4))
+        );
+        assert_eq!(recursive_folder_stats(&root, 0, 2), (None, Some(8)));
+        std::fs::remove_file(&nested).unwrap();
+        assert_eq!(recursive_max_mtime(&root, 3), Some(1_000_000_000));
+        std::fs::remove_file(&direct).unwrap();
+        assert_eq!(recursive_max_mtime(&root, 3), recursive_max_mtime(&root, 0));
+        assert_eq!(recursive_folder_stats(&root, 3, 3).1, Some(0));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_folder_dates_do_not_follow_links_or_count_link_timestamps() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let root = std::env::temp_dir().join(format!("favnyr-folder-links-{}", nano()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("my_file.txt");
+        std::fs::write(&file, b"data").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000_000))
+            .unwrap();
+        std::os::unix::fs::symlink(&file, root.join("file_link")).unwrap();
+        std::os::unix::fs::symlink(&root, root.join("folder_link")).unwrap();
+        assert_eq!(
+            recursive_folder_stats(&root, 16, 16),
+            (Some(1_000_000_000), Some(4))
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2057,6 +2210,7 @@ mod tests {
             },
             hidden: false,
             is_symlink: false,
+            is_share: false,
             executable: false,
         }
     }
@@ -2072,6 +2226,7 @@ mod tests {
             kind: FileKind::File,
             hidden: false,
             is_symlink: false,
+            is_share: false,
             executable: false,
         }
     }

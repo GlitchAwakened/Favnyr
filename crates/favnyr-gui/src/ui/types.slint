@@ -1,0 +1,431 @@
+// Structs shared between Rust and Slint.
+//
+// The ones the bridge exchanges with the window are re-exported by
+// `main_window.slint`, which places them in the generated Rust API.
+
+// Represents a tab in a panel's tab bar.
+// `width` and `offset` are computed by the bridge from the title, with a
+// width clamped to 90-180 px. Rendering and drop logic thus share
+// a geometry independent of the reactive layout.
+export struct TabInfo {
+    title: string,
+    folder-slot: int,       // shared path annotation, 0 = unmarked
+    width: length,
+    offset: length,
+    // Full path shown in the tooltip on hover.
+    path: string,
+}
+
+// A breadcrumb segment. `label` is the displayed name,
+// `path` the absolute path to navigate to on click.
+export struct Crumb {
+    label: string,
+    path: string,
+}
+
+// A named workspace in the "Workspaces" overlay list.
+export struct WorkspaceEntry {
+    id: string,      // stable identifier (file name)
+    name: string,    // displayed name, editable
+    panels: int,     // number of panels (metadata)
+    tabs: int,       // total number of tabs (metadata)
+    is-current: bool, // currently loaded workspace (accent rail + semibold name)
+    is-dirty: bool,   // current + unsaved changes (dot + amber pill)
+    slot: int,        // keyboard slot 1..9 that loads it; 0 = none
+    // Name of the theme it imposes while loaded, already localized and capped
+    // in length, empty when it follows the global theme. A name rather than a
+    // colour: resolved colours are never carried by item models, and a theme
+    // file's accent belongs to no fixed palette.
+    theme: string,
+    // The same theme as the stored identifier, which is what the picker ticks
+    // and what survives the list being sorted again. The displayed name above
+    // cannot serve: two files may carry the same name once shortened.
+    theme-id: string,
+}
+
+// A location in the "Places" sidebar. `kind`: 0=folder,
+// 1=home, 2=drive, 3=trash (drives the icon + the i18n label).
+// Models are split by section on the bridge side: ordering belongs to the
+// workspace and is therefore never encoded in each row.
+export struct SidebarPlace {
+    label: string,
+    path: string,
+    kind: int,
+    // Removable device → offers to release it.
+    removable: bool,
+    // Can the cable be pulled? Decides the wording, not the availability.
+    hotplug: bool,
+    // Eject/disconnect target (Linux device `/dev/…` or drive letter `X:`).
+    device: string,
+    // Remaining-space level of a drive: -1 unmeasurable (no badge at all),
+    // 0 roomy, 1 low, 2 critical. Anything that is not a local volume — a
+    // share, the trash, a shortcut — stays at -1.
+    space-level: int,
+    // Share of the volume in USE, 0..1. The gauge grows with it, in step with
+    // the figures beside it.
+    space-used-ratio: float,
+    // "26.0 / 57.3 GB", already localized, and the used figure alone for a
+    // narrow sidebar.
+    space-text: string,
+    space-text-short: string,
+    // One-line breakdown for the hover hint, where each figure is named.
+    space-hint: string,
+}
+
+// An "opener" (Open with) on the GUI side: id + label + availability
+// (program not found → greyed out). `default-exts` shown in settings.
+export struct OpenerItem {
+    id: string,
+    label: string,
+    available: bool,
+    icon: image,        // icon extracted from the exe (empty if unavailable)
+    // 0 = none, 1 = 7-Zip, 2 = archive/tar, 3 = email, 4 = device transfer.
+    icon-kind: int,
+}
+
+// Entry in the WINDOWS CONTEXT MENU (hosted shell extensions).
+// `has-sub` = cascade (e.g. an archiver's submenu) → dedicated flyout;
+// `sub` = sub-menu index on the bridge side (model pushed on hover);
+// `icon` = menu bitmap (empty = fallback).
+export struct ShellCtxEntry {
+    id: int,            // command offset (InvokeCommand, leaves)
+    label: string,
+    icon: image,
+    // Monochrome system glyph (e.g. "Share") → re-tinted to the theme
+    // foreground (unreadable as-is on a dark menu). Coloured app icons = false.
+    monochrome: bool,
+    has-sub: bool,
+    sub: int,
+}
+
+/// One annotation whose item is gone, as the cleanup list shows it.
+///
+/// `key` is the store's own key and is never rebuilt on this side: toggling
+/// sends it back untouched, so the bridge alone decides what an entry is.
+export struct OrphanRow {
+    key: string,
+    parent: string,        // folder that still exists, shown dimmed
+    name: string,          // last segment, the part one recognises
+    note: string,          // "" when the annotation is only a colour
+    slot: int,             // 1..7; 0 = no colour, only a note
+    checked: bool,
+}
+
+// Row in the settings panel "Detected Windows entries".
+export struct ShellExtRow {
+    label: string,
+    enabled: bool,
+}
+
+// A FLATTENED node of the favorites tree. `is-container` distinguishes a
+// container (favorites folder) from a favorite (leaf pointing to `path`). The
+// bridge only emits VISIBLE nodes (collapsed container = descendants hidden).
+export struct FavNode {
+    id: string,
+    label: string,
+    path: string,          // "" for a container
+    is-container: bool,
+    depth: int,            // indentation depth (root = 0)
+    expanded: bool,        // container expanded?
+    has-children: bool,    // container: has at least one child (chevron)
+    available: bool,       // favorite: path exists? (false = greyed out)
+    is-dir: bool,          // favorite: existing target is a directory
+    folder-slot: int,      // directory annotation; containers and files stay unmarked
+    icon: image,           // favorite file: its own icon, empty when none was found
+}
+
+// A list column. `id` = code ("name"/"path"/"size"/"modified"…),
+// `label` = i18n label, `visible` (used by the check/uncheck menu).
+// The width is NOT here: it lives in the col-*-width properties of the
+// PanelComponent (live resize) and is resolved by id via `width-of`.
+export struct ColumnInfo {
+    id: string,
+    label: string,
+    visible: bool,
+    // Cumulative left offset (px) among the VISIBLE columns — provided by the
+    // bridge. Used to compute the drag target WITHOUT reading `absolute-position`
+    // (which, in a layout context, triggers a "Recursion detected" cycle).
+    offset: length,
+}
+
+// Shortcut labels shown in the CONTEXT MENUS. Pushed by
+// the bridge from the EFFECTIVE map (defaults + overrides) → dynamic: if
+// the user rebinds an action, the menu shows the new shortcut. Empty
+// "" = unassigned action (the MenuItem then hides the shortcut).
+export struct MenuShortcuts {
+    open: string,
+    terminal: string,
+    copy: string,
+    cut: string,
+    paste: string,
+    rename: string,
+    delete: string,
+    properties: string,
+    new-folder: string,
+    new-file: string,
+    split-side: string,
+    split-stack: string,
+    equalize: string,
+    tab-reopen-closed: string,
+    open-settings: string,
+    open-workspaces: string,
+}
+
+// Keyboard shortcuts. A "cap" = a displayed key: `kind` 0 = text
+// (`label`), 1/2/3/4 = up/down/left/right arrow (SVG icon).
+export struct ShortcutCap {
+    label: string,
+    kind: int,
+}
+// A configurable action: localized name, keys of its combination, and states.
+export struct ShortcutRow {
+    action-id: string,
+    name: string,
+    caps: [ShortcutCap],
+    assigned: bool,     // false → "unassigned"
+    overridden: bool,   // true → customized (shows the reset button)
+}
+// A group of actions (header + rows).
+export struct ShortcutGroup {
+    name: string,
+    rows: [ShortcutRow],
+}
+
+// Represents a file row. `selected` / `cut` mutate as used.
+export struct FileRow {
+    name: string,
+    // Name split for display: `name-base` (stem) + `name-ext`
+    // (extension WITH the dot, e.g. ".jpg"; empty if none). Allows
+    // coloring the extension in the list without changing anything in the operations
+    // (which use the full `name`).
+    name-base: string,
+    name-ext: string,
+    ext: string,        // extension without the dot ("Extension" column); empty for a folder
+    path: string,
+    size: string,
+    modified: string,
+    created: string,
+    is-dir: bool,
+    drop-runnable: bool,
+    is-symlink: bool,   // symbolic link / junction → marked ("folder + arrow" icon)
+    is-share: bool,     // root of a network share → "folder + network" icon
+    // Colour slot assigned to a folder, 0 = the default gold.
+    folder-slot: int,
+    // Note attached to this entry, empty when none.
+    comment: string,
+    kind: int,
+    selected: bool,
+    cut: bool,
+    hidden: bool,
+    age: string,        // formatted age ("2h 50m", "25d")
+    age-bucket: int,    // 0 recent (hot) … 6 old (cold); -1 = unknown
+    // Image metadata (optional columns) — empty until
+    // computed / if the file is not a readable image.
+    resolution: string, // e.g. "1920x1080"
+    depth: string,      // e.g. "24-bit + alpha"
+    // Preview thumbnail — empty (width 0) until it is generated
+    // or if the type has no preview → falls back to the type icon.
+    thumbnail: image,
+    // OS default application icon for this extension on
+    // Windows. Empty (width 0) if unavailable → falls back to the SVG type icon.
+    app-icon: image,
+    // `.lnk` shortcut pointing to a FOLDER → "folder + arrow" icon
+    // (folder-symlink.svg), like a folder symbolic link.
+    link-folder: bool,
+    // The type can produce a real content thumbnail (image/video/PDF,
+    // SVG included). Stable even before the worker finishes: the height doesn't
+    // jump when the texture arrives.
+    preview-capable: bool,
+    // Vertical geometry precomputed by the bridge. It is the shared
+    // source for rendering, hit-testing, keyboard scrolling, and rubber-band selection.
+    visual-y: length,
+    visual-h: length,
+    // Index in the full logical model. `rendered` only drives the
+    // virtualized window: neither one participates in operations.
+    model-index: int,
+    rendered: bool,
+}
+
+// Where a view sits, as fractions [0,1] of the container (the flattened
+// layout tree); the GUI multiplies by the container size.
+//
+// Held in a model PARALLEL to `panels` rather than inside `PanelView`, for the
+// same reason as the footers: dragging a separator rewrites this on every
+// frame, and rewriting a `PanelView` invalidates every binding that reads it —
+// `rendered-rows` included, which is the row repeater's own model. Kept apart,
+// a resize moves the tiles and touches nothing else.
+export struct PanelBox {
+    fx: float,
+    fy: float,
+    fw: float,
+    fh: float,
+}
+
+// Per-view layout metrics, kept outside the file model during resizing.
+export struct ItemGrid {
+    columns: int,
+    cell-width: length,
+    cell-height: length,
+    gap: length,
+    left: length,
+    top: length,
+}
+
+export struct ItemRect {
+    left: length,
+    top: length,
+    width: length,
+    height: length,
+}
+
+export struct ItemNameTip {
+    text: string,
+    x: length,
+    y: length,
+}
+
+// Geometry only, separate from PanelView so scrolling never invalidates rows.
+export struct FileDropArea {
+    left: length,
+    top: length,
+    width: length,
+    height: length,
+    content-left: length,
+    content-start: length,
+    content-right: length,
+    scroll-top: length,
+    grid: ItemGrid,
+}
+
+// Complete view of a panel for Slint rendering.
+// All per-panel state flows through this struct; the Rust bridge
+// pushes a `[PanelView]` on every structural change.
+export struct PanelView {
+    rows: [FileRow],
+    // Dynamic sub-model of only the rows near the viewport. The rendering
+    // iterates over it without losing the full logical model used by operations.
+    rendered-rows: [FileRow],
+    // Incremented only when row order or geometry changes.
+    rows-revision: int,
+    // Incremented on a folder/tab change: a new context
+    // always starts at the top, regardless of its content's height.
+    viewport-reset-gen: int,
+    tabs: [TabInfo],
+    current-path: string,
+    total-count: int,
+    can-go-back: bool,
+    can-go-forward: bool,
+    sort-column: string,
+    sort-asc: bool,
+    secondary-sort-column: string,
+    secondary-sort-asc: bool,
+    group-dates-by-day: bool,
+    active-tab-idx: int,
+    title: string,                  // e.g.: "Panel 1 · Documents"
+    crumbs: [Crumb],                // clickable breadcrumb trail
+    // Column widths SPECIFIC to this panel (each view is independent).
+    col-name-w: length,
+    col-path-w: length,
+    col-size-w: length,
+    col-modified-w: length,
+    col-created-w: length,
+    col-ext-w: length,          // resizable width of the "ext" column
+    col-resolution-w: length,   // resizable width "resolution"
+    col-depth-w: length,        // resizable width "depth"
+    col-age-w: length,          // resizable width "age"
+    // Columns: `columns` = visible ones in order (header + rows);
+    // `columns-menu` = ALL of them (for the check/uncheck menu).
+    columns: [ColumnInfo],
+    columns-menu: [ColumnInfo],
+    // Arrangement and content previews are independent preferences.
+    preview-mode: bool,
+    grid-mode: bool,
+    grid-zoom: int,
+    // Total width of VISIBLE columns (px) — computed by the bridge
+    // (accurate, unlike a hardcoded sum) → drives horizontal scrolling.
+    content-width: length,
+    // Hidden file display: true = dotfiles/HIDDEN shown.
+    show-hidden: bool,
+    // Grouping by type: code "folders" / "colored" / "files" / "mixed".
+    group-mode: string,
+    // Explicit per-tab order. When active, sorting, grouping and filters are
+    // suspended until the mode is disabled.
+    manual-order: bool,
+    // Keyboard navigation: cursor row to make visible; `scroll-gen`
+    // is a counter bumped on every keyboard move → triggers
+    // scroll-into-view (without redoing it on other refreshes).
+    cursor-row: int,
+    scroll-gen: int,
+    // UNREACHABLE folder (network drive not started, mount missing) → banner
+    // "not found" instead of the list; auto re-check.
+    unavailable: bool,
+    // Extension filter: `ext-filter-on` = bar shown (enabled from
+    // the columns menu); `ext-filter` = free-text entered ("jpg, png").
+    ext-filter-on: bool,
+    ext-filter: string,
+    search-recursive: bool,
+    search-query: string,
+    // Tab bar position for the view: 0 = horizontal at the
+    // top · 1 = vertical on the left · 2 = vertical on the right.
+    tab-bar-mode: int,
+    // USER-set width of the vertical bar (0 = automatic).
+    vbar-user-w: length,
+}
+
+// Splitter (resize handle) flattened from the tree. `idx` identifies
+// the Split node on the Rust side (to adjust its ratio). Geometry in fractions.
+export struct SplitterView {
+    idx: int,
+    vertical: bool,                 // true = vertical bar (side-by-side split)
+    pos: float,                     // seam position on the perpendicular axis
+    cross-start: float,             // start of the bar on the parallel axis
+    cross-len: float,               // length of the bar
+    // Rectangle this separator governs, in the same fractions: exactly what a
+    // double-click on it would even out.
+    area-x: float,
+    area-y: float,
+    area-w: float,
+    area-h: float,
+    // How many views it governs. A pair needs no outline to be understood.
+    governs: int,
+}
+
+// A ready-made command offered in the settings. `index` designates it in the
+// bridge's table, which the displayed list no longer matches once recipes
+// whose tool is missing have been filtered out.
+export struct OwRecipe {
+    label: string,
+    index: int,
+    icon-kind: int,
+}
+
+// One long operation's progress, as shown by its toast. Several can run at
+// once, so each row carries the id that identifies its operation.
+export struct OpProgress {
+    id: int,
+    state: int,                     // 1 running · 2 scanning · 3 success · 4 error · 5 cancelled
+    progress: float,                // 0..1
+    indeterminate: bool,
+    title: string,                  // e.g. "Copying…"
+    detail: string,                 // e.g. "12.3 MB / 80.0 MB"
+    percent: string,                // e.g. "42 %" (empty while indeterminate)
+}
+
+// One line of the properties panel. Both halves arrive ready to show: the
+// bridge formats the figures, translates the label and decides which rows
+// exist at all, so a fact the filesystem does not report is simply absent
+// rather than displayed empty.
+export struct PropRow {
+    label: string,
+    value: string,
+}
+
+// Geometry of the row a cascading submenu hangs from, in window coordinates.
+// The ROW and not the menu that holds it: the two share their vertical edges,
+// and the row is what the pointer has to cross without the flyout slipping out
+// from under it.
+export struct CascadeAnchor {
+    left: length,
+    width: length,
+    top: length,
+}

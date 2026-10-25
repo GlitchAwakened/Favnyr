@@ -1,0 +1,124 @@
+# Gruvbox Hard, adapted to application semantic roles.
+# Both appearances use the upstream hard-contrast content surface. Semantic
+# colors follow the faded light and bright dark palettes.
+#
+# Gruvbox by morhetz, distributed under the MIT/X11 license.
+# Copyright (c) morhetz
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+schema_version = 1
+
+# Hard light content, warm secondary surfaces and a deep orange accent.
+# Age labels use darker shades on their tinted badges. Notification backgrounds
+# and ink on colored fills use the shared resolver.
+[light.opacity]
+hidden = 0.58
+age = 0.10
+
+[light.colors]
+background = "#EBDBB2"
+surface = "#F9F5D7"
+toolbar = "#FBF1C7"
+alternate_background = "#EBDBB2"
+foreground = "#3C3836"
+border = "#BDAE93"
+accent_background = "#AF3A03"
+accent_foreground = "#F9F5D7"
+danger = "#9D0006"
+danger_foreground = "#F9F5D7"
+success = "#79740E"
+warning = "#B57614"
+extension = "#0A6374"
+track = "#D5C4A1"
+disk_normal = "#BDAE93"
+tooltip_background = "#3C3836"
+tooltip_foreground = "#F9F5D7"
+shadow = "#1D2021"
+modal_overlay = "#1D202173"
+file_application = "#79740E"
+file_archive = "#AF3A03"
+file_audio = "#8F3F71"
+file_document = "#076678"
+file_image = "#9D0006"
+file_video = "#427B58"
+file_registry = "#665C54"
+folder_default = "#B57614"
+folder_red = "#9D0006"
+folder_green = "#79740E"
+folder_teal = "#427B58"
+folder_blue = "#076678"
+folder_violet = "#8F3F71"
+folder_pink = "#B16286"
+folder_slate = "#665C54"
+age_hour = "#9D0006"
+age_hours = "#AF3A03"
+age_day = "#85570F"
+age_week = "#62600C"
+age_month = "#356347"
+age_year = "#076678"
+age_older = "#665C54"
+
+# Hard dark content with warm charcoal chrome and an orange accent. Pink
+# extends the upstream purple toward red; small metadata uses lighter shades
+# where necessary to retain contrast on tinted or selected rows.
+[dark.opacity]
+hidden = 0.55
+age = 0.10
+
+[dark.colors]
+background = "#282828"
+surface = "#1D2021"
+toolbar = "#282828"
+alternate_background = "#3C3836"
+foreground = "#EBDBB2"
+border = "#504945"
+accent_background = "#FE8019"
+accent_foreground = "#1D2021"
+danger = "#FB4934"
+danger_foreground = "#1D2021"
+success = "#B8BB26"
+warning = "#FABD2F"
+extension = "#8CAA9A"
+tooltip_background = "#1D2021"
+tooltip_foreground = "#EBDBB2"
+shadow = "#1D2021"
+modal_overlay = "#1D202199"
+file_application = "#B8BB26"
+file_archive = "#FE8019"
+file_audio = "#D3869B"
+file_document = "#83A598"
+file_image = "#FB4934"
+file_video = "#8EC07C"
+file_registry = "#A89984"
+folder_default = "#FABD2F"
+folder_red = "#FB4934"
+folder_green = "#B8BB26"
+folder_teal = "#8EC07C"
+folder_blue = "#83A598"
+folder_violet = "#D3869B"
+folder_pink = "#E9979E"
+folder_slate = "#A89984"
+age_hour = "#FF8572"
+age_hours = "#FE9B49"
+age_day = "#FABD2F"
+age_week = "#B8BB26"
+age_month = "#8EC07C"
+age_year = "#9EBBAD"
+age_older = "#BDAE93"

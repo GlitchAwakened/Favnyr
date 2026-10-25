@@ -1,0 +1,463 @@
+// Translated labels of the interface, filled by Rust from the i18n catalogs.
+
+// Each label is a separate property so reading one never clones the whole catalog.
+// Globals are shared by the components of one window, with independent instances
+// for other windows. Rust updates them together when the language changes.
+export global Strings {
+    in-out property <string> edit-select-all;
+    in-out property <string> edit-clear;
+    in-out property <string> edit-show-password;
+    in-out property <string> edit-hide-password;
+    in-out property <string> app-title;
+    in-out property <string> archive-compress-to;
+    in-out property <string> archive-name;
+    in-out property <string> archive-format;
+    in-out property <string> archive-tar-compression;
+    in-out property <string> archive-none;
+    in-out property <string> archive-level;
+    in-out property <string> archive-level-hint;
+    in-out property <string> archive-password;
+    in-out property <string> archive-confirm-password;
+    in-out property <string> archive-password-title;
+    in-out property <string> archive-password-hint;
+    in-out property <string> archive-password-toggle;
+    in-out property <string> archive-tar-hint;
+    in-out property <string> archive-create;
+    in-out property <string> archive-extract;
+    in-out property <string> archive-managed;
+    in-out property <string> archive-managed-hint;
+
+    in-out property <string> settings-language;
+    in-out property <string> settings-theme;
+    in-out property <string> settings-terminal;
+    in-out property <string> settings-appearance;
+    in-out property <string> theme-folder;
+    in-out property <string> theme-reload;
+    in-out property <string> settings-ui-scale;        // "Interface zoom"
+    in-out property <string> settings-optional-tools-title;
+    in-out property <string> settings-optional-tools-hint;
+    in-out property <string> settings-optional-tools-recheck;
+    in-out property <string> settings-optional-tools-available;
+    in-out property <string> settings-optional-tools-missing;
+    in-out property <string> settings-optional-tools-flatpak;
+    in-out property <string> settings-tool-ffmpeg-hint;
+    in-out property <string> settings-tool-poppler-hint;
+    in-out property <string> settings-tool-seven-zip-hint;
+    in-out property <string> settings-tabbar-default;  // default tab bar position
+    in-out property <string> settings-default-view-mode-label;
+    in-out property <string> settings-default-item-arrangement-label;
+    in-out property <string> settings-default-hidden-label;
+    in-out property <string> settings-default-view-mode-hint;
+    in-out property <string> settings-view-mode-list;
+    in-out property <string> settings-view-mode-previews;
+    in-out property <string> settings-clock-label;     // label for the timezone setting of the Modified column
+    in-out property <string> settings-clock-local;     // "Local time" option of the timezone dropdown
+    in-out property <string> settings-tab-tooltip-label;  // tab path tooltip option
+    in-out property <string> settings-tab-tooltip-hint;
+    in-out property <string> settings-grid-name-tooltip-label;
+    in-out property <string> settings-grid-name-tooltip-hint;
+    in-out property <string> settings-search-path-tooltip-label;
+    in-out property <string> settings-search-path-tooltip-hint;
+    in-out property <string> settings-ws-panel-hint;
+    in-out property <string> settings-ws-shortcut-hint;
+    in-out property <string> settings-compact-preview-label;
+    in-out property <string> settings-thumbnail-zoom-label;
+    in-out property <string> settings-thumbnail-zoom-hint;
+    in-out property <string> settings-compact-preview-hint;
+    // "Colors and notes" cleanup section.
+    in-out property <string> settings-annotations-title;
+    in-out property <string> settings-annotations-hint;
+    in-out property <string> settings-annotations-clean;
+    in-out property <string> annotations-cleanup-title;      // heading of the cleanup list
+    in-out property <string> annotations-cleanup-all;        // "Select all"
+    in-out property <string> annotations-cleanup-none;       // "Deselect all"
+    in-out property <string> annotations-cleanup-empty;      // nothing left to sweep
+    in-out property <string> settings-annotations-cleaned;   // toast: how many entries went
+
+    in-out property <string> col-name;
+    in-out property <string> col-path;
+    in-out property <string> col-size;
+    in-out property <string> col-modified;
+    in-out property <string> col-created;
+    in-out property <string> sort-primary;
+    in-out property <string> sort-secondary;
+    in-out property <string> sort-by-day;
+    in-out property <string> sort-ascending;
+    in-out property <string> sort-descending;
+    in-out property <string> col-age;
+    in-out property <string> col-ext;            // "Extension" column
+    in-out property <string> ext-filter-label;   // columns menu: "Filter by extension"
+    in-out property <string> search-subfolders;
+    in-out property <string> search-reveal;
+    in-out property <string> search-reveal-new-tab;
+    in-out property <string> ext-filter-placeholder;   // greyed hint of the extension filter bar
+    in-out property <string> col-resolution;
+    in-out property <string> col-depth;
+    // Favorites
+    in-out property <string> fav-title;
+    in-out property <string> fav-new-container;
+    in-out property <string> fav-collapse-all;
+    in-out property <string> fav-expand-all;
+    in-out property <string> fav-empty;
+    in-out property <string> fav-container-empty;
+    in-out property <string> fav-open;
+    in-out property <string> fav-execute;
+    in-out property <string> fav-open-all;
+    in-out property <string> fav-new-subcontainer;
+    in-out property <string> fav-rename;
+    in-out property <string> fav-delete;
+    in-out property <string> fav-delete-confirm;
+    in-out property <string> fav-copy-path;
+    in-out property <string> fav-save-tab;
+    in-out property <string> fav-save-all-tabs;
+    in-out property <string> fav-add;
+    in-out property <string> fav-popup-title;
+    in-out property <string> fav-popup-alias;
+    in-out property <string> fav-popup-container;
+    in-out property <string> fav-popup-parent;
+    in-out property <string> fav-popup-new;
+    in-out property <string> fav-popup-root;
+    in-out property <string> fav-save;
+    in-out property <string> fav-toast-added;
+    in-out property <string> fav-toast-missing;
+    in-out property <string> fav-toast-exists;          // warning: duplicate favorite
+
+    in-out property <string> footer-items-singular;
+    in-out property <string> footer-items-plural;
+    in-out property <string> footer-empty;
+    in-out property <string> footer-selected-singular;
+    in-out property <string> footer-selected-plural;
+
+    in-out property <string> nav-prev;
+    in-out property <string> nav-next;
+    in-out property <string> nav-parent;
+    in-out property <string> nav-refresh;
+    in-out property <string> view-mode-tooltip;
+    in-out property <string> view-layout-list;
+    in-out property <string> view-layout-grid;
+    in-out property <string> view-sort-tooltip;
+    in-out property <string> show-hidden-tooltip;
+    in-out property <string> manual-order-label;
+    in-out property <string> manual-order-hint;
+    in-out property <string> manual-order-drag;
+    in-out property <string> group-section;
+    in-out property <string> group-folders-first;
+    in-out property <string> group-colored-folders-first;
+    in-out property <string> group-files-first;
+    in-out property <string> group-mixed;
+
+    in-out property <string> tab-new-tooltip;
+    in-out property <string> tab-scroll-left;   // left-scroll chevron tooltip
+    in-out property <string> tab-scroll-right;
+    in-out property <string> tabbar-menu-tooltip;   // "tab bar position" button
+    in-out property <string> tabbar-top;            // … horizontal bar at top option
+    in-out property <string> tabbar-left;           // … vertical bar on the left option
+    in-out property <string> tabbar-right;          // … vertical bar on the right option
+    in-out property <string> tab-unavailable;       // folder-not-found banner
+    in-out property <string> tab-unavailable-hint;
+    in-out property <string> tab-duplicate;         // tab context menu: duplicate
+    in-out property <string> tab-reopen-closed;     // dead-zone menu: last closed tab
+    in-out property <string> tab-close-tooltip;
+
+    in-out property <string> panel-prefix;
+    in-out property <string> panel-new-tooltip;
+    in-out property <string> panel-close-tooltip;
+    in-out property <string> panel-move-tooltip;     // grip: drag this view onto another
+    in-out property <string> panel-split-view;
+    in-out property <string> split-side-by-side;
+    in-out property <string> split-stacked;
+    in-out property <string> equalize-all;           // menu row: even out every view
+    in-out property <string> equalize-restore;       // same row while a way back is held
+
+    in-out property <string> ctx-open;
+    in-out property <string> ctx-open-new-tab;
+    in-out property <string> ctx-open-new-pane;
+    in-out property <string> ctx-open-admin;           // "Open as administrator" (file, Windows)
+    in-out property <string> ctx-open-with;
+    in-out property <string> ctx-open-parent;
+    in-out property <string> ctx-open-terminal;
+    in-out property <string> ctx-new;                  // unified parent entry "New" (flyout)
+    in-out property <string> ctx-new-folder;
+    in-out property <string> ctx-new-file;
+    in-out property <string> ctx-new-shortcut;         // "New shortcut" (.lnk, Windows)
+    in-out property <string> create-shortcut-target;   // label of the "Target" field (shortcut popup)
+    in-out property <string> create-browse;            // "Browse…" button for the target
+    in-out property <string> ctx-create-link;          // entry + shortcut tab "Create a shortcut"
+    in-out property <string> ctx-mark;                 // parent entry of the "Colour & note" flyout
+    in-out property <string> ctx-comment;              // flyout entry opening the note editor
+    in-out property <string> comment-title;
+    in-out property <string> comment-placeholder;
+    in-out property <string> comment-clear;            // link clearing the field in the editor
+    in-out property <string> create-symlink-tab;       // "Create a symlink" tab
+    in-out property <string> create-confirm;
+    in-out property <string> create-placeholder;
+    in-out property <string> ctx-copy;
+    in-out property <string> ctx-cut;
+    in-out property <string> ctx-paste;
+    in-out property <string> ctx-duplicate;
+    in-out property <string> ctx-copy-path;
+    in-out property <string> ctx-copy-name;
+    in-out property <string> ctx-rename;
+    in-out property <string> ctx-delete;
+    in-out property <string> ctx-properties;
+
+    // "Folder" / "File" labels. Historically from the internal
+    // Properties panel (removed: properties now go through the OS's NATIVE
+    // dialog); they are still used by the tabs of the "New
+    // shortcut" popup — hence the `prop-` prefix kept so as not to break the
+    // existing translation catalogs.
+    in-out property <string> prop-kind-folder;
+    in-out property <string> prop-kind-file;
+
+    // Settings menu.
+    in-out property <string> settings-tooltip;
+    in-out property <string> settings-title;
+    in-out property <string> settings-tab-general;       // "General" tab label
+    in-out property <string> settings-tab-storage;       // "Storage" tab label
+    in-out property <string> prop-title;                 // properties panel title
+    in-out property <string> prop-tab-general;           // its first tab
+    in-out property <string> prop-tab-permissions;       // its second tab
+    in-out property <string> prop-tab-checksums;         // its third tab
+    in-out property <string> prop-perm-owner;            // permissions: owner row
+    in-out property <string> prop-perm-group;            // permissions: group row
+    in-out property <string> prop-perm-others;           // permissions: others row
+    in-out property <string> prop-perm-execute;          // the execute checkbox
+    in-out property <string> prop-perm-ownership;        // ownership section
+    in-out property <string> prop-perm-mode;             // octal mode row
+    in-out property <string> prop-hash-compute;          // start the computation
+    in-out property <string> prop-hash-cancel-label;     // stop it
+    in-out property <string> prop-hash-hint;             // why it is not automatic
+    in-out property <string> prop-hash-folder;           // a folder has no digest
+    in-out property <string> prop-expected-label;        // the compare field
+    in-out property <string> prop-expected-no-match;     // verdict when none matched
+    in-out property <string> settings-tab-defaults-title;   // card: defaults for new tabs
+    in-out property <string> settings-tab-defaults-hint;    // its single shared caveat
+    in-out property <string> settings-new-workspace-title;  // card: new-workspace defaults
+    in-out property <string> settings-new-workspace-hint;
+    in-out property <string> settings-group-dates;          // card: dates and sizes
+    in-out property <string> settings-group-tooltips;
+    in-out property <string> settings-group-workspaces;
+    in-out property <string> settings-folder-depth-hint;    // shared under both depth spin boxes
+    in-out property <string> settings-columns-section;   // "Default columns"
+    // MORE EXPLICIT labels in the checkbox for the columns reserved for
+    // images (the column header itself stays short).
+    in-out property <string> settings-col-resolution;
+    in-out property <string> settings-col-depth;
+    in-out property <string> settings-rmtime-label;
+    in-out property <string> settings-rmtime-hint;
+    in-out property <string> settings-fsize-label;      // "Folder size"
+    in-out property <string> settings-fsize-hint;
+    in-out property <string> settings-view-text-size-title;
+    in-out property <string> settings-view-text-size-hint;
+    in-out property <string> settings-view-text-size-toggle;
+    in-out property <string> settings-view-item-spacing-title;
+    in-out property <string> settings-view-item-spacing-hint;
+    in-out property <string> settings-paths-section;
+    in-out property <string> settings-config-path;
+    in-out property <string> settings-data-path;
+    in-out property <string> settings-cache-path;
+    in-out property <string> settings-open;
+
+    // Keyboard shortcuts
+    in-out property <string> settings-shortcuts-section;
+    in-out property <string> settings-letter-layout;       // the list's label
+    in-out property <string> settings-letter-layout-tip;   // its hover text
+    in-out property <string> settings-letter-layout-off;   // its first entry
+    in-out property <string> settings-keyboard-russian-standard;
+    in-out property <string> settings-keyboard-ukrainian-standard;
+    in-out property <string> shortcut-search-placeholder;
+    in-out property <string> shortcut-reset-all;
+    in-out property <string> shortcut-reset-all-confirm;
+    in-out property <string> shortcut-reset-tooltip;
+    in-out property <string> shortcut-listening;
+    in-out property <string> shortcut-capture-cancel;
+    in-out property <string> shortcut-unassigned;
+    in-out property <string> shortcut-unassign;       // context menu: remove the shortcut
+    in-out property <string> shortcut-no-results;
+    in-out property <string> shortcut-conflict-reassign;
+    in-out property <string> shortcut-conflict-keep;
+
+    // Rename popup.
+    in-out property <string> rename-title;
+    in-out property <string> rename-current-prefix;    // e.g.: "Current name: "
+    in-out property <string> rename-new-placeholder;
+    in-out property <string> rename-confirm;           // label of the "Rename" button
+    in-out property <string> rename-force-replace;     // explicit replacement of a file with the same name
+    in-out property <string> rename-select-name;       // selects the name without its extension
+    in-out property <string> btn-cancel;
+
+    // Name conflict on paste
+    in-out property <string> paste-conflict-title;
+    in-out property <string> paste-conflict-hint;
+    in-out property <string> paste-conflict-taken;
+    in-out property <string> paste-conflict-skip;
+    in-out property <string> paste-conflict-confirm;
+    in-out property <string> paste-conflict-replace;       // "Replace"
+    in-out property <string> paste-conflict-replace-all;   // "Replace all"
+    in-out property <string> paste-conflict-skip-all;      // "Skip all"
+
+    // File-drag feedback.
+    in-out property <string> drag-open-with;               // "Open with this program"
+
+    // Progress bar for long operations.
+    in-out property <string> op-copying;
+    in-out property <string> op-moving;
+    in-out property <string> op-deleting;
+    in-out property <string> op-deleting-permanently;
+    in-out property <string> op-duplicating;
+    in-out property <string> op-scanning;
+    in-out property <string> op-done;
+    in-out property <string> op-cancelled;
+    in-out property <string> op-errors;           // e.g.: "Finished with errors"
+    in-out property <string> op-items;            // e.g.: "items" (trash counter)
+
+    // Named workspaces
+    in-out property <string> ws-tooltip;               // top bar button tooltip
+    in-out property <string> ws-title;                 // overlay title
+    in-out property <string> ws-save-section;          // "Save current workspace"
+    in-out property <string> ws-name-placeholder;      // name field placeholder
+    in-out property <string> ws-name-taken;            // name already used (live validation)
+    in-out property <string> ws-save-btn;              // "Save"
+    in-out property <string> ws-saved-section;         // "My workspaces" (no counter, appended in Slint)
+    in-out property <string> ws-empty;                 // "No saved workspace"
+    in-out property <string> ws-empty-hint;            // empty-state subtext
+    in-out property <string> ws-load;                  // "Load"
+    in-out property <string> ws-update;                // "Update" (⟳ tooltip)
+    in-out property <string> ws-rename;                // pencil tooltip
+    in-out property <string> ws-delete;                // trash tooltip + red confirm button
+    in-out property <string> ws-delete-confirm;        // "Delete this workspace?"
+    in-out property <string> ws-overwrite-confirm;     // "Overwrite this workspace?"
+    in-out property <string> ws-panels-short;          // "pnl." (metadata)
+    in-out property <string> ws-tabs-short;            // "tabs." (metadata)
+    in-out property <string> ws-toast-saved;
+    in-out property <string> ws-toast-updated;
+    in-out property <string> ws-toast-renamed;
+    in-out property <string> ws-toast-deleted;
+    in-out property <string> ws-notice-saved;            // global toast with {name} (Ctrl+S)
+    in-out property <string> ws-notice-save-failed;       // global error with {name}
+    // "Unsaved changes" safeguard when loading.
+    in-out property <string> ws-dirty-title;           // dialog title (with {name})
+    in-out property <string> ws-dirty-body;            // body (with {name})
+    in-out property <string> ws-dirty-body-new;
+    in-out property <string> ws-dirty-discard;         // "Load without saving" (red ghost)
+    in-out property <string> ws-dirty-save-load;       // "Save and load" (primary)
+    in-out property <string> ws-dirty-discard-new;
+    in-out property <string> ws-dirty-save-new;
+    in-out property <string> ws-shortcut-ask;
+    in-out property <string> ws-shortcut-discard;
+    in-out property <string> ws-shortcut-save;
+    in-out property <string> ws-shortcut-remember;
+    in-out property <string> ws-panel-remember;
+    in-out property <string> ws-dirty-tooltip;         // amber dot tooltip: "Unsaved changes"
+    in-out property <string> ws-slot-assign;           // empty badge: offer to assign a shortcut
+    in-out property <string> ws-slot-none;             // picker: the entry that clears the slot
+    in-out property <string> ws-theme-assign;          // empty swatch: offer to impose a theme
+    in-out property <string> ws-theme-none;            // picker: the entry that follows the global theme
+    in-out property <string> ws-toast-slot-moved;      // panel toast: the slot changed hands
+    in-out property <string> ws-dirty-save-action;     // amber ⟳ hover tooltip: "Save changes"
+    // "Places" sidebar
+    in-out property <string> sidebar-tooltip;          // toggle button tooltip
+    in-out property <string> sidebar-shortcuts;        // shortcuts section header
+    in-out property <string> sidebar-drives;           // drives section header
+    in-out property <string> sidebar-network;          // network section header
+    in-out property <string> net-ejected;              // toast: device removed
+    in-out property <string> net-disconnected;         // toast: network drive disconnected
+    in-out property <string> net-eject-failed;         // toast: removal failed (prefix)
+    in-out property <string> net-eject;                // drive menu, unpluggable device
+    in-out property <string> net-release;              // drive menu, device wired in place
+    in-out property <string> net-released;             // toast: released, nothing to unplug
+    in-out property <string> net-disconnect;           // drive menu: "Disconnect"
+    in-out property <string> sidebar-home;             // "Home folder" label
+    in-out property <string> sidebar-trash;            // "Trash" label
+    in-out property <string> sidebar-root;             // root drive "/" label when unnamed
+    in-out property <string> sidebar-empty-trash;      // context menu: "Empty trash"
+    in-out property <string> sidebar-empty-trash-confirm; // 2nd click: confirmation
+    in-out property <string> exit-title;
+    in-out property <string> exit-body;
+    in-out property <string> exit-stay;
+    in-out property <string> exit-cancel;
+    in-out property <string> exit-confirm;
+    in-out property <string> exit-stopping;
+    in-out property <string> net-delete-title;         // network "permanent deletion" popup
+    in-out property <string> net-delete-body;          // … body: no trash, irreversible
+    in-out property <string> permanent-delete-body;    // … generic body for Shift+Delete
+    in-out property <string> trash-delete-body;        // … body for items already in the trash
+    in-out property <string> net-delete-confirm;       // … action button: "Delete permanently"
+    in-out property <string> open-many-title;          // guard before opening a whole selection
+    in-out property <string> open-many-confirm;        // … action button: "Open all"
+    // Cross-view drag'n'drop: drop menu
+    in-out property <string> drop-move;                // "Move here"
+    in-out property <string> drop-copy;                // "Copy here"
+    in-out property <string> drop-split;               // "Split here"
+    in-out property <string> drop-link;                // "Link here"
+    in-out property <string> drop-favorite;            // "Add to favorites" (drag over the favorites)
+    in-out property <string> drop-swap;                // "Swap" (a view carried onto another)
+    in-out property <string> drop-detach;              // "Detach" (a view carried out of the window)
+
+    in-out property <string> ws-reset;                 // "Start a new workspace" button
+    in-out property <string> ws-new-name;              // "new workspace" target name in the dialog
+    in-out property <string> ws-toast-reset;           // toast after reset
+    in-out property <string> ws-sort-newest;           // "newest first" sort label
+    in-out property <string> ws-sort-oldest;           // "oldest first" sort label
+    in-out property <string> ws-sort-tooltip;          // sort-direction toggle button tooltip
+    // Open with
+    in-out property <string> ow-choose;
+    in-out property <string> ow-pick-browse;
+    in-out property <string> ow-custom;
+    in-out property <string> ow-use-as-app;
+    in-out property <string> ow-manage;
+    in-out property <string> ow-title;
+    in-out property <string> ow-name;
+    in-out property <string> ow-program;
+    in-out property <string> ow-store-program;       // label of the frozen Program field (OS/Store app)
+    in-out property <string> ow-args;
+    in-out property <string> ow-tags;
+    // Tooltips explaining what each insertable tag stands for.
+    in-out property <string> ow-tag-file;
+    in-out property <string> ow-tag-dir;
+    in-out property <string> ow-tag-dirname;
+    in-out property <string> ow-tag-setname;
+    in-out property <string> ow-tag-name;
+    in-out property <string> ow-tag-stem;
+    in-out property <string> ow-tag-ext;
+    in-out property <string> ow-tag-uri;
+    in-out property <string> ow-tag-files;
+    in-out property <string> ow-preview;
+    in-out property <string> ow-add-suggested;
+    in-out property <string> ow-recipes-label;   // section title, also its accessible label
+    in-out property <string> ow-recipes-hint;    // what the recipes are and why some are absent
+    in-out property <string> ow-launch;
+    in-out property <string> ow-default-ext;
+    in-out property <string> ow-set-default;     // "Set as default" checkbox of the app picker
+    in-out property <string> ow-display-other-apps; // Linux picker: include launchers without MimeType
+    in-out property <string> ow-used-ext;        // "Suggested in Open with for these extensions"
+    in-out property <string> ow-default-ext-placeholder;
+    in-out property <string> ow-used-ext-placeholder;
+    in-out property <string> ow-run-as-admin;    // "Run as administrator" checkbox (Windows)
+    in-out property <string> ow-default-ext-hint; // tooltip for the "default app" label
+    in-out property <string> ow-show-in-section;  // title of the "Where to show this command" panel
+    in-out property <string> ow-ctx-menu;        // "Show in the context menu:" label
+    in-out property <string> ow-ctx-files;       // "Files" checkbox
+    in-out property <string> ow-ctx-dirs;        // "Folders" checkbox
+    in-out property <string> ow-ctx-background;  // "View background" checkbox
+    in-out property <string> ow-ctx-ext;         // extension filter of the Files entry
+    in-out property <string> ow-ctx-ext-hint;    // what "*" means, and that it only affects Files
+    in-out property <string> ow-used-ext-hint;   // what the "suggested for" list does
+    in-out property <string> settings-shellmenu-label; // settings card: Windows context menu
+    in-out property <string> settings-shellmenu-hint;
+    in-out property <string> settings-shellext-list-label; // sub-tab: detected Windows entries
+    in-out property <string> settings-shellext-list-hint;
+    in-out property <string> settings-shellext-empty;      // no entry detected
+    in-out property <string> ow-move-up;         // tooltips for the Open-with list buttons
+    in-out property <string> ow-move-down;
+    in-out property <string> ow-duplicate-tip;
+    in-out property <string> ow-edit-tip;
+    in-out property <string> ow-delete-tip;
+    in-out property <string> settings-openers-section;
+    in-out property <string> ow-add;
+    in-out property <string> ow-empty;
+    in-out property <string> ow-search-placeholder;
+    in-out property <string> ow-no-results;
+    in-out property <string> ow-promote;
+    in-out property <string> ow-promote-add;
+}

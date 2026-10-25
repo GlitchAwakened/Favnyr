@@ -1,0 +1,144 @@
+// Resolved colors are set once per theme change, never carried by item models.
+import { ItemRect } from "types.slint";
+
+export global Theme {
+    in-out property <bool> custom-palette: false;
+    in-out property <float> hidden-opacity;
+    in-out property <float> age-opacity;
+    in-out property <color> background;
+    in-out property <color> surface;
+    in-out property <color> toolbar;
+    in-out property <color> alternate-background;
+    in-out property <color> foreground;
+    in-out property <color> border;
+    in-out property <color> accent-background;
+    in-out property <color> accent-foreground;
+    in-out property <color> danger;
+    in-out property <color> danger-foreground;
+    in-out property <color> success;
+    in-out property <color> warning;
+    in-out property <color> extension;
+    in-out property <color> track;
+    in-out property <color> disk-normal;
+    in-out property <color> disk-warning;
+    in-out property <color> disk-critical;
+    in-out property <color> disk-normal-foreground;
+    in-out property <color> disk-warning-foreground;
+    in-out property <color> disk-critical-foreground;
+    in-out property <color> toast-success;
+    in-out property <color> toast-info;
+    in-out property <color> toast-danger;
+    in-out property <color> tooltip-background;
+    in-out property <color> tooltip-foreground;
+    in-out property <color> shadow;
+    in-out property <color> modal-overlay;
+    in-out property <color> file-application;
+    in-out property <color> file-archive;
+    in-out property <color> file-audio;
+    in-out property <color> file-document;
+    in-out property <color> file-image;
+    in-out property <color> file-video;
+    in-out property <color> file-registry;
+    in-out property <color> folder-default;
+    in-out property <color> folder-red;
+    in-out property <color> folder-green;
+    in-out property <color> folder-teal;
+    in-out property <color> folder-blue;
+    in-out property <color> folder-violet;
+    in-out property <color> folder-pink;
+    in-out property <color> folder-slate;
+    in-out property <color> age-hour;
+    in-out property <color> age-hours;
+    in-out property <color> age-day;
+    in-out property <color> age-week;
+    in-out property <color> age-month;
+    in-out property <color> age-year;
+    in-out property <color> age-older;
+    in-out property <color> folder-red-foreground;
+    in-out property <color> folder-green-foreground;
+    in-out property <color> folder-teal-foreground;
+    in-out property <color> folder-blue-foreground;
+    in-out property <color> folder-violet-foreground;
+    in-out property <color> folder-pink-foreground;
+    in-out property <color> folder-slate-foreground;
+}
+
+// Geometry stays independent of user palettes.
+export global Tokens {
+    out property <color> danger: Theme.danger;
+    out property <color> success: Theme.success;
+    out property <color> warning: Theme.warning;
+    out property <color> ext: Theme.extension;
+    out property <color> track: Theme.track;
+    out property <color> hairline: Theme.border.with-alpha(0.6);
+    out property <color> trough: Theme.background;
+    out property <length> radius-overlay: 8px;
+    out property <length> gutter: 30px;
+    out property <length> gutter-content: root.gutter + 6px;
+    out property <length> col-gap: 8px;
+    out property <length> radius-panel: 9px;
+    out property <length> radius-row: 6px;
+    out property <length> panel-gap: 4px;
+    out property <length> panel-pad: 7px;
+
+    public pure function disk-fill(level: int) -> color {
+        level >= 2 ? Theme.disk-critical : level == 1 ? Theme.disk-warning : Theme.disk-normal
+    }
+    public pure function disk-ink(level: int) -> color {
+        level >= 2 ? Theme.disk-critical-foreground
+            : level == 1 ? Theme.disk-warning-foreground : Theme.disk-normal-foreground
+    }
+    public pure function age-color(bucket: int) -> color {
+        bucket <= 0 ? Theme.age-hour
+            : bucket == 1 ? Theme.age-hours
+            : bucket == 2 ? Theme.age-day
+            : bucket == 3 ? Theme.age-week
+            : bucket == 4 ? Theme.age-month
+            : bucket == 5 ? Theme.age-year
+            : Theme.age-older
+    }
+    public pure function folder-color(slot: int) -> color {
+        slot == 1 ? Theme.folder-red
+            : slot == 2 ? Theme.folder-green
+            : slot == 3 ? Theme.folder-teal
+            : slot == 4 ? Theme.folder-blue
+            : slot == 5 ? Theme.folder-violet
+            : slot == 6 ? Theme.folder-pink
+            : slot == 7 ? Theme.folder-slate
+            : Theme.folder-default
+    }
+    public pure function folder-ink(slot: int) -> color {
+        slot == 1 ? Theme.folder-red-foreground
+            : slot == 2 ? Theme.folder-green-foreground
+            : slot == 3 ? Theme.folder-teal-foreground
+            : slot == 4 ? Theme.folder-blue-foreground
+            : slot == 5 ? Theme.folder-violet-foreground
+            : slot == 6 ? Theme.folder-pink-foreground
+            : slot == 7 ? Theme.folder-slate-foreground
+            : Theme.foreground
+    }
+
+    public pure function grid-caption-rect(width: length, height: length) -> ItemRect {
+        return { left: 6px, top: width + 2px,
+            width: max(1px, width - 12px), height: max(1px, height - width - 8px) };
+    }
+
+    public pure function row-enlarged(preview: bool, row-h: length) -> bool {
+        preview && row-h > 34px
+    }
+    public pure function row-icon-size(preview: bool, row-h: length) -> length {
+        Tokens.row-enlarged(preview, row-h)
+            ? row-h - 4px
+            : clamp(row-h - 12px, 16px, 26px)
+    }
+    // Slot reserving room for the icon in the name column. Wider than tall in
+    // thumbnail mode so landscape pictures fill the height; bounded by the
+    // name column so it never spills into the next one.
+    public pure function row-icon-slot(preview: bool, row-h: length,
+            col-name-w: length) -> length {
+        Tokens.row-enlarged(preview, row-h)
+            ? max(40px, min(row-h * 1.5, col-name-w - 40px))
+            : Tokens.row-icon-size(preview, row-h) + 4px
+    }
+
+}

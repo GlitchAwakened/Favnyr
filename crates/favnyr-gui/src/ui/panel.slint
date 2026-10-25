@@ -1,0 +1,3422 @@
+// A complete view panel and the splitter that separates two panels.
+
+import { FileDropArea, ItemGrid, ItemNameTip, ItemRect, PanelView } from "types.slint";
+import { Strings } from "strings.slint";
+import { Dismiss, Note, TextMetrics, Tip, WindowFocus } from "globals.slint";
+import { Theme, Tokens } from "theme.slint";
+import { DragEdgeScroller, EditTextInput, NavIconButton } from "controls.slint";
+import { ColumnHeader, FileItemView, FilterBar } from "file_list.slint";
+import { TabItem, TabScrollButton, VTabBar } from "tabs.slint";
+
+// Vertical splitter component between two side-by-side panels. Horizontal drag
+// → emits the cumulative delta since the start of the drag. The bridge converts it
+// into a stretch adjustment for the adjacent panels.
+// Separator positioned absolutely on the seam between two zones.
+// Vertical (side by side) or horizontal (stacked). Emits the pointer's
+// **absolute** position; the conversion to a ratio is done on the Rust side (drift-free,
+// since it's an absolute, not incremental, computation).
+export component PanelSplitterAbs inherits Rectangle {
+    in property <bool> vertical;
+    callback dragged(/* abs_x */ length, /* abs_y */ length);
+    /// Double-click: even out the views this separator governs.
+    callback equalize();
+    // Lit while hovered or held: the grip pill shows itself.
+    out property <bool> lit: drag-touch.has-hover || drag-touch.pressed;
+    // Hovered but at rest. What the region outline keys on, so that dragging
+    // adds nothing to paint: mid-resize the user already knows what is moving.
+    out property <bool> outlined: drag-touch.has-hover && !drag-touch.pressed;
+
+    // Invisible at rest: the groove and borders separate the views. A thin
+    // accent pill appears on hover and during the drag to signal the grip.
+    background: transparent;
+
+    // A press that moved the seam is a resize, not half of a double-click.
+    // Cleared on every press, so only the press being judged counts: two quick
+    // corrections in a row are then never read as a request to even out.
+    property <length> press-x;
+    property <length> press-y;
+    property <bool> resized;
+    // Inset along the seam so the pill does NOT overlap the panels' rounded
+    // part: gap (up to the tile edge) + corner radius
+    // (up to the start of the straight edge). It thus only covers the flat segment.
+    property <length> seam-inset: Tokens.panel-gap + Tokens.radius-panel;
+
+    Rectangle {
+        x: root.vertical ? (parent.width - self.width) / 2 : root.seam-inset;
+        y: root.vertical ? root.seam-inset : (parent.height - self.height) / 2;
+        width: root.vertical ? 3px : parent.width - 2 * root.seam-inset;
+        height: root.vertical ? parent.height - 2 * root.seam-inset : 3px;
+        border-radius: 1.5px;
+        background: root.lit ? Theme.accent-background : transparent;
+        opacity: root.lit ? 1.0 : 0.0;
+        animate opacity { duration: 110ms; easing: ease-out; }
+    }
+
+    drag-touch := TouchArea {
+        mouse-cursor: root.vertical ? ew-resize : ns-resize;
+        pointer-event(ev) => {
+            // Grabbing a splitter closes the context menu.
+            if (ev.kind == PointerEventKind.down) {
+                Dismiss.serial += 1;
+                root.press-x = self.absolute-position.x + self.mouse-x;
+                root.press-y = self.absolute-position.y + self.mouse-y;
+                root.resized = false;
+            }
+        }
+        moved => {
+            if (self.pressed) {
+                if (abs(self.absolute-position.x + self.mouse-x - root.press-x) > 2px
+                    || abs(self.absolute-position.y + self.mouse-y - root.press-y) > 2px) {
+                    root.resized = true;
+                }
+                root.dragged(self.absolute-position.x + self.mouse-x,
+                             self.absolute-position.y + self.mouse-y);
+            }
+        }
+        double-clicked => {
+            if (!root.resized) { root.equalize(); }
+        }
+    }
+}
+
+// ---------- PanelComponent: a complete panel (tabs + nav + rows + footer) ----------
+
+export component PanelComponent inherits Rectangle {
+    // IMPORTANT: `preferred-width: 0` is necessary for the splitter
+    // to move pixel-perfectly with the mouse. Without it, Slint reserves the
+    // "natural" preferred-width (tab strip + breadcrumb + etc.) for each
+    // panel BEFORE distributing the rest via stretch, and dragging the
+    // splitter only changes the "rest", which makes the movement
+    // ~50% slower than the mouse.
+    preferred-width: 0px;
+    min-width: 0px;
+    max-width: 99999px;
+
+    in property <PanelView> view;
+    // Footer text ("N selected / M items") DECOUPLED from
+    // `view`: the selection count changes on every rubber-band step;
+    // if it lived in `PanelView`, updating it would rewrite the whole struct
+    // (via `set_row_data` on the panels model) and invalidate the Repeater's
+    // `rendered-rows` model property → selection changes would no longer be
+    // rendered in place until a re-list happens (hence the "skipped"
+    // entries until a scroll). Driven separately via
+    // `panel-footers[idx]`, it never invalidates the list anymore.
+    in property <string> footer-text;
+    in property <bool> active;
+    in property <bool> can-close: false;
+    in property <bool> view-text-font-size-override: false;
+    in property <int> view-text-font-size: 13;
+    in property <int> view-item-spacing: 0;
+    in property <bool> grid-name-tooltip-enabled: true;
+    in property <bool> search-path-tooltip-enabled: true;
+    // Column widths SPECIFIC to this panel: initialized from the model
+    // (`view`), mutated locally by the header grips. On resize end,
+    // `column-resized(id, width)` reports it to the bridge (which stores it per panel
+    // to survive model rebuilds). GENERIC callback per column
+    // → no tuple that needs to grow with every new column.
+    in-out property <length> col-name-width: root.view.col-name-w;
+    in-out property <length> col-path-width: root.view.col-path-w;
+    in-out property <length> col-size-width: root.view.col-size-w;
+    in-out property <length> col-modified-width: root.view.col-modified-w;
+    in-out property <length> col-created-width: root.view.col-created-w;
+    in-out property <length> col-ext-width: root.view.col-ext-w;
+    in-out property <length> col-resolution-width: root.view.col-resolution-w;
+    in-out property <length> col-depth-width: root.view.col-depth-w;
+    in-out property <length> col-age-width: root.view.col-age-w;
+    callback column-resized(string /*id*/, length /*width*/);
+    // check/uncheck a column (id, visible) + right-click header.
+    callback column-toggle(string, bool);
+    callback open-columns-menu(length, length);   // absolute position
+    // Reordering: column identifier and signed delta in pixels.
+    callback column-moved(string, int);
+    // type-ahead filter — current text (shown if view is active) + reset.
+    in property <string> filter-text: "";
+    in property <bool> filter-take-keyboard: false;
+    /// A filter field has taken the keyboard.
+    callback filter-focused();
+    /// The whole filter, as the bar now holds it.
+    callback filter-set(string);
+    /// A key the bar gave back, for the application to resolve.
+    callback filter-key(KeyEvent) -> bool;
+    callback search-scope-toggle();
+    // Shared by progressive search and asynchronous folder-date sorting.
+    out property <bool> rows-pointer-busy:
+        sel-touch.pressed || gutter-strip.pressed || root.rb-active || root.mid-scroll-active;
+    // Exact vertical viewport (content coordinate + visible height). The
+    // bridge adjusts the small rendered window and thumbnail priority.
+    callback rows-viewport-changed(length /*top*/, length /*height*/, ItemGrid) -> length;
+    callback item-at-content-point(length, length, ItemGrid) -> int;
+    pure callback grid-layout(length, int, length, length, length) -> ItemGrid;
+    pure callback grid-item-rect(ItemGrid, int) -> ItemRect;
+    pure callback grid-insertion-gap(ItemGrid, int, length, length, bool) -> int;
+    property <ItemGrid> item-grid: root.view.grid-mode
+        ? root.grid-layout(rows-scroll.width, root.view.grid-zoom,
+            (root.view-text-font-size-override ? root.view-text-font-size : 13) * 1px,
+            root.view-item-spacing * 1px, Tokens.gutter)
+        : { columns: 0, cell-width: 0px, cell-height: 0px, gap: 0px, left: 0px, top: 0px };
+    function item-rect(index: int) -> ItemRect {
+        if (root.view.grid-mode) {
+            return root.grid-item-rect(root.item-grid, index);
+        }
+        return { left: 0px, top: root.view.rows[index].visual-y,
+            width: rows-scroll.width, height: root.view.rows[index].visual-h };
+    }
+    // extension filter — bar's close button (disables the mode). TYPING
+    // goes through filter-type/backspace (shared with type-ahead), not here.
+    callback ext-filter-toggle();
+    // current tab bar scroll (content-x, plain) —
+    // reported to the bridge via `panel-tabs-scrolled(idx, vx)`.
+    callback tabs-scrolled(length);
+    property <bool> col-drag-active: false;
+    property <length> col-drag-center: 0px;   // center of the dragged column (plain)
+    property <length> col-drag-delta: 0px;
+    property <int> col-drop-idx: -1;
+    property <string> col-drag-id: "";
+
+    // Width of a column by its id. All resizable.
+    function width-of(id: string) -> length {
+        id == "path" ? root.col-path-width
+            : id == "size" ? root.col-size-width
+            : id == "modified" ? root.col-modified-width
+            : id == "created" ? root.col-created-width
+            : id == "ext" ? root.col-ext-width
+            : id == "resolution" ? root.col-resolution-width
+            : id == "depth" ? root.col-depth-width
+            : id == "age" ? root.col-age-width
+            : root.col-name-width;
+    }
+    // Applies a width to the right property (live resize, `for`-compatible).
+    function set-col-width(id: string, w: length) {
+        if (id == "path") { root.col-path-width = w; }
+        else if (id == "size") { root.col-size-width = w; }
+        else if (id == "modified") { root.col-modified-width = w; }
+        else if (id == "created") { root.col-created-width = w; }
+        else if (id == "ext") { root.col-ext-width = w; }
+        else if (id == "resolution") { root.col-resolution-width = w; }
+        else if (id == "depth") { root.col-depth-width = w; }
+        else if (id == "age") { root.col-age-width = w; }
+        else { root.col-name-width = w; }
+    }
+
+    // Path bar edit mode: false = clickable breadcrumbs,
+    // true = TextInput. Local to the panel, toggled by clicking empty area / Enter / Escape.
+    in-out property <bool> path-edit-mode: false;
+    // The field is created conditionally. Its focus and selection are applied
+    // on the next event-loop turn, after the edit widget exists.
+    property <bool> address-select-pending: false;
+    /// Same deferral, for the variant that leaves the path alone.
+    property <bool> address-caret-end-pending: false;
+    /// Shared by both entry points: creates the field and fills it. What
+    /// happens to the caret afterwards is the caller's choice.
+    function open-address-editor() {
+        root.activate();
+        root.close-ctx-menu();
+        root.url-edit-text = root.view.current-path;
+        root.path-edit-mode = true;
+    }
+    /// Opens the path with the whole of it selected, so the next keystroke
+    /// replaces it. Ctrl+L, the empty part of the bar and the menu all mean
+    /// "I am going somewhere else".
+    function edit-address() {
+        root.open-address-editor();
+        root.address-select-pending = true;
+    }
+    /// Opens the path with the caret at its end and nothing selected, so the
+    /// next keystroke appends. A left click on a separator means "I want to
+    /// carry on from here", which is a different intent and deserves a
+    /// different result.
+    function edit-address-at-end() {
+        root.open-address-editor();
+        root.address-caret-end-pending = true;
+    }
+    function edit-address-menu(mx: length, my: length) {
+        root.edit-address();
+        root.open-url-menu(mx, my);
+    }
+    // Toolbar controls do not necessarily take keyboard focus. Cancel the
+    // draft explicitly before their action and discard deferred editor focus.
+    function cancel-address-edit() {
+        root.address-select-pending = false;
+        root.address-caret-end-pending = false;
+        if (root.path-edit-mode) {
+            root.path-edit-mode = false;
+            root.close-ctx-menu();
+            root.request-focus();
+        }
+    }
+    // Ctrl+L is broadcast to all panels; only the active one handles it.
+    in property <int> address-focus-gen;
+    changed address-focus-gen => {
+        if (root.active) {
+            root.edit-address();
+        }
+    }
+
+    // === Tab drag: preview handled locally in Slint ===
+    /// Global "a drag is in progress" flag propagated from MainWindow to
+    /// **all** PanelComponents — lets each panel compute
+    /// ITS OWN preview, and thus display the line in the cross-view
+    /// target panel.
+    in property <bool> drag-active: false;
+    // Distinguish real tabs from directory and sidebar location drags.
+    in property <bool> tab-drag-active: false;
+    // Tabs and directory locations can target panel zones.
+    in property <bool> drag-panel-zones: true;
+    // Center remains an append target even when no new panel can be created;
+    // edge previews must reflect the actual split capacity.
+    in property <bool> drag-panel-split-edges: true;
+    /// Absolute X position of the mouse during the drag (propagated from
+    /// MainWindow). Each panel compares it with its tabs-row to know
+    /// whether the mouse is within its tab zone.
+    in property <length> drag-abs-x: 0px;
+    in property <length> drag-abs-y: 0px;
+    /// Global tab path tooltip setting, propagated to both tab orientations.
+    in property <bool> tab-tooltip-enabled: false;
+
+    // ===== Dragging this VIEW, to exchange or rearrange its place =====
+    // Its own channel, parallel to the tab drag: the two gestures start from
+    // different pixels — a tab, versus the grip in the nav bar — so they never
+    // overlap and neither has to arbitrate for the other.
+    callback view-drag-progress(/* abs_x */ length, /* abs_y */ length);
+    callback view-drag-completed(/* abs_x */ length, /* abs_y */ length);
+    in property <bool> view-drag-active: false;
+    in property <length> view-drag-abs-x;
+    in property <length> view-drag-abs-y;
+    /// This view is the one being carried.
+    in property <bool> view-drag-is-source: false;
+    /// This view is the one under the cursor.
+    in property <bool> view-drag-is-target: false;
+    /// A center drop is armed, so both members of the swap are highlighted.
+    in property <bool> view-drag-armed: false;
+    /// This view is on its way to its new place.
+    in property <bool> view-swap-flying: false;
+    /// This view is being carried out of the window.
+    in property <bool> view-drag-leaving: false;
+    // Cursor inside this view, and this view is not the one being carried.
+    // The "is a drag running" test comes FIRST: at rest the expression stops on
+    // one boolean and never reads the position that moves with the pointer.
+    out property <bool> view-drag-over: root.view-drag-active
+        && !root.view-drag-is-source
+        && root.view-drag-abs-x - root.absolute-position.x >= 0px
+        && root.view-drag-abs-x - root.absolute-position.x <= root.width
+        && root.view-drag-abs-y - root.absolute-position.y >= 0px
+        && root.view-drag-abs-y - root.absolute-position.y <= root.height;
+    out property <int> view-drag-zone: !root.view-drag-over ? 0
+        : root.panel-drop-zone(root.view-drag-abs-x - root.absolute-position.x,
+            root.view-drag-abs-y - root.absolute-position.y);
+    // The pair lights up together or not at all. A swap concerns TWO views;
+    // marking only one would read as "this one replaces that one".
+    // Held for the whole travel as well: two outlined rectangles crossing
+    // read as two cards being exchanged, where two bare tiles overlapping read
+    // as a glitch — the z-order between tiles is not something to rely on.
+    property <bool> swap-lit: root.view-swap-flying
+        || (root.view-drag-armed
+            && (root.view-drag-is-source || root.view-drag-is-target));
+    // Where the grip was pressed, and whether the press became a drag.
+    property <length> vd-x;
+    property <length> vd-y;
+    property <bool> view-dragging: false;
+
+    // Directional drop zones -----
+    // Drag cursor position in THIS panel's frame.
+    property <length> dl-x: root.drag-abs-x - root.absolute-position.x;
+    property <length> dl-y: root.drag-abs-y - root.absolute-position.y;
+    // Is the drag cursor over this panel?
+    out property <bool> drag-over: root.drag-active
+        && root.dl-x >= 0px && root.dl-x <= root.width
+        && root.dl-y >= 0px && root.dl-y <= root.height;
+
+    // FILE drag'n'drop between views -----
+    // (Same principles as the tab drag: absolute position propagated from
+    // MainWindow; each panel computes whether it is hovered. `absolute-position`
+    // is safe here because panels are positioned with an explicit `x:`.)
+    in property <bool> file-drag-active: false;
+    // Navigation keeps the source gesture alive while disabling file targets.
+    in property <bool> folder-open-drag-active: false;
+    in property <length> file-drag-abs-x: 0px;
+    in property <length> file-drag-abs-y: 0px;
+    in property <bool> is-file-drag-source: false;
+    in property <bool> file-drag-internal: false;
+    out property <FileDropArea> file-drop-area: {
+        left: flickable.absolute-position.x,
+        top: list-area.absolute-position.y,
+        width: max(0px, flickable.width - (root.rb-min-vy < 0px ? 9px : 0px)),
+        height: list-area.height,
+        content-left: list-area.absolute-position.x,
+        content-start: Tokens.gutter,
+        content-right: root.content-right,
+        scroll-top: -rows-scroll.content-y,
+        grid: root.item-grid,
+    };
+    out property <bool> file-drag-over: root.file-drag-active
+        && !root.folder-open-drag-active
+        && root.file-drag-abs-x >= root.file-drop-area.left
+        && root.file-drag-abs-x < root.file-drop-area.left + root.file-drop-area.width
+        && root.file-drag-abs-y >= root.file-drop-area.top
+        && root.file-drag-abs-y < root.file-drop-area.top + root.file-drop-area.height;
+    // Emitted by `sel-touch` (see below) to MainWindow.
+    callback file-drag-started(int /*row_idx*/, length /*abs_x*/, length /*abs_y*/);
+    callback pointer-modifiers(bool /*control*/, bool /*shift*/);
+    callback file-drag-progress(length, length);
+    callback file-drag-dropped(length, length);
+    callback manual-gap-noop(int /*gap*/) -> bool;
+    // Top of the body (below the tabs + nav header) = list-area position.
+    property <length> body-top: list-area.absolute-position.y - root.absolute-position.y;
+    // Actual LEFT inset of list-area within the panel: root row's
+    // padding (`Tokens.panel-pad`) + 6px spacing consumed by `vbar-left`, which
+    // stays in the tree at zero width when the vertical tab bar is
+    // inactive — i.e. 13px in the common case. Not to be confused with
+    // `body-left` (body bounds excluding the vertical bar, zero if tab-mode != 1).
+    // Measured rather than hardcoded, to stay accurate if the layout changes.
+    // Same read as `body-top` (panel absolute-position = proven safe):
+    // used only to place `gutter-strip`, which takes part in no layout →
+    // no cycle.
+    property <length> list-inset-x: list-area.absolute-position.x - root.absolute-position.x;
+    // (FOLDER) row hovered during a file-drag → allows dropping the
+    // selection INTO this subfolder. Same reads as `file-drag-over` /
+    // `body-top` (panel absolute-position = proven safe); the hit-test consults
+    // the precomputed geometry, no reentrant layout read. -1 = no
+    // folder-row under the cursor (falls back to the panel's current folder).
+    property <length> drag-y-in-body: root.file-drag-abs-y - root.absolute-position.y - root.body-top;
+    // Exact X position of the row area (accounts for vertical bar,
+    // padding, and horizontal scroll). It shares the same dead bounds as
+    // normal hover/click: gutter on the left, end of columns on the right.
+    property <length> fd-x-in-list: root.file-drag-abs-x - list-area.absolute-position.x;
+    property <int> drag-hover-row: -1;
+    function update-drag-hover-row() {
+        root.drag-hover-row =
+            (root.file-drag-active && root.file-drag-over && root.drag-y-in-body >= 0px
+                && root.fd-x-in-list >= Tokens.gutter
+                && root.fd-x-in-list <= root.content-right)
+            ? root.item-index-at(root.fd-x-in-list, root.drag-y-in-body)
+            : -1;
+    }
+    changed file-drag-active => { root.update-drag-hover-row(); }
+    changed file-drag-over => { root.update-drag-hover-row(); }
+    changed file-drag-abs-x => { root.update-drag-hover-row(); }
+    changed file-drag-abs-y => { root.update-drag-hover-row(); }
+    out property <int> drag-target-row: root.drag-hover-row;
+    out property <bool> drag-target-exec:
+        root.manual-drop-gap < 0
+        && root.drag-hover-row >= 0 && root.drag-hover-row < root.view.rows.length
+        && !root.view.rows[root.drag-hover-row].is-dir
+        && root.view.rows[root.drag-hover-row].drop-runnable;
+    out property <int> drag-folder-row:
+        (root.manual-drop-gap < 0
+            && root.drag-hover-row >= 0 && root.drag-hover-row < root.view.rows.length
+            && root.view.rows[root.drag-hover-row].is-dir)
+        ? root.drag-hover-row
+        : -1;
+    property <length> manual-drag-content-y: root.drag-y-in-body - rows-scroll.content-y;
+    property <float> manual-row-frac:
+        root.drag-hover-row >= 0 && root.drag-hover-row < root.view.rows.length
+        ? (root.manual-drag-content-y - root.view.rows[root.drag-hover-row].visual-y)
+            / max(1px, root.view.rows[root.drag-hover-row].visual-h)
+        : -1;
+    property <bool> manual-row-keeps-drop:
+        root.drag-hover-row >= 0 && root.drag-hover-row < root.view.rows.length
+        && (root.view.rows[root.drag-hover-row].is-dir
+            || root.view.rows[root.drag-hover-row].drop-runnable);
+    property <int> manual-drop-gap-candidate:
+        !root.view.manual-order || !root.file-drag-internal || !root.file-drag-over
+            || root.drag-y-in-body < 0px
+            || root.fd-x-in-list < Tokens.gutter
+            || root.fd-x-in-list > root.content-right
+        ? -1
+        : root.view.grid-mode
+            ? root.grid-insertion-gap(root.item-grid, root.view.rows.length,
+                root.fd-x-in-list, root.manual-drag-content-y, root.manual-row-keeps-drop)
+        : (root.drag-hover-row >= 0
+            ? (root.manual-row-keeps-drop
+                    && root.manual-row-frac >= 0.33
+                    && root.manual-row-frac <= 0.66
+                ? -1
+                : (root.manual-row-frac < 0.5
+                    ? root.drag-hover-row
+                    : root.drag-hover-row + 1))
+            : -1);
+    in-out property <int> manual-drop-gap: -1;
+    changed manual-drop-gap-candidate => {
+        root.manual-drop-gap = root.manual-drop-gap-candidate >= 0
+            && (!root.is-file-drag-source
+                || !root.manual-gap-noop(root.manual-drop-gap-candidate))
+            ? root.manual-drop-gap-candidate
+            : -1;
+    }
+    // The center is deliberately compact: dropping on a view is primarily a
+    // split gesture, while appending to its tab bar remains available here and
+    // across the whole header. Named bounds keep preview and release identical.
+    property <float> drag-center-min: 0.40;
+    property <float> drag-center-max: 0.60;
+    // Drop zone: 0 none · 1 center (move) · 2 west · 3 east · 4 north · 5 south.
+    // Central 20%x20% band = move; otherwise the nearest edge (diagonals).
+    // The TAB BAR (top band OR side column) and the nav bar
+    // count as "center" (move zone, no split).
+    // Tabs, directory locations and whole views share the same hit zones.
+    function panel-drop-zone(px: length, py: length) -> int {
+        if (root.in-tab-bar(px, py) || py < root.body-top) { return 1; }
+        let nx: float = (px - root.body-left) / max(1px, root.body-right - root.body-left);
+        let ny: float = (py - root.body-top) / max(1px, root.height - root.body-top);
+        if (nx >= root.drag-center-min && nx <= root.drag-center-max
+                && ny >= root.drag-center-min && ny <= root.drag-center-max) { return 1; }
+        return min(nx, 1 - nx) < min(ny, 1 - ny)
+            ? (nx < 0.5 ? 2 : 3) : (ny < 0.5 ? 4 : 5);
+    }
+    out property <int> drag-zone: !root.drag-over ? 0
+        : root.panel-drop-zone(root.dl-x, root.dl-y);
+    // A center view drop already uses the paired swap outline.
+    property <int> drop-preview-zone: root.view-drag-over
+        ? (root.view-drag-zone > 1 ? root.view-drag-zone : 0)
+        : (root.drag-panel-zones && root.drag-over
+            && (root.drag-zone == 1 || root.drag-panel-split-edges)
+            && root.drag-preview-idx < 0 ? root.drag-zone : 0);
+    property <int> drop-guide-zone: root.view-drag-over ? root.view-drag-zone
+        : root.drop-preview-zone;
+    /// Absolute X start of `tabs-row` = `root.absolute-position.x` (PanelComponent
+    /// position, STABLE, independent of internal layout) + cumulative inset
+    /// up to the tabs: root VerticalLayout padding (7px) + toolbar
+    /// padding (6px) = 13px. No dependency on tabs-row's layout.
+    property <length> tabs-row-x: root.absolute-position.x + 13px;
+
+    // Vertical tab bar -----
+    // THIS panel's bar position: 0 top · 1 left · 2 right.
+    property <int> tab-mode: root.view.tab-bar-mode;
+    // USER width of the bar (0 = automatic). Initialized from the model,
+    // mutated locally by the grip (LIVE resize), reported to the bridge at the
+    // end of the drag (`vbar-resized`) — same pattern as column widths.
+    in-out property <length> vbar-live-w: root.view.vbar-user-w;
+    // EFFECTIVE bar width — MUST == `vbar_width` (bridge): user
+    // width if set, otherwise 40% of the panel capped at 180; the whole thing bounded
+    // between 110px and 60% of the panel to preserve content width.
+    property <length> vbar-w:
+        max(110px, min(
+            root.vbar-live-w > 0px ? root.vbar-live-w : min(180px, root.width * 0.4),
+            max(110px, root.width * 0.6)));
+    /// End of the bar's resize (grip released): effective width to
+    /// persist per view.
+    callback vbar-resized(length);
+    // ABSOLUTE Y origin of the vertical tab list: panel + content
+    // padding (7) + bar padding (4) + "+" header (24) + spacing (4) +
+    // thread (1) + spacing (4) = 44px — FIXED insets from the
+    // PanelComponent's position, never layout-cache (same pattern as `tabs-row-x`).
+    // MUST == the vertical inset of `locate_tab_drop` (bridge, 48 with panel-gap).
+    property <length> vtabs-col-y: root.absolute-position.y + 44px;
+    // Is the tab drag cursor within THIS panel's BAR? Common
+    // gate: gap claiming, insertion preview, split drop's "center"
+    // zone — regardless of mode (top band OR side column).
+    function in-tab-bar(px: length, py: length) -> bool {
+        return root.tab-mode == 0 ? py < root.body-top
+            : (root.tab-mode == 1 ? px <= 7px + root.vbar-w + 4px
+                : px >= root.width - 7px - root.vbar-w - 4px);
+    }
+    property <bool> drag-in-bar: root.in-tab-bar(root.dl-x, root.dl-y);
+    // Body X bounds, excluding the vertical bar. They normalize the split
+    // zones and limit row hover during a file drag.
+    property <length> body-left: root.tab-mode == 1 ? 7px + root.vbar-w + 6px : 0px;
+    property <length> body-right: root.tab-mode == 2
+        ? root.width - 7px - root.vbar-w - 6px
+        : root.width;
+    // Tab bar overflow -----
+    // Direct Flickable reads (`content-width`, `content-x`, `width`),
+    // no dependency on the layout cache. `content-x ≤ 0`, with 0 at the start and
+    // `width - content-width` at the right end. The epsilon stabilizes the edges.
+    property <bool> tabs-overflow: tabs-flick.content-width > tabs-flick.width + 0.5px;
+    property <bool> can-scroll-left: tabs-flick.content-x < -0.5px;
+    property <bool> can-scroll-right:
+        tabs-flick.content-x > tabs-flick.width - tabs-flick.content-width + 0.5px;
+    // Width of the right overlay cluster (chevrons): reserved on the right (spacer at
+    // the end of `tabs-row` + effective right bound below) so the last
+    // tab clears the cluster. MUST == the backdrop's width.
+    property <length> tab-cluster-w: 62px;
+    // EFFECTIVE right edge for revealing: the useful visible area stops where
+    // the cluster begins (otherwise a tab would align UNDER the cluster).
+    property <length> tabs-view-w: tabs-flick.width - root.tab-cluster-w;
+    // Scroll target computed by the BRIDGE (exact `TabInfo` widths):
+    // reveals "tab by tab" rather than an arbitrary jump. `idx<0` = no chevron
+    // in the `forward` direction; `idx>=0` = reveal tab `idx`.
+    callback scroll-target(int, bool, length, length) -> length;
+    function tabs-scroll-left() {
+        tabs-flick.content-x =
+            root.scroll-target(-1, false, tabs-flick.content-x, root.tabs-view-w);
+    }
+    function tabs-scroll-right() {
+        tabs-flick.content-x =
+            root.scroll-target(-1, true, tabs-flick.content-x, root.tabs-view-w);
+    }
+    // Index to reveal AFTER the model rebuild triggered by a wheel
+    // `tab-clicked`. The rebuild resets `content-x` → we reveal DEFERRED via
+    // `reveal-timer` (one loop iteration later, once the model is
+    // applied), otherwise the scroll gets overwritten.
+    property <int> pending-reveal-idx: -1;
+    reveal-timer := Timer {
+        interval: 8ms;
+        running: false;
+        triggered => {
+            self.running = false;
+            if (root.pending-reveal-idx >= 0) {
+                // Dispatch by orientation: same bridge target
+                // (`scroll-target`), different axis.
+                if (root.tab-mode == 0) {
+                    tabs-flick.content-x = root.scroll-target(
+                        root.pending-reveal-idx, true, tabs-flick.content-x, root.tabs-view-w);
+                } else if (root.tab-mode == 1) {
+                    vbar-left.reveal(root.pending-reveal-idx);
+                } else {
+                    vbar-right.reveal(root.pending-reveal-idx);
+                }
+                root.pending-reveal-idx = -1;
+            }
+        }
+    }
+    // Automatically reveals the active tab after any activation source:
+    // wheel, Ctrl+Tab, creation, closing, cross-instance receipt, or
+    // orientation change. Only the index and mode values are
+    // observed, to react only to an actual change.
+    property <int> active-tab-watch: root.view.active-tab-idx;
+    changed active-tab-watch => {
+        root.pending-reveal-idx = root.view.active-tab-idx;
+        reveal-timer.running = true;
+    }
+    property <int> tab-mode-watch: root.view.tab-bar-mode;
+    changed tab-mode-watch => {
+        root.pending-reveal-idx = root.view.active-tab-idx;
+        reveal-timer.running = true;
+    }
+    // Tab bar auto-scroll during a REORDER DRAG when
+    // the cursor nears an edge (bar overflowing) → allows dropping
+    // behind a tab that stayed off-screen. `reorder-cur` follows `content-x`
+    // → the drop gap recomputes itself as scrolling progresses.
+    property <length> strip-cursor-x: root.drag-abs-x - root.tabs-row-x;
+    Timer {
+        interval: 16ms;
+        running: root.tab-mode == 0 && root.drag-active && root.drag-over
+            && root.dl-y < root.body-top && root.tabs-overflow;
+        triggered => {
+            if (root.strip-cursor-x < 28px && root.can-scroll-left) {
+                tabs-flick.content-x = min(0px, tabs-flick.content-x + 12px);
+            } else if (root.strip-cursor-x > root.tabs-view-w - 12px && root.can-scroll-right) {
+                tabs-flick.content-x = max(
+                    tabs-flick.width - tabs-flick.content-width,
+                    tabs-flick.content-x - 12px);
+            }
+        }
+    }
+    // Wheel over the tab bar = next/previous tab (circular wrap)
+    // THEN scroll-into-view (deferred) of the new tab.
+    function tab-wheel(fwd: bool) {
+        if (root.view.tabs.length == 0) { return; }
+        let ni: int = fwd
+            ? (root.view.active-tab-idx >= root.view.tabs.length - 1 ? 0 : root.view.active-tab-idx + 1)
+            : (root.view.active-tab-idx <= 0 ? root.view.tabs.length - 1 : root.view.active-tab-idx - 1);
+        root.activate();
+        root.tab-clicked(ni);
+        root.pending-reveal-idx = ni;
+        reveal-timer.running = true;
+    }
+    /// Tab reordering: gaps are claimed BY the TabItems
+    /// from 100% PLAIN geometries (width/offset provided by the bridge
+    /// in the `TabInfo` model) — no layout observation, no cycle. The
+    /// claimed gap is stored here (local preview) AND reported to MainWindow
+    /// (`tab-gap-claimed`) for cross-view drop (TARGET panel's gap).
+    property <int> tab-drop-idx: -1;
+    property <length> tab-drop-x;
+    /// Emitted (synchronously) on every gap claim — MainWindow stores
+    /// (gap, panel) for cross-view drop.
+    callback tab-gap-claimed(int);
+    callback tab-gap-cleared();
+    function report-tab-drop(i: int, x: length) {
+        root.tab-drop-idx = i;
+        root.tab-drop-x = x;
+        root.tab-gap-claimed(i);
+    }
+    // New drag → starts over from an undefined gap (avoids a leftover from the previous drag).
+    changed drag-active => { if (root.drag-active) { root.tab-drop-idx = -1; } }
+    /// Drop preview line index. `-1` = no drag, or cursor outside
+    /// **THIS panel's bar** (gate `drag-in-bar`: top band OR side
+    /// column depending on mode — prevents neighboring views from displaying it).
+    property <int> drag-preview-idx:
+        (!root.drag-active || !root.drag-over || !root.drag-in-bar)
+        ? -1
+        : root.tab-drop-idx;
+    changed drag-preview-idx => {
+        if (root.drag-preview-idx < 0) { root.tab-gap-cleared(); }
+    }
+
+    // Callbacks emitted to MainWindow (which dispatches to the active panel).
+    callback activate();
+    callback go-back();
+    callback go-forward();
+    callback go-parent();
+    callback go-home();
+    callback refresh();
+    callback sort-clicked(string);
+    callback secondary-sort-action(string);
+    callback row-activated(int);
+    callback row-clicked(int) -> bool;
+    callback row-ctrl-clicked(int);
+    callback row-shift-clicked(int);
+    // Slow second click on the single selected entry: reuses the
+    // global rename route (same popup as F2 / context menu).
+    callback rename-selected();
+    callback right-clicked(int, length, length);
+    callback select-all();
+    callback deselect-all();
+    callback rubber-band-begin(int /*mode: 0 replace, 1 add, 2 subtract*/);
+    callback rubber-band-update(length, length, length, length);
+    callback tab-new();
+    callback tab-clicked(int);
+    callback tab-closed(int);
+    callback tab-context(int, length, length);   // tab right-click
+    callback tab-bar-context(length, length);    // right-click on the bar's dead zone
+    /// Tab drag completed: (src_idx, target_intra_idx, abs_x, abs_y).
+    /// `target_intra_idx` is computed locally in Slint (insertion position
+    /// BEFORE removal), or `-1` if the mouse left the tab zone
+    /// (the bridge will then try a cross-view target via `abs_x`).
+    callback tab-drag-completed(int, int, length, length);
+    /// Drag progress: (src_idx, abs_x, abs_y). Used by the bridge for
+    /// possible global decisions (no preview here — handled in Slint).
+    callback tab-drag-progress(int, length, length);
+    callback request-focus();
+    /// Emitted when the user submits a path typed in the URL bar.
+    callback navigate-to(string);
+    /// Emitted on right-click in the empty area (below the rows) — the bridge
+    /// opens the context menu on the current folder.
+    callback empty-right-clicked(/* abs_x */ length, /* abs_y */ length);
+    /// Emitted when the user clicks the header's "x" to close this panel.
+    callback close-panel();
+    /// Emitted on click of the split token — requests opening the
+    /// "Split" menu at position (abs_x, abs_y) below the token.
+    callback open-split-menu(length, length);
+    /// Emitted on click of the "tab bar position" button —
+    /// requests opening the 3-option menu at (abs_x, abs_y) below the button.
+    callback open-tabbar-menu(length, length);
+    callback open-display-menu(length, length);
+    callback open-sort-menu(length, length);
+    /// Entry zoom (Ctrl+wheel): +1 enlarges, -1 shrinks. The bridge maps
+    /// the level to a row height, then returns the new `viewport-top`
+    /// that keeps the anchor entry at the same visual position.
+    callback zoom-step(int /*delta*/, length /*top*/, length /*width*/, length /*height*/,
+        length /*pointer-x*/, length /*pointer-y*/) -> length;
+    callback zoom-feedback(length, length);
+    /// Global keystroke counter. Any keystroke cancels a deferred
+    /// second-click: keyboard input/navigation takes priority over slow rename.
+    in property <int> keyboard-interaction-gen;
+    /// A modal overlay (menu / popup / dialog) is open → the wheel must
+    /// NOT scroll/zoom the view (otherwise the view "moves" under the focused popup).
+    in property <bool> overlay-open;
+    /// Shows / hides hidden files in the active tab.
+    callback toggle-show-hidden();
+    /// Right-click in the URL bar → Paste/Copy path menu, at (x, y).
+    callback open-url-menu(length, length);
+    /// Closes the context menu (left-click in a panel's content).
+    callback close-ctx-menu();
+    // Editable text of the URL bar (bound to MainWindow's shared property).
+    in-out property <string> url-edit-text;
+    // URL menu open? → prevents exiting edit mode on focus loss.
+    in property <bool> url-menu-open;
+    /// Bumped by the URL menu's "Copy". The field itself watches this and
+    /// copies, because only IT knows what is selected — see `url-input`.
+    in property <int> url-copy-serial;
+    in property <int> url-paste-serial;
+
+    // Rubber-band (selection rectangle).
+    // To stay correct while the list is scrolled, the anchor and the current
+    // point are stored in **content coordinates** (= visible − scroll).
+    // The bridge queries the arrangement's exact item rectangles; the drawn
+    // rectangle converts back to visible coordinates (+ content-y).
+    property <bool> rb-active: false;
+    property <length> rb-anchor-x;    // visible x at the start
+    property <length> rb-anchor-cy;   // CONTENT y at the start (anchor)
+    property <length> rb-cur-x;       // current visible x
+    property <length> rb-cur-vy;      // current VISIBLE y (mouse)
+    // current content y — reactive to scroll (key to edge auto-scroll).
+    property <length> rb-cur-cy: root.rb-cur-vy - rows-scroll.content-y;
+    // Lower (negative) bound of content-y; 0 if the content fits without scrolling.
+    property <length> rb-min-vy: rows-scroll.content-height > rows-scroll.height
+        ? -(rows-scroll.content-height - rows-scroll.height)
+        : 0px;
+    // Where the column titles sit inside the header band: pushed down in
+    // manual order, which shows a pill naming that mode above them.
+    property <length> header-titles-y: root.view.manual-order ? 22px : 0px;
+    // Height of the whole header band, titles included. Anything that has to
+    // sit below the header reads it here rather than restating the figures:
+    // the vertical scrollbar restated them, and overlapped the header the day
+    // the band grew.
+    property <length> header-height: root.header-titles-y + 30px;
+    // Gap between the header band and the rows, from the layout holding them.
+    property <length> header-gap: 2px;
+    // Auto-scroll on middle-click held down (browser/PDF style): we
+    // store the cursor's origin on press; a Timer scrolls continuously at a
+    // speed proportional to the current offset — vertical AND horizontal.
+    property <bool> mid-scroll-active: false;
+    property <length> mid-origin-y;
+    // Horizontal axis: `sel-touch` SCROLLS horizontally with the Flickable,
+    // so `mouse-x` alone (relative to sel-touch) drifts as the view scrolls. The
+    // FIXED reference is `mouse-x + flickable.content-x`. We store it on every
+    // change of `mouse-x` (consistent instant); the Timer reads the stored value.
+    property <length> mid-origin-fx;   // fixed reference at click (origin)
+    property <length> mid-cur-fx;      // current fixed reference
+
+    // Hovered row index (-1 = none) — driven by `sel-touch`.
+    property <int> hovered-idx: -1;
+    // One hover calculation per view. File rows never observe mouse coordinates.
+    function item-name-tooltip() -> ItemNameTip {
+        if (!sel-touch.has-hover || sel-touch.pressed
+                || root.overlay-open || root.mid-scroll-active
+                || root.hovered-idx < 0 || root.hovered-idx >= root.view.rows.length) {
+            return { text: "", x: 0px, y: 0px };
+        }
+        let show-name = root.view.grid-mode && root.grid-name-tooltip-enabled;
+        let show-path = root.view.search-recursive && root.search-path-tooltip-enabled;
+        if (!show-name && !show-path) {
+            return { text: "", x: 0px, y: 0px };
+        }
+        let cell = root.item-rect(root.hovered-idx);
+        let name-start = Tokens.gutter-content + Tokens.row-icon-slot(root.view.preview-mode,
+            max(1px, cell.height - root.view-item-spacing * 1px), root.col-name-width) + 8px;
+        let caption = root.view.grid-mode ? Tokens.grid-caption-rect(cell.width, cell.height)
+            : { left: name-start, top: 0px,
+                width: max(0px, Tokens.gutter-content + root.col-name-width - name-start),
+                height: max(1px, cell.height - root.view-item-spacing * 1px) };
+        let x = sel-touch.mouse-x - cell.left;
+        let y = sel-touch.mouse-y - rows-scroll.content-y - cell.top;
+        if (x < caption.left || x >= caption.left + caption.width
+                || y < caption.top || y >= caption.top + caption.height) {
+            return { text: "", x: 0px, y: 0px };
+        }
+        let item = root.view.rows[root.hovered-idx];
+        // One line per reason to be here. The path says where a result lives,
+        // which the row does not show; the name is added only where its own
+        // setting asks for it, a grid caption being the one place that elides
+        // it. Repeating a name the pointer is already resting on taught the
+        // reader nothing.
+        return { text: show-path
+                ? (show-name ? item.name + "\n" + item.path : item.path)
+                : item.name,
+            x: rows-scroll.absolute-position.x + cell.left + caption.left,
+            y: rows-scroll.absolute-position.y + rows-scroll.content-y
+                + cell.top + caption.top + caption.height + 4px };
+    }
+    property <ItemNameTip> item-name-tip: root.item-name-tooltip();
+    property <ItemNameTip> shown-name-tip;
+    changed item-name-tip => {
+        if (root.item-name-tip.text != "") {
+            Tip.text = root.item-name-tip.text;
+            Tip.x = root.item-name-tip.x;
+            Tip.y = root.item-name-tip.y;
+        } else if (root.shown-name-tip.text != ""
+                && Tip.text == root.shown-name-tip.text
+                && Tip.x == root.shown-name-tip.x && Tip.y == root.shown-name-tip.y) {
+            // A view leaving hover must not clear a tooltip just opened elsewhere.
+            Tip.text = "";
+        }
+        root.shown-name-tip = root.item-name-tip;
+    }
+    // Which row's note the pointer is asking for, or -1. The badge is drawn on
+    // the ICON, so that is where the reader points; the rest of the line must
+    // not pop a bubble on the way past.
+    //
+    // Decided ONCE for the view rather than by a property on every rendered
+    // row. A `changed` handler forces its property to be evaluated eagerly, so
+    // one per row means a hundred evaluations where one per view means one —
+    // and the pointer moves far more often than the rows do. The hover test
+    // comes first, so while a separator is being dragged this stops at a single
+    // boolean and never even looks at the column widths that are moving.
+    property <int> note-row: (sel-touch.has-hover && !sel-touch.pressed
+            && root.hovered-idx >= 0
+            && root.hovered-idx < root.view.rows.length
+            && root.view.rows[root.hovered-idx].comment != ""
+            && (root.view.grid-mode
+                ? sel-touch.mouse-y - rows-scroll.content-y
+                    < root.item-rect(root.hovered-idx).top + root.item-grid.cell-width
+                : (sel-touch.mouse-x >= Tokens.gutter-content
+            && sel-touch.mouse-x <= Tokens.gutter-content
+                + Tokens.row-icon-slot(root.view.preview-mode,
+                    root.view.rows[root.hovered-idx].visual-h,
+                    root.col-name-width))))
+        ? root.hovered-idx : -1;
+    // Menu key (the context-menu key of a PC keyboard). The window bumps a
+    // counter, every view watches it, and only the active one answers — the
+    // same idiom as `Dismiss.serial`, and the only one that reaches a single
+    // instance of a repeated component.
+    in property <int> menu-key-serial;
+    // Row the menu should target, or -1 for the background menu. Resolved by
+    // the bridge, which owns the selection; the geometry stays here, where the
+    // pixels are.
+    callback keyboard-context-row() -> int;
+    property <int> menu-key-watch: root.menu-key-serial;
+    changed menu-key-watch => {
+        if (root.active) {
+            // Top-left of the entries area: where a menu opens when nothing is
+            // targeted, and the fallback when the target cannot be pointed at.
+            let fx: length = rows-scroll.absolute-position.x + Tokens.gutter;
+            let fy: length = rows-scroll.absolute-position.y;
+            let idx: int = root.keyboard-context-row();
+            if (idx < 0 || idx >= root.view.rows.length) {
+                root.empty-right-clicked(fx, fy);
+            } else {
+                // Same geometry as the note bubble: the frame's own position,
+                // plus the scroll offset, plus the row's place in the viewport.
+                let rtop: length = rows-scroll.absolute-position.y + rows-scroll.content-y
+                    + root.item-rect(idx).top;
+                let rbot: length = rtop + root.item-rect(idx).height;
+                // A row scrolled out of sight would drag the menu off the view.
+                // The selection still owns the menu; only its position falls
+                // back to the corner.
+                let on-screen: bool = rtop >= rows-scroll.absolute-position.y
+                    && rbot <= rows-scroll.absolute-position.y + rows-scroll.height;
+                root.right-clicked(idx, root.view.grid-mode && on-screen
+                    ? rows-scroll.absolute-position.x + root.item-rect(idx).left : fx,
+                    on-screen ? rbot : fy);
+            }
+        }
+    }
+
+    // Claim held on the shared bubble. Leaving one view as the pointer enters
+    // another fires both handlers in an order nothing guarantees, so a view
+    // only clears what it put there itself. Same idiom as `Dismiss.serial`.
+    property <int> note-claim: -1;
+    changed note-row => {
+        if (root.note-row >= 0) {
+            Note.owner += 1;
+            root.note-claim = Note.owner;
+            Note.pending = root.view.rows[root.note-row].comment;
+            // Edges of the row in WINDOW coordinates: the frame's own position,
+            // plus the scroll offset (negative when scrolled down), plus the
+            // row's place in the viewport. Both travel, so the bubble can flip
+            // above the row when there is no room beneath it. On x, the gutter
+            // is added: a row spans the whole viewport, but the entry the user
+            // sees starts at the gutter, the same inset as its selection pill.
+            Note.pending-x = rows-scroll.absolute-position.x
+                + (root.view.grid-mode ? root.item-rect(root.note-row).left : Tokens.gutter);
+            Note.row-top = rows-scroll.absolute-position.y + rows-scroll.content-y
+                + root.item-rect(root.note-row).top;
+            Note.row-bottom = Note.row-top + root.item-rect(root.note-row).height;
+        } else if (root.note-claim == Note.owner) {
+            Note.pending = "";
+        }
+    }
+    // Very short lock around Ctrl+wheel's synchronous relayout. Without it,
+    // the `rows-revision` notification would republish the OLD viewport onto the
+    // NEW geometry just before the restored anchor is applied.
+    property <bool> zoom-adjusting: false;
+
+    // Close / merge previews -----
+    // `is-drag-source` = this panel is the source of the ongoing tab drag.
+    in property <bool> is-drag-source: false;
+    // (A) Hovering the "x" button = explicit CLOSE → danger red (actual loss
+    // of the layout + tabs). Driven by close-panel-touch.
+    property <bool> close-hover: false;
+    // (B) Dragging the last tab = the view is about to be ABSORBED via merge. This
+    // is an ALLOWED, non-destructive action (the tab migrates) → definitely NOT red:
+    // treated as a neutral "dissolution" (grey veil + faded content).
+    property <bool> will-merge: root.is-drag-source && root.view.tabs.length <= 1;
+    // The absorption register: this view is about to stop existing HERE — its
+    // last tab carried into another view, or the whole view carried out of the
+    // window. The same word for the same meaning, content faded included,
+    // because it really does leave. Which is exactly what must NOT happen on a
+    // swap, where nothing is lost.
+    property <bool> leaving: root.will-merge || root.view-drag-leaving;
+
+    // ACTUAL content height. Unlike Slint's standard ListView,
+    // no average-height computation is involved: scrollbar and hit-tests
+    // share exactly the same cumulative reference.
+    property <length> rows-content-height:
+        root.view.grid-mode && root.view.rows.length > 0
+            ? root.item-rect(root.view.rows.length - 1).top + root.item-grid.cell-height
+        : root.view.rows.length > 0
+            ? root.view.rows[root.view.rows.length - 1].visual-y
+                + root.view.rows[root.view.rows.length - 1].visual-h
+            : 0px;
+
+    function report-rows-viewport() {
+        if (!root.zoom-adjusting) {
+            root.zoom-adjusting = true;
+            let top = root.rows-viewport-changed(max(0px, -rows-scroll.content-y),
+                rows-scroll.height, root.item-grid);
+            rows-scroll.content-y = clamp(-top, root.rb-min-vy, 0px);
+            root.zoom-adjusting = false;
+        }
+    }
+    // Shift redirects the wheel to the horizontal viewport. Native horizontal
+    // deltas are already redirected by some backends and must not be doubled.
+    function scroll-rows(dx: length, dy: length, horizontal: bool) {
+        if (horizontal || dx != 0px) {
+            flickable.content-x = clamp(
+                flickable.content-x + (dx != 0px ? dx : dy),
+                min(0px, flickable.width - flickable.content-width), 0px);
+        }
+        if (!horizontal) {
+            rows-scroll.content-y = clamp(
+                rows-scroll.content-y + dy, root.rb-min-vy, 0px);
+        }
+    }
+    // Width changes only need reconciliation when the fitted grid changes.
+    // An unchanged column count and cell size preserve the visible items.
+    changed item-grid => {
+        if (root.view.grid-mode) { flickable.content-x = 0px; }
+        root.report-rows-viewport();
+        root.update-drag-hover-row();
+        root.update-pointer-hover();
+    }
+    function update-pointer-hover() {
+        if (sel-touch.has-hover && !sel-touch.pressed && !root.mid-scroll-active) {
+            let hover: int = root.item-index-at(sel-touch.mouse-x, sel-touch.mouse-y);
+            root.hovered-idx = hover;
+            if (sel-touch.rename-pending && hover != sel-touch.rename-candidate-idx) {
+                sel-touch.cancel-rename-candidate();
+            }
+        }
+    }
+    property <int> rows-revision-watch: root.view.rows-revision;
+    property <int> viewport-reset-watch: root.view.viewport-reset-gen;
+    property <length> rows-content-height-watch: list-area.height;
+    changed rows-revision-watch => {
+        if (!root.zoom-adjusting) {
+            rows-scroll.content-y = clamp(rows-scroll.content-y, root.rb-min-vy, 0px);
+            root.report-rows-viewport();
+            root.update-drag-hover-row();
+            root.update-pointer-hover();
+        }
+    }
+    changed rows-content-height-watch => {
+        rows-scroll.content-y = clamp(rows-scroll.content-y, root.rb-min-vy, 0px);
+        root.report-rows-viewport();
+        root.update-pointer-hover();
+    }
+    changed viewport-reset-watch => {
+        rows-scroll.content-y = 0px;
+        root.report-rows-viewport();
+        root.update-drag-hover-row();
+        root.update-pointer-hover();
+    }
+
+    // RIGHT edge of the columns (Flickable content position): beyond it is a
+    // DEAD ZONE (like the left gutter) → click/hover/drag there start a
+    // rubber-band, not a row action. Columns run from `gutter-content`
+    // to `gutter-content + content-width`.
+    property <length> content-right: root.view.grid-mode
+        ? rows-scroll.width - 12px : Tokens.gutter-content + root.view.content-width;
+    // Row index under `(x, y)`, respecting the left (gutter) AND right
+    // (beyond the columns) dead zones. `-1` = dead zone / outside the list.
+    function item-index-at(x: length, y: length) -> int {
+        (x < Tokens.gutter || x > root.content-right || y < 0px) ? -1
+            : root.item-at-content-point(x, y - rows-scroll.content-y, root.item-grid);
+    }
+
+    // Keyboard navigation: brings row `idx` into the visible area by
+    // adjusting the exact vertical scroll (content-y ≤ 0). Only moves if the
+    // row overflows top or bottom. Bounded by `rb-min-vy`.
+    function scroll-row-into-view(idx: int) {
+        if (idx < 0) {
+            return;
+        }
+        if (idx >= root.view.rows.length) {
+            return;
+        }
+        let top: length = root.item-rect(idx).top;
+        let height: length = root.item-rect(idx).height;
+        let row-top-in-view: length = top + rows-scroll.content-y;
+        if (row-top-in-view < 0px) {
+            rows-scroll.content-y = clamp(-top, root.rb-min-vy, 0px);
+        } else if (row-top-in-view + height > rows-scroll.height) {
+            rows-scroll.content-y = clamp(rows-scroll.height - top - height, root.rb-min-vy, 0px);
+        }
+    }
+
+    // We ONLY observe `scroll-gen` (bumped on every keyboard cursor
+    // move) → scrolls only on keyboard navigation, not on other
+    // PanelView refreshes.
+    property <int> scroll-gen-watch: root.view.scroll-gen;
+    changed scroll-gen-watch => { root.scroll-row-into-view(root.view.cursor-row); }
+
+    // The active state reads as a crisp accent outline (2px); inactive panels
+    // carry a discreet thread. (No drop shadow: `panels-container` clips
+    // and the z-order between tiles would make it inconsistent from one side to the other.)
+    property <length> outline-width: root.close-hover ? 2px
+        : (root.swap-lit ? 2px
+            : (root.leaving ? 1.5px
+                : (root.active ? 2px : 1px)));
+    property <color> outline-color: root.close-hover
+        ? Tokens.danger                              // (A) close = red
+        : (root.swap-lit
+            ? Theme.accent-background               // (C) swap = accent, both of the pair
+            : (root.leaving
+                ? Theme.border.with-alpha(0.6)     // (B) absorption = neutral
+                : (root.active
+                    ? Theme.accent-background       // active = accent outline
+                    : Tokens.hairline)));             // inactive = discreet thread
+    border-radius: Tokens.radius-panel;
+    // Card surface (slightly detached from the channel/groove = Theme.background).
+    background: Theme.surface;
+    // NO `clip` HERE: a `clip` combined with a `border-radius` forces Slint to
+    // render the whole subtree into an offscreen layer (rounded mask), a layer
+    // allocated/recomposed at a fractional size → the WHOLE panel (URL
+    // bar, entries) becomes BLURRY, and inconsistently from one panel
+    // to another. The clip is carried by `content-clip` (rectangular = scissor,
+    // no layer, hence crisp). The rounded corner remains purely visual here.
+
+    // Activates this panel on click of any "dead" zone (empty tab
+    // strip, footer, nav bar gaps). Placed BEHIND the content:
+    // interactive elements (tabs, buttons, rows…) are on top and
+    // keep their clicks; only clicks on empty area land here. Slint
+    // dispatches to the topmost TouchArea under the pointer.
+    activate-bg := TouchArea {
+        clicked => { root.activate(); root.close-ctx-menu(); }
+    }
+
+    // Wrapper that CLIPS the content — rectangular, WITHOUT border-radius → clip
+    // via scissor (no offscreen layer, hence NO blur). Confines the
+    // header buttons to a narrow view (otherwise they'd overflow into the
+    // neighboring view). The rounded corner is still carried by the root Rectangle.
+    content-clip := Rectangle {
+        width: 100%;
+        height: 100%;
+        clip: true;
+    // Root row: [left vertical tab bar] · content ·
+    // [right vertical bar]. BOTH bars stay in the tree (zero width
+    // and invisible when inactive): a conditional `if` element would not be
+    // referenceable (reveal, content-y, drag cursor).
+    HorizontalLayout {
+        padding: Tokens.panel-pad;
+        spacing: 6px;
+        // "Dissolution" fade when the view is about to be absorbed via merge
+        // (dragging its last tab) — main signal, neutral (not red).
+        opacity: root.leaving ? 0.55 : 1.0;
+        animate opacity { duration: 200ms; easing: ease-out; }
+
+        vbar-left := VTabBar {
+            width: root.tab-mode == 1 ? root.vbar-w : 0px;
+            visible: root.tab-mode == 1;
+            on-left: true;
+            tabs: root.view.tabs;
+            active-tab-idx: root.view.active-tab-idx;
+            overlay-open: root.overlay-open;
+            tab-drag-active: root.drag-active;
+            new-tab-tooltip: Strings.tab-new-tooltip;
+            show-tooltip: root.tab-tooltip-enabled;
+            reorder-here: root.tab-mode == 1 && root.drag-active
+                && root.drag-over && root.drag-in-bar;
+            // Drag cursor in the list's CONTENT position (plain values only:
+            // fixed origin `vtabs-col-y` + viewport reported by the bar).
+            reorder-cur: root.drag-abs-y - root.vtabs-col-y - self.vp-y;
+            cursor-in-bar-y: root.drag-abs-y - root.vtabs-col-y;
+            preview-idx: root.tab-mode == 1 ? root.drag-preview-idx : -1;
+            preview-pos: root.tab-drop-x;
+            claim-drop(g, gy) => { root.report-tab-drop(g, gy); }
+            tab-clicked(i) => { root.activate(); root.tab-clicked(i); }
+            tab-closed(i) => { root.activate(); root.tab-closed(i); }
+            tab-context(i, x, y) => { root.activate(); root.tab-context(i, x, y); }
+            // NO `activate()` during the drag (would rebuild the model →
+            // lost grab; activation on drop, bridge side) — strip parity.
+            tab-drag-progress(i, ax, ay) => { root.tab-drag-progress(i, ax, ay); }
+            tab-drag-completed(i, ax, ay) => {
+                root.tab-drag-completed(i, root.drag-preview-idx, ax, ay);
+            }
+            tab-new => { root.activate(); root.close-ctx-menu(); root.tab-new(); }
+            bar-clicked => { root.activate(); root.close-ctx-menu(); }
+            bar-context(x, y) => { root.activate(); root.tab-bar-context(x, y); }
+            wheel(fwd) => { root.tab-wheel(fwd); }
+            scrolled(vy) => { root.tabs-scrolled(vy); }
+            scroll-target(ti, fwd, vp, vw) => {
+                return root.scroll-target(ti, fwd, vp, vw);
+            }
+            // Resize via the inner grip: width = mouse −
+            // bar's left edge (panel + padding 7). Shared clamp
+            // via `vbar-w` (the raw live-w is bounded by the formula).
+            grip-moved(ax) => {
+                root.vbar-live-w = ax - root.absolute-position.x - 7px;
+            }
+            grip-done => { root.vbar-resized(root.vbar-w); }
+        }
+
+    VerticalLayout {
+        spacing: 6px;
+
+        // ===== Top toolbar (tabs + nav) =====
+        // `Theme.toolbar` background (one notch darker than the surface) to clearly
+        // set apart the top part (tabs + URL + buttons) from the bottom part
+        // (list). Inset rounded block (the card's border/corner remain
+        // visible around it).
+        Rectangle {
+            // Washed while this view is the one being carried: the header is
+            // what the hand is holding, and saying it there costs nothing
+            // anywhere else.
+            background: root.view-drag-is-source
+                ? Theme.accent-background.with-alpha(0.18)
+                : Theme.toolbar;
+            border-radius: Tokens.radius-row;
+            VerticalLayout {
+                padding: 6px;
+                // Vertical bar: the strip's row is COLLAPSED (height
+                // 0) → no spacing above the nav bar.
+                spacing: root.tab-mode == 0 ? 6px : 0px;
+
+        // ===== Tab strip =====
+        // Wrapped in a horizontal layout containing:
+        //  - a horizontally scrollable Flickable (tabs + "+" button)
+        // (The "split" and "x close panel" tokens live in the
+        // nav bar — same location in all THREE bar modes.)
+        // COLLAPSED (height 0, invisible) when the tab bar is VERTICAL:
+        // the element stays in the tree — its ids (tabs-flick…) are referenced
+        // by the panel's properties/Timers (an `if` would break them).
+        HorizontalLayout {
+            spacing: 4px;
+            height: root.tab-mode == 0 ? 26px : 0px;
+            visible: root.tab-mode == 0;
+
+            // Scrollable tab zone: it isolates their cumulative width from
+            // the panel's minimum width and leaves the splitter free.
+            tabs-area := Rectangle {
+                horizontal-stretch: 1;
+                preferred-width: 0px;
+                min-width: 0px;
+                max-width: 99999px;
+                clip: true;
+
+                // TouchArea for the wheel → switches tab (on hover over the
+                // tab zone, regardless of which specific tab). Covers
+                // also covers clicking the empty area of the strip, to the right of the tabs.
+                // Since this TouchArea consumes clicks, it activates the
+                // panel itself.
+                tabs-wheel := TouchArea {
+                    clicked => { root.activate(); root.close-ctx-menu(); }
+                    // Double-click in the EMPTY area of the tab bar → new tab
+                    // (like the "+" button), browser convention.
+                    double-clicked => { root.activate(); root.close-ctx-menu(); root.tab-new(); }
+                    pointer-event(ev) => {
+                        if (ev.kind == PointerEventKind.down
+                                && ev.button == PointerEventButton.right) {
+                            root.activate();
+                            root.tab-bar-context(
+                                self.absolute-position.x + self.mouse-x,
+                                self.absolute-position.y + self.mouse-y);
+                        }
+                    }
+                    scroll-event(ev) => {
+                        // Modal overlay open → wheel neutralized (no tab
+                        // switching while a popup has focus).
+                        if (root.overlay-open) {
+                            return accept;
+                        }
+                        // Covers horizontal trackpads and vertical wheel.
+                        // `tab-wheel` changes tab (wrap) THEN reveals the new
+                        // tab (reliable scroll-into-view).
+                        if (ev.delta-y < 0 || ev.delta-x < 0) { root.tab-wheel(true); return accept; }
+                        if (ev.delta-y > 0 || ev.delta-x > 0) { root.tab-wheel(false); return accept; }
+                        return reject;
+                    }
+                }
+
+                // The preview line is interleaved between the TabItems
+                // to exactly follow each tab's individual width.
+
+                tabs-flick := Flickable {
+                    x: 0;
+                    y: 0;
+                    width: parent.width;
+                    height: parent.height;
+                    content-width: max(self.width, tabs-row.preferred-width);
+                    content-height: self.height;
+                    interactive: false;
+                    // Smooth scrolling driven by the chevrons + scroll-into-view
+                    // (SOLE writers of `content-x` → no contention, no
+                    // cycle: `tabs-row`'s layout does not depend on `content-x`).
+                    animate content-x { duration: 120ms; easing: ease-out; }
+                    // Reports scrolling to the bridge (insertion hit-test for a
+                    // tab received from another instance). `content-x` is a
+                    // PLAIN property already observed (can-scroll-left/right) → the
+                    // `changed` fires reliably.
+                    changed content-x => { root.tabs-scrolled(self.content-x); }
+
+                    tabs-row := HorizontalLayout {
+                        spacing: 2px;
+                        alignment: start;
+                        // Tabs with 100% PLAIN geometry: width/offset
+                        // come from the MODEL (bridge). Gap claiming is
+                        // computed INSIDE TabItem on these plain values (ColumnHeader pattern).
+                        for tab[idx] in root.view.tabs : TabItem {
+                            title: tab.title;
+                            folder-slot: tab.folder-slot;
+                            // Path tooltip: opt-in — empty = disabled.
+                            tip-path: root.tab-tooltip-enabled ? tab.path : "";
+                            active: idx == root.view.active-tab-idx;
+                            tab-width: tab.width;
+                            tab-offset: tab.offset;
+                            tab-index: idx;
+                            tab-count: root.view.tabs.length;
+                            tab-drag-active: root.drag-active;
+                            // Mode gate: the collapsed strip (vertical bar
+                            // active) must NEVER claim a
+                            // gap — its TabItems always exist in the tree.
+                            reorder-active: root.tab-mode == 0 && root.drag-active
+                                && root.drag-over && root.drag-in-bar;
+                            // Cursor in tabs-row's CONTENT coordinates: visible
+                            // position (`drag-abs-x - tabs-row-x`) MINUS the scroll
+                            // (`content-x` ≤ 0). Without this term, a scrolled bar
+                            // (half-tabs) would claim the wrong drop gap. The
+                            // preview (inside the Flickable) is already content-relative →
+                            // consistent. Plain read of `content-x` → safe.
+                            reorder-cur: root.drag-abs-x - root.tabs-row-x - tabs-flick.content-x;
+                            claim-drop(g, gx) => { root.report-tab-drop(g, gx); }
+                            clicked => { root.activate(); root.tab-clicked(idx); }
+                            close-clicked => { root.activate(); root.tab-closed(idx); }
+                            right-clicked(x, y) => { root.activate(); root.tab-context(idx, x, y); }
+                            // NO `root.activate()` during the drag (would rebuild
+                            // the model → lost grab; activation on drop, bridge side).
+                            drag-progress(d, abs-x, abs-y) => {
+                                root.tab-drag-progress(idx, abs-x, abs-y);
+                            }
+                            drag-completed(d, abs-x, abs-y) => {
+                                root.tab-drag-completed(idx, root.drag-preview-idx, abs-x, abs-y);
+                            }
+                        }
+                        // The "+" button belongs to the fixed right-hand cluster and
+                        // stays visible even when the tabs overflow.
+                        // Spacer = overlay cluster width: reserves room on
+                        // the right so the LAST tab (and its close button) clears the
+                        // cluster instead of being half-hidden under it. Also extends
+                        // the Flickable's scroll range accordingly.
+                        Rectangle { width: root.tab-cluster-w; }
+                    }
+                    // Drop preview line — out-of-layout OVERLAY (doesn't shift the
+                    // tabs → no binding cycle). At the claimed gap `tab-drop-x`
+                    // (tabs-row position = Flickable content).
+                    if root.drag-preview-idx >= 0 : Rectangle {
+                        x: root.tab-drop-x - 1px;
+                        y: 0;
+                        width: 2px;
+                        height: parent.height;
+                        background: Theme.accent-background;
+                    }
+                }
+                // Edge fades: signal that there are hidden tabs to the
+                // left/right. Rectangles WITHOUT a TouchArea → intercept nothing (the
+                // `tabs-wheel` wheel and clicks pass through). Fades toward
+                // `Theme.toolbar` (actual color behind) → theme-aware.
+                if root.can-scroll-left : Rectangle {
+                    x: 0;
+                    y: 0;
+                    width: 24px;
+                    height: parent.height;
+                    background: @linear-gradient(90deg,
+                        Theme.toolbar 0%, Theme.toolbar.with-alpha(0.0) 100%);
+                }
+                // RIGHT scroll cluster: OVERLAY within `tabs-area` (not
+                // in the row's layout) → does NOT affect `tabs-area.width`,
+                // hence no `tabs-overflow ↔ width` loop. Visible only on
+                // overflow. Fades toward `Theme.toolbar` on the left (dissolves the
+                // tabs) then an opaque zone under the 2 chevrons (legible). The
+                // chevrons carry their own TouchArea → clickable; the fade (to
+                // their left) lets wheel/clicks pass through.
+                if root.tabs-overflow : Rectangle {
+                    x: parent.width - self.width;
+                    y: 0;
+                    width: 62px;
+                    height: parent.height;
+                    background: @linear-gradient(90deg,
+                        Theme.toolbar.with-alpha(0.0) 0%,
+                        Theme.toolbar 22%,
+                        Theme.toolbar 100%);
+                    // Guard placed below the chevrons: it captures clicks and wheel
+                    // events over the whole area without forwarding them to the
+                    // tabs underneath. Declared before the chevrons, it leaves
+                    // them clickable on top.
+                    TouchArea {
+                        clicked => { root.activate(); root.close-ctx-menu(); }
+                        scroll-event(ev) => {
+                            if (root.overlay-open) { return accept; }
+                            if (ev.delta-y < 0 || ev.delta-x < 0) { root.tab-wheel(true); return accept; }
+                            if (ev.delta-y > 0 || ev.delta-x > 0) { root.tab-wheel(false); return accept; }
+                            return reject;
+                        }
+                    }
+                    HorizontalLayout {
+                        x: 10px;
+                        width: 50px;
+                        height: parent.height;
+                        spacing: 2px;
+                        TabScrollButton {
+                            icon: @image-url("../../assets/icons/chevron-left.svg");
+                            tooltip-text: Strings.tab-scroll-left;
+                            enabled: root.can-scroll-left;
+                            clicked => { root.activate(); root.close-ctx-menu(); root.tabs-scroll-left(); }
+                        }
+                        TabScrollButton {
+                            icon: @image-url("../../assets/icons/chevron-right.svg");
+                            tooltip-text: Strings.tab-scroll-right;
+                            enabled: root.can-scroll-right;
+                            clicked => { root.activate(); root.close-ctx-menu(); root.tabs-scroll-right(); }
+                        }
+                    }
+                }
+            }
+
+            // The scroll chevrons are overlaid within `tabs-area`, outside
+            // this layout, to avoid a width ↔ overflow dependency.
+
+            // "+" button outside the Flickable, hence always visible.
+            Rectangle {
+                width: 28px;
+                height: 26px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 5px;
+                background: new-touch.has-hover ? Theme.alternate-background : transparent;
+                Image {
+                    source: @image-url("../../assets/icons/plus.svg");
+                    width: 13px;
+                    height: 13px;
+                    colorize: Theme.foreground;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                new-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.activate(); root.close-ctx-menu(); root.tab-new(); }
+                    changed has-hover => {
+                        if (self.has-hover && Strings.tab-new-tooltip != "") {
+                            Tip.text = Strings.tab-new-tooltip;
+                            Tip.x = self.absolute-position.x;
+                            Tip.y = self.absolute-position.y + self.height + 4px;
+                        } else if (Tip.text == Strings.tab-new-tooltip) {
+                            Tip.text = "";
+                        }
+                    }
+                }
+            }
+
+            // The Split and Close-panel actions live in the
+            // navigation bar, at a stable location in all three modes.
+        }
+
+        // Keep one instance of each control while the header reflows. In
+        // particular, resizing must not recreate the address editor or grip.
+        nav-bar := Rectangle {
+            min-width: 0px;
+            preferred-width: 0px;
+            max-width: 99999px;
+            property <length> tools-width: 248px;
+            property <length> actions-width: root.can-close ? 74px : 22px;
+            property <bool> wrap-address: self.width < self.tools-width + 8px + 120px + self.actions-width;
+            property <bool> wrap-actions: self.width < 120px + 4px + self.actions-width;
+            property <int> tool-columns: clamp(floor((self.width + 4px) / 36px), 1, 7);
+            property <length> tools-height: ceil(7 / self.tool-columns) * 32px - 4px;
+            property <length> address-y: self.wrap-address ? self.tools-height + 6px : 0px;
+            property <length> address-x: self.wrap-address ? 0px : self.tools-width + 4px;
+            height: self.address-y + 28px + (self.wrap-actions ? 34px : 0px);
+
+            // Explicit placement keeps the available width independent of the
+            // buttons' minimum sizes, avoiding a width/layout feedback loop.
+            // A sized child outside a layout centers itself by default. Anchor
+            // both axes so the tools stay above or beside the address field.
+            nav-tools := Rectangle {
+                x: 0px;
+                y: 0px;
+                width: min(nav-bar.width, nav-bar.tool-columns * 36px - 4px);
+                height: nav-bar.tools-height;
+
+            NavIconButton {
+                x: 0px;
+                y: 0px;
+                enabled: root.view.can-go-back;
+                icon: @image-url("../../assets/icons/chevron-left.svg");
+                tooltip-text: Strings.nav-prev;
+                clicked => { root.cancel-address-edit(); root.activate(); root.go-back(); }
+            }
+            NavIconButton {
+                x: mod(1, nav-bar.tool-columns) * 36px;
+                y: floor(1 / nav-bar.tool-columns) * 32px;
+                enabled: root.view.can-go-forward;
+                icon: @image-url("../../assets/icons/chevron-right.svg");
+                tooltip-text: Strings.nav-next;
+                clicked => { root.cancel-address-edit(); root.activate(); root.go-forward(); }
+            }
+            NavIconButton {
+                x: mod(2, nav-bar.tool-columns) * 36px;
+                y: floor(2 / nav-bar.tool-columns) * 32px;
+                icon: @image-url("../../assets/icons/arrow-up.svg");
+                tooltip-text: Strings.nav-parent;
+                clicked => { root.cancel-address-edit(); root.activate(); root.go-parent(); }
+            }
+            NavIconButton {
+                x: mod(3, nav-bar.tool-columns) * 36px;
+                y: floor(3 / nav-bar.tool-columns) * 32px;
+                icon: @image-url("../../assets/icons/refresh.svg");
+                tooltip-text: Strings.nav-refresh;
+                clicked => { root.cancel-address-edit(); root.activate(); root.refresh(); }
+            }
+            // Arrangement and preview options share a compact display menu.
+            NavIconButton {
+                x: mod(4, nav-bar.tool-columns) * 36px;
+                y: floor(4 / nav-bar.tool-columns) * 32px;
+                icon: root.view.grid-mode
+                    ? @image-url("../../assets/icons/grid.svg")
+                    : @image-url("../../assets/icons/list.svg");
+                tooltip-text: Strings.view-mode-tooltip;
+                dismiss-bump: false;
+                clicked-at(mx, my) => {
+                    root.cancel-address-edit();
+                    root.activate();
+                    root.open-display-menu(mx, my);
+                }
+            }
+            // Shows / hides hidden files, per view. The icon
+            // reflects the CURRENT state: eye = hidden files shown; crossed-out eye = hidden.
+            NavIconButton {
+                x: mod(5, nav-bar.tool-columns) * 36px;
+                y: floor(5 / nav-bar.tool-columns) * 32px;
+                icon: root.view.show-hidden
+                    ? @image-url("../../assets/icons/eye.svg")
+                    : @image-url("../../assets/icons/eye-off.svg");
+                tooltip-text: Strings.show-hidden-tooltip;
+                clicked => { root.cancel-address-edit(); root.activate(); root.toggle-show-hidden(); }
+            }
+            // Tab bar position: 3-option dropdown menu
+            // (top / left / right). The icon reflects the current state via a
+            // radio-choice semantics, at the same location in all three modes.
+            NavIconButton {
+                x: mod(6, nav-bar.tool-columns) * 36px;
+                y: floor(6 / nav-bar.tool-columns) * 32px;
+                icon: root.tab-mode == 1
+                    ? @image-url("../../assets/icons/tabs-left.svg")
+                    : (root.tab-mode == 2
+                        ? @image-url("../../assets/icons/tabs-right.svg")
+                        : @image-url("../../assets/icons/tabs-top.svg"));
+                tooltip-text: Strings.tabbar-menu-tooltip;
+                dismiss-bump: false;   // opens a menu → don't auto-close it
+                // Position provided by the button's internal TouchArea via
+                // `clicked-at`, same as for tooltips. It thus shares the
+                // same reference frame as the pointer event.
+                clicked-at(mx, my) => {
+                    root.cancel-address-edit();
+                    root.close-ctx-menu();
+                    root.open-tabbar-menu(mx, my);
+                    root.activate();
+                }
+            }
+            }
+
+            // Path bar: two modes.
+            //  - Display (default): breadcrumb of clickable segments.
+            //    Clicking a segment → navigate-to(segment.path). Clicking the
+            //    empty area on the right → switches to edit mode.
+            //  - Edit: TextInput (type an arbitrary path). Enter
+            //    submits, Escape cancels. Usual file manager pattern (Ctrl+L to edit).
+            Rectangle {
+                x: nav-bar.address-x;
+                y: nav-bar.address-y;
+                width: max(0px, nav-bar.width - self.x
+                    - (nav-bar.wrap-actions ? 0px : nav-bar.actions-width + 4px));
+                height: 28px;
+                // Visual frame (background + rounded corners) WITHOUT clip: a clip with
+                // border-radius forces an offscreen layer rendered at a
+                // fractional size → VERY BLURRY URL bar. The clip is carried by
+                // the inner rectangular wrapper (scissor, crisp).
+                background: Theme.alternate-background;
+                border-radius: 4px;
+                border-width: root.path-edit-mode ? 1px : 0;
+                border-color: Theme.accent-background;
+
+                url-clip := Rectangle {
+                width: 100%;
+                height: 100%;
+                clip: true;
+
+                // --- DISPLAY mode: breadcrumbs ---
+                if !root.path-edit-mode : TouchArea {
+                    // Click on the empty area (not on a segment) → edit mode.
+                    clicked => {
+                        root.edit-address();
+                    }
+                    // Right-click → enters edit mode (pre-filled field) + Paste/Copy
+                    // menu, so "Paste" fills the field.
+                    pointer-event(ev) => {
+                        if (ev.kind == PointerEventKind.down
+                                && ev.button == PointerEventButton.right) {
+                            root.edit-address-menu(
+                                self.absolute-position.x + self.mouse-x,
+                                self.absolute-position.y + self.mouse-y);
+                        }
+                    }
+                    // The trail is kept END-aligned as soon as it overflows.
+                    // A view narrowed by its splitter then hides the start of
+                    // the path instead of its last segments — the folder being
+                    // looked at is what identifies the view, the drive it sits
+                    // on rarely is.
+                    crumbs-flick := Flickable {
+                        width: parent.width;
+                        height: parent.height;
+                        content-width: max(self.width, crumbs-row.preferred-width);
+                        content-height: self.height;
+                        interactive: false;
+                        // Zero while the trail fits, so a wide view keeps it
+                        // against the left edge exactly as before. Nothing else
+                        // writes this property, and `crumbs-row` never reads it,
+                        // so the binding cannot feed back into the layout that
+                        // produces it.
+                        content-x: min(0px, self.width - self.content-width);
+
+                        crumbs-row := HorizontalLayout {
+                            padding-left: 6px;
+                            padding-right: 6px;
+                            spacing: 0px;
+                            alignment: start;
+                            for crumb[ci] in root.view.crumbs : HorizontalLayout {
+                                spacing: 0px;
+                                // "›" separator between segments (not before the first).
+                                if ci > 0 : Rectangle {
+                                    width: 16px;
+                                    Image {
+                                        source: @image-url("../../assets/icons/chevron-right.svg");
+                                        width: 11px;
+                                        height: 11px;
+                                        x: (parent.width - self.width) / 2;
+                                        y: (parent.height - self.height) / 2;
+                                        colorize: Theme.foreground.with-alpha(0.4);
+                                    }
+                                    TouchArea {
+                                        // A separator is not a destination, so a
+                                        // left click on it opens the path for
+                                        // editing. Unlike every other way in, it
+                                        // selects nothing and leaves the caret at
+                                        // the end: clicking between two segments
+                                        // reads as carrying on from the current
+                                        // path, not as replacing it.
+                                        //
+                                        // It has to say so itself. This area
+                                        // exists for the right-click menu, and a
+                                        // TouchArea swallows every button it is
+                                        // given, so without a handler the click
+                                        // would not reach the catch-all behind
+                                        // the trail either.
+                                        clicked => {
+                                            root.edit-address-at-end();
+                                        }
+                                        pointer-event(ev) => {
+                                            if (ev.kind == PointerEventKind.down
+                                                    && ev.button == PointerEventButton.right) {
+                                                root.edit-address-menu(
+                                                    self.absolute-position.x + self.mouse-x,
+                                                    self.absolute-position.y + self.mouse-y);
+                                            }
+                                        }
+                                    }
+                                }
+                                crumb-rect := Rectangle {
+                                    height: parent.height;
+                                    border-radius: 3px;
+                                    background: crumb-touch.has-hover
+                                        ? Theme.accent-background.with-alpha(0.18)
+                                        : transparent;
+                                    HorizontalLayout {
+                                        padding-left: 5px;
+                                        padding-right: 5px;
+                                        Text {
+                                            text: crumb.label;
+                                            font-size: 12px;
+                                            color: Theme.foreground;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    crumb-touch := TouchArea {
+                                        clicked => {
+                                            root.activate();
+                                            root.close-ctx-menu();
+                                            root.navigate-to(crumb.path);
+                                        }
+                                        pointer-event(ev) => {
+                                            if (ev.kind == PointerEventKind.down
+                                                    && ev.button == PointerEventButton.right) {
+                                                root.edit-address-menu(
+                                                    self.absolute-position.x + self.mouse-x,
+                                                    self.absolute-position.y + self.mouse-y);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // --- EDIT mode: TextInput + "confirm" button on the right ---
+                if root.path-edit-mode : Rectangle {
+                    Timer {
+                        interval: 1ms;
+                        running: root.address-select-pending || root.address-caret-end-pending;
+                        triggered => {
+                            url-input.focus();
+                            if (root.address-select-pending) {
+                                url-input.select-all();
+                            } else {
+                                // Both offsets at the very end leaves a caret
+                                // and no selection. The offsets are counted in
+                                // bytes, which is why the length comes from
+                                // Rust and not from `character-count`.
+                                url-input.set-selection-offsets(
+                                    TextMetrics.byte-length(url-input.text),
+                                    TextMetrics.byte-length(url-input.text));
+                            }
+                            root.address-select-pending = false;
+                            root.address-caret-end-pending = false;
+                        }
+                    }
+                    // Right-click thread BEHIND the TextInput: the latter only
+                    // handles the left button (cursor/selection), so the
+                    // right-click falls through here → Paste/Copy menu.
+                    TouchArea {
+                        pointer-event(ev) => {
+                            if (ev.kind == PointerEventKind.down
+                                    && ev.button == PointerEventButton.right) {
+                                root.open-url-menu(
+                                    self.absolute-position.x + self.mouse-x,
+                                    self.absolute-position.y + self.mouse-y);
+                            }
+                        }
+                    }
+                    // The field is wider than its frame as soon as the path
+                    // overflows, so it lives in a viewport that follows the
+                    // caret. Without this, extending a selection past the
+                    // right edge selects text that stays invisible. The
+                    // rename field gets the same behaviour from `LineEdit`,
+                    // whose chrome would be out of place inside this bar.
+                    url-flick := Flickable {
+                        x: 8px;
+                        y: 0;
+                        // Leaves room for the confirm button (28px) on the right.
+                        width: parent.width - 8px - 30px;
+                        height: parent.height;
+                        // Dragging scrolls the text selection, never the
+                        // viewport: the caret alone drives it.
+                        interactive: false;
+                        content-width: max(self.width, url-input.preferred-width);
+                        content-height: self.height;
+                        url-input := EditTextInput {
+                            width: parent.content-width;
+                            height: parent.height;
+                            // Keeps the caret inside the frame. `content-x` is
+                            // negative or zero, so the caret sits on screen at
+                            // `cursor.x + content-x`.
+                            cursor-position-changed(cursor) => {
+                                if (cursor.x + url-flick.content-x < 0px) {
+                                    url-flick.content-x = -cursor.x;
+                                } else if (cursor.x + url-flick.content-x
+                                        > url-flick.width - 2px) {
+                                    url-flick.content-x =
+                                        url-flick.width - 2px - cursor.x;
+                                }
+                            }
+                            // Shared text (initialized to the current path on entering
+                            // edit mode; replaceable via "Paste").
+                            text <=> root.url-edit-text;
+                            font-size: 12px;
+                            color: Theme.foreground;
+                            single-line: true;
+                            vertical-alignment: center;
+                            selection-background-color: Theme.accent-background.with-alpha(0.5);
+                            selection-foreground-color: Theme.foreground;
+                            init => {
+                                self.copy-seen = root.url-copy-serial;
+                                self.paste-seen = root.url-paste-serial;
+                            }
+                            // "Copy" in the URL menu acts on the SELECTION, like
+                            // this field's own Ctrl+C — copying the whole path
+                            // whatever was highlighted made selecting part of it
+                            // pointless. Only the field knows its selection, and
+                            // the menu lives at window level, out of reach of it;
+                            // the menu therefore bumps a counter and the field
+                            // acts on it. Same broadcast idiom as `Dismiss`.
+                            //
+                            // The snapshot taken on entry keeps edit mode from
+                            // copying on its own: only a counter that moved after
+                            // the field became active is a request.
+                            property <int> copy-seen;
+                            property <int> copy-request: root.url-copy-serial;
+                            changed copy-request => {
+                                if (self.copy-request > self.copy-seen) {
+                                    self.copy-seen = self.copy-request;
+                                    self.copy();
+                                }
+                            }
+                            // Same reasoning for "Paste": handing the clipboard to
+                            // the field through its text replaced the whole line,
+                            // where the toolkit's own paste drops it at the caret
+                            // and replaces just the selection — what every text
+                            // field does, and what Ctrl+V here already did.
+                            property <int> paste-seen;
+                            property <int> paste-request: root.url-paste-serial;
+                            changed paste-request => {
+                                if (self.paste-request > self.paste-seen) {
+                                    self.paste-seen = self.paste-request;
+                                    self.paste();
+                                }
+                            }
+                            // Focus loss → exits edit mode without navigating
+                            // ("cancel on blur"). BUT not if the URL menu is
+                            // open (right-click → menu): we must stay in edit mode
+                            // so "Paste" fills the field.
+                            changed has-focus => {
+                                if (!self.has-focus && !root.url-menu-open) {
+                                    root.path-edit-mode = false;
+                                }
+                            }
+                            accepted => {
+                                root.path-edit-mode = false;
+                                root.activate();
+                                root.navigate-to(self.text);
+                                root.request-focus();
+                            }
+                            key-pressed(event) => {
+                                if (event.text == Key.Escape) {
+                                    root.path-edit-mode = false;
+                                    root.request-focus();
+                                    return accept;
+                                }
+                                // Shared editing shortcuts (see EditTextInput):
+                                // this field overrides `key-pressed`, so it must
+                                // call them explicitly.
+                                if (self.edit-shortcut(event)) { return accept; }
+                                return reject;
+                            }
+                        }
+                    }
+
+                    // "Confirm" button: applies the entered path and exits
+                    // edit mode (equivalent to Enter), clickable.
+                    Rectangle {
+                        width: 22px;
+                        height: 22px;
+                        x: parent.width - 26px;
+                        y: (parent.height - self.height) / 2;
+                        border-radius: 4px;
+                        background: validate-touch.has-hover
+                            ? Theme.accent-background
+                            : Theme.accent-background.with-alpha(0.85);
+                        Image {
+                            source: @image-url("../../assets/icons/check.svg");
+                            width: 13px;
+                            height: 13px;
+                            colorize: Theme.accent-foreground;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        validate-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.path-edit-mode = false;
+                                root.activate();
+                                root.close-ctx-menu();
+                                root.navigate-to(url-input.text);
+                                root.request-focus();
+                            }
+                        }
+                    }
+                    // A click on the editing field is consumed by TextInput.
+                    // While its context menu is open, the first click dismisses
+                    // the menu, as it does over the rest of the window.
+                    if root.url-menu-open : TouchArea {
+                        pointer-event(ev) => {
+                            if (ev.kind == PointerEventKind.down
+                                    && ev.button == PointerEventButton.left) {
+                                root.close-ctx-menu();
+                            } else if (ev.kind == PointerEventKind.down
+                                    && ev.button == PointerEventButton.right) {
+                                root.open-url-menu(
+                                    self.absolute-position.x + self.mouse-x,
+                                    self.absolute-position.y + self.mouse-y);
+                            }
+                        }
+                    }
+                }
+                } // closes url-clip (rectangular clip wrapper = crisp)
+            }
+
+            HorizontalLayout {
+                x: max(0px, nav-bar.width - nav-bar.actions-width);
+                y: nav-bar.address-y + (nav-bar.wrap-actions ? 34px : 0px);
+                width: nav-bar.actions-width;
+                height: 28px;
+                spacing: 4px;
+
+            // Grip: drag this whole view to exchange or rearrange its place.
+            // In the nav bar rather than in the empty part of the tab strip:
+            // that empty part vanishes the moment the tabs overflow
+            // (`tabs-overflow`), and a handle whose existence depends on the
+            // number of tabs is not a handle. Here it sits in the same place in
+            // all three tab bar modes.
+            //
+            // To the LEFT of the split token on purpose: overshooting a handle
+            // must land on a harmless button, never on the one that closes the
+            // view. Shown only when there is another view to swap with — the
+            // same condition the close button already uses.
+            if root.can-close : Rectangle {
+                width: 22px;
+                height: 22px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 4px;
+                background: grip-touch.has-hover
+                    ? Theme.accent-background.with-alpha(0.18)
+                    : transparent;
+                border-width: 1px;
+                border-color: grip-touch.has-hover
+                    ? Theme.accent-background.with-alpha(0.55)
+                    : Theme.border;
+                Image {
+                    source: @image-url("../../assets/icons/grip-horizontal.svg");
+                    width: 14px;
+                    height: 9px;
+                    colorize: Theme.foreground;
+                    // The three-step scale the sidebar section headers already
+                    // use, for the same icon and the same gesture.
+                    opacity: root.view-dragging ? 0.90
+                        : (grip-touch.has-hover ? 0.65 : 0.32);
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                grip-touch := TouchArea {
+                    mouse-cursor: root.view-dragging ? grabbing : grab;
+                    changed has-hover => {
+                        if (self.has-hover && !root.view-dragging) {
+                            Tip.text = Strings.panel-move-tooltip;
+                            Tip.x = self.absolute-position.x;
+                            Tip.y = self.absolute-position.y + self.height + 4px;
+                        } else if (Tip.text == Strings.panel-move-tooltip) {
+                            Tip.text = "";
+                        }
+                    }
+                    pointer-event(ev) => {
+                        if (ev.button == PointerEventButton.left
+                                && ev.kind == PointerEventKind.down) {
+                            root.cancel-address-edit();
+                            root.vd-x = self.absolute-position.x + self.mouse-x;
+                            root.vd-y = self.absolute-position.y + self.mouse-y;
+                            root.view-dragging = false;
+                        }
+                        if (ev.button == PointerEventButton.left
+                                && ev.kind == PointerEventKind.up
+                                && root.view-dragging) {
+                            root.view-dragging = false;
+                            root.view-drag-completed(
+                                self.absolute-position.x + self.mouse-x,
+                                self.absolute-position.y + self.mouse-y);
+                        }
+                    }
+                    moved => {
+                        // Threshold on BOTH axes, like the tab drag: a view can
+                        // be pulled straight down as readily as sideways.
+                        if (self.pressed && !root.view-dragging
+                                && (abs(self.absolute-position.x + self.mouse-x - root.vd-x) > 6px
+                                    || abs(self.absolute-position.y + self.mouse-y - root.vd-y) > 6px)) {
+                            root.view-dragging = true;
+                            Tip.text = "";
+                        }
+                        if (self.pressed && root.view-dragging) {
+                            root.view-drag-progress(
+                                self.absolute-position.x + self.mouse-x,
+                                self.absolute-position.y + self.mouse-y);
+                        }
+                    }
+                }
+            }
+
+            // Split token: opens the "Split" menu. Moved from the
+            // strip to the nav bar: a single location, stable across the
+            //    three tab bar modes. --
+            Rectangle {
+                width: 22px;
+                height: 22px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 4px;
+                background: split-touch.has-hover
+                    ? Theme.accent-background.with-alpha(0.18)
+                    : transparent;
+                border-width: 1px;
+                border-color: split-touch.has-hover
+                    ? Theme.accent-background.with-alpha(0.55)
+                    : Theme.border;
+                Image {
+                    source: @image-url("../../assets/icons/split.svg");
+                    width: 14px;
+                    height: 14px;
+                    colorize: Theme.foreground.with-alpha(split-touch.has-hover ? 1.0 : 0.7);
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                split-touch := TouchArea {
+                    mouse-cursor: pointer;
+                    changed has-hover => {
+                        if (self.has-hover) {
+                            Tip.text = Strings.panel-split-view;
+                            Tip.x = self.absolute-position.x;
+                            Tip.y = self.absolute-position.y + self.height + 4px;
+                        } else if (Tip.text == Strings.panel-split-view) {
+                            Tip.text = "";
+                        }
+                    }
+                    clicked => {
+                        root.cancel-address-edit();
+                        root.close-ctx-menu();
+                        // Capture the position + open the menu BEFORE activate()
+                        // (which may rebuild this panel, invalidating `self`).
+                        root.open-split-menu(
+                            self.absolute-position.x,
+                            self.absolute-position.y + self.height);
+                        root.activate();
+                    }
+                }
+            }
+
+            // -- "x" button to close this panel (visible if > 1 panel) --
+            if root.can-close : Rectangle {
+                width: 22px;
+                height: 22px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 4px;
+                background: close-panel-touch.has-hover ? Tokens.danger.with-alpha(0.27) : transparent;
+                border-width: 1px;
+                border-color: close-panel-touch.has-hover ? Tokens.danger.with-alpha(0.4) : Theme.border;
+                Image {
+                    source: @image-url("../../assets/icons/close.svg");
+                    width: 12px;
+                    height: 12px;
+                    colorize: close-panel-touch.has-hover ? Tokens.danger : Theme.foreground.with-alpha(0.7);
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                close-panel-touch := TouchArea {
+                    // Hover → "danger" preview across the whole panel (it will
+                    // close on click). `changed` because has-hover is not a
+                    // direct binding usable from the root.
+                    changed has-hover => { root.close-hover = self.has-hover; }
+                    clicked => { root.cancel-address-edit(); root.close-ctx-menu(); root.close-panel(); }
+                }
+            }
+            }
+        } // closes nav-bar
+            } // closes the toolbar's inner VerticalLayout
+        } // closes the toolbar (Theme.toolbar)
+
+        // ===== View filter bar — SHARED component =====
+        // By-NAME type-ahead filter: magnifying glass + the field, shown as soon
+        // as text is entered. Emptying the field closes it, and so does Escape
+        // (see key-scope).
+        if (root.view.search-recursive || (root.active && root.filter-text != "")) && !root.view.ext-filter-on && !root.view.manual-order : FilterBar {
+            icon: @image-url("../../assets/icons/search.svg");
+            text: root.view.search-recursive ? root.view.search-query : root.filter-text;
+            editable: root.active;
+            take-keyboard: root.filter-take-keyboard;
+            scope-available: true;
+            recursive: root.view.search-recursive;
+            scope-label: Strings.search-subfolders;
+            edited(value) => { root.filter-set(value); }
+            app-key(ev) => { return root.filter-key(ev); }
+            focused => { root.activate(); root.close-ctx-menu(); root.filter-focused(); }
+            toggle-scope => { root.activate(); root.close-ctx-menu(); root.search-scope-toggle(); }
+        }
+        // By-EXTENSION filter: funnel + the field (hint "jpg, png" if empty).
+        // Activated from the columns menu. Its "x" turns the mode off, which
+        // emptying the field does not, so this bar keeps one.
+        if root.view.ext-filter-on && !root.view.manual-order : FilterBar {
+            icon: @image-url("../../assets/icons/filter.svg");
+            text: root.view.ext-filter;
+            hint: Strings.ext-filter-placeholder;
+            editable: root.active;
+            dismissible: true;
+            take-keyboard: root.filter-take-keyboard;
+            edited(value) => { root.filter-set(value); }
+            app-key(ev) => { return root.filter-key(ev); }
+            focused => { root.activate(); root.close-ctx-menu(); root.filter-focused(); }
+            close => { root.ext-filter-toggle(); }
+        }
+
+        // ===== Flickable wrapper: headers + list scroll TOGETHER horizontally =====
+        // If the sum of column widths exceeds the available width,
+        // a custom scrollbar appears at the bottom of the panel (see below).
+        Rectangle {
+            vertical-stretch: 1;
+            preferred-width: 0px;
+            min-width: 0px;
+            max-width: 99999px;
+
+            // Actual row width: left gutter (`gutter-content`) +
+            // visible columns (`content-width`) + right padding. It must
+            // match the rows' and header's indents so the
+            // viewport doesn't add spurious horizontal overflow.
+            property <length> total-col-w:
+                root.view.content-width + Tokens.gutter-content + 8px;
+            // A 6px threshold absorbs residual rounding and spacing to
+            // avoid a scrollbar almost as wide as the viewport.
+            property <bool> needs-hscroll: !root.view.grid-mode && total-col-w > self.width + 6px;
+
+            flickable := Flickable {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: parent.height - (parent.needs-hscroll ? 10px : 0px);
+                content-width: root.view.grid-mode ? self.width : max(self.width, parent.total-col-w);
+                content-height: self.height;
+                // `interactive: false`: otherwise the Flickable captures the
+                // drags and the rubber-band no longer receives anything. Horizontal
+                // scrolling happens via the custom scrollbar at the bottom + via
+                // shift+wheel within the list.
+                interactive: false;
+
+                VerticalLayout {
+                    spacing: 2px;
+
+                    // === Column header (inside the Flickable
+                    //     to scroll along with the rows) ===
+                    // "Pro table" look: no filled rounded chip, just
+                    // a flat header topping a thin hairline.
+                    Rectangle {
+                        background: transparent;
+                        height: root.header-height;
+                        clip: root.view.grid-mode;
+                        // Thin hairline separating header / list.
+                        Rectangle {
+                            y: parent.height - 1px;
+                            height: 1px;
+                            background: Tokens.hairline;
+                        }
+                        if root.view.manual-order : Rectangle {
+                            x: Tokens.gutter-content;
+                            y: 2px;
+                            width: manual-mode-row.preferred-width + 14px;
+                            height: 20px;
+                            border-radius: 5px;
+                            background: Theme.accent-background.with-alpha(0.14);
+                            border-width: 1px;
+                            border-color: Theme.accent-background.with-alpha(0.45);
+                            manual-mode-row := HorizontalLayout {
+                                padding-left: 7px;
+                                padding-right: 7px;
+                                Text {
+                                    text: Strings.manual-order-label;
+                                    font-size: 10px;
+                                    font-weight: 600;
+                                    color: Theme.accent-background;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                        if root.view.grid-mode : HorizontalLayout {
+                            y: root.header-titles-y;
+                            height: 30px;
+                            padding-left: Tokens.gutter-content;
+                            padding-right: 12px;
+                            spacing: 4px;
+                            Rectangle {
+                                min-width: 0px;
+                                horizontal-stretch: 1;
+                                ColumnHeader {
+                                    column-width: parent.width;
+                                    label: root.view.sort-column == "path" ? Strings.col-path
+                                        : root.view.sort-column == "size" ? Strings.col-size
+                                        : root.view.sort-column == "modified" ? Strings.col-modified
+                                        : root.view.sort-column == "created" ? Strings.col-created
+                                        : root.view.sort-column == "age" ? Strings.col-age
+                                        : root.view.sort-column == "ext" ? Strings.col-ext
+                                        : Strings.col-name;
+                                    active: !root.view.manual-order;
+                                    asc: root.view.sort-asc;
+                                    resizable: false;
+                                    reorderable: false;
+                                    clicked => {
+                                        root.activate();
+                                        if (!root.view.manual-order) { root.sort-clicked(root.view.sort-column); }
+                                    }
+                                    right-clicked(mx, my) => { root.activate(); root.open-columns-menu(mx, my); }
+                                }
+                            }
+                            NavIconButton {
+                                icon: @image-url("../../assets/icons/filter.svg");
+                                tooltip-text: Strings.view-sort-tooltip;
+                                enabled: !root.view.manual-order;
+                                dismiss-bump: false;
+                                clicked-at(mx, my) => { root.activate(); root.open-sort-menu(mx, my); }
+                            }
+                        }
+                        if !root.view.grid-mode : HorizontalLayout {
+                            y: root.header-titles-y;
+                            height: 30px;
+                            // Aligned with the rows' content (see FileItemView).
+                            padding-left: Tokens.gutter-content;
+                            padding-right: 8px;
+                            spacing: Tokens.col-gap;
+                            alignment: start;
+
+                            // Headers rendered dynamically based on their order and
+                            // visibility. The width is resolved via `width-of`, then
+                            // applied via `set-col-width` and persisted.
+                            for col[ci] in root.view.columns : ColumnHeader {
+                                column-width: root.width-of(col.id);
+                                label: col.label;
+                                column-id: col.id;
+                                active: !root.view.manual-order && root.view.sort-column == col.id;
+                                asc: root.view.sort-asc;
+                                index: ci;
+                                count: root.view.columns.length;
+                                offset: col.offset;
+                                col-drag-active: root.col-drag-active;
+                                col-drag-new-center: root.col-drag-center + root.col-drag-delta;
+                                col-drop-idx: root.col-drop-idx;
+                                clicked => {
+                                    root.activate();
+                                    if (!root.view.manual-order) { root.sort-clicked(col.id); }
+                                }
+                                resized(w) => { root.set-col-width(col.id, w); }
+                                resize-finished => { root.column-resized(col.id, root.width-of(col.id)); }
+                                right-clicked(x, y) => { root.activate(); root.open-columns-menu(x, y); }
+                                reorder-start(center) => {
+                                    root.col-drag-active = true;
+                                    root.col-drag-id = col.id;
+                                    root.col-drag-center = center;
+                                    root.col-drag-delta = 0px;
+                                    root.col-drop-idx = -1;
+                                }
+                                reorder-move(delta) => { root.col-drag-delta = delta; }
+                                report-drop-target(t) => { root.col-drop-idx = t; }
+                                reorder-end(delta) => {
+                                    if (root.col-drag-active && root.col-drag-id != "") {
+                                        root.column-moved(root.col-drag-id, delta / 1px);
+                                    }
+                                    root.col-drag-active = false;
+                                    root.col-drag-id = "";
+                                    root.col-drag-delta = 0px;
+                                    root.col-drop-idx = -1;
+                                }
+                            }
+                        }
+                    }
+
+                    // === List + empty area + rubber-band overlay ===
+                    list-area := Rectangle {
+            vertical-stretch: 1;
+            preferred-width: 0px;
+            min-width: 0px;
+            max-width: 99999px;
+            // Confines the selection rectangle (and the rows) to the list
+            // area: without this, a negative rubber-band `y` would make it overflow
+            // OVER the column header (list-area draws afterward).
+            clip: true;
+
+            // Vertical Flickable with EXACT content. The standard `ListView` estimates
+            // its anchor via the delegates' average height, which is not
+            // compatible with a mix of 28/76/… px. `rendered-rows` stays a
+            // sub-model bounded to the viewport + overscan: virtualization is
+            // preserved without ever approximating the geometry.
+            rows-scroll := Flickable {
+                width: parent.width;
+                height: parent.height;
+                content-width: self.width;
+                content-height: max(self.height, root.rows-content-height);
+                interactive: false;
+                changed content-y => {
+                    if (!root.zoom-adjusting) {
+                        root.report-rows-viewport();
+                        root.update-drag-hover-row();
+                        root.update-pointer-hover();
+                    }
+                }
+                for entry[visible-idx] in root.view.rendered-rows : FileItemView {
+                    // Only grid placement needs a rectangle. In list mode, keep
+                    // width independent of the vertical bands and read them from
+                    // the delegate instead of looking up the full model again.
+                    property <ItemRect> grid-rect: root.view.grid-mode
+                        ? root.grid-item-rect(root.item-grid, entry.model-index)
+                        : { left: 0px, top: 0px, width: 0px, height: 0px };
+                    x: root.view.grid-mode ? self.grid-rect.left : 0px;
+                    y: root.view.grid-mode ? self.grid-rect.top : entry.visual-y;
+                    width: root.view.grid-mode ? self.grid-rect.width : rows-scroll.width;
+                    grid-mode: root.view.grid-mode;
+                    name: entry.name;
+                    name-base: entry.name-base;
+                    name-ext: entry.name-ext;
+                    hidden: entry.hidden;
+                    age: entry.age;
+                    age-bucket: entry.age-bucket;
+                    path: entry.path;
+                    size: entry.size;
+                    modified: entry.modified;
+                    created: entry.created;
+                    is-dir: entry.is-dir;
+                    is-symlink: entry.is-symlink;
+                    is-share: entry.is-share;
+                    folder-slot: entry.folder-slot;
+                    comment: entry.comment;
+                    kind: entry.kind;
+                    selected: entry.selected;
+                    cut: entry.cut;
+                    // A drag target receives the same hover as mouse
+                    // hover, including from another Favnyr view/instance.
+                    hovered: entry.model-index == root.hovered-idx
+                        || (root.file-drag-over && root.manual-drop-gap < 0
+                            && entry.model-index == root.drag-hover-row
+                            && (entry.is-dir || entry.drop-runnable));
+                    preview-mode: root.view.preview-mode;
+                    row-h: root.view.grid-mode ? self.grid-rect.height : entry.visual-h;
+                    item-spacing: root.view-item-spacing;
+                    resolution: entry.resolution;
+                    depth: entry.depth;
+                    ext: entry.ext;
+                    thumbnail: entry.thumbnail;
+                    app-icon: entry.app-icon;
+                    link-folder: entry.link-folder;
+                    text-font-size-override: root.view-text-font-size-override;
+                    text-font-size: root.view-text-font-size;
+                    col-name-width: root.col-name-width;
+                    col-path-width: root.col-path-width;
+                    col-size-width: root.col-size-width;
+                    col-modified-width: root.col-modified-width;
+                    col-created-width: root.col-created-width;
+                    col-ext-width: root.col-ext-width;
+                    col-resolution-width: root.col-resolution-width;
+                    col-depth-width: root.col-depth-width;
+                    col-age-width: root.col-age-width;
+                    content-width: root.view.content-width;
+                    columns: root.view.columns;
+                }
+            }
+
+            // Same insertion vocabulary as Favorites: a thin accent line at
+            // the exact gap that will receive the selected block.
+            if root.manual-drop-gap >= 0 && !root.view.grid-mode : Rectangle {
+                x: Tokens.gutter-content;
+                y: max(0px, min(
+                    list-area.height - 2px,
+                    (root.manual-drop-gap < root.view.rows.length
+                        ? root.view.rows[root.manual-drop-gap].visual-y
+                        : root.rows-content-height) + rows-scroll.content-y - 1px));
+                width: min(root.view.content-width, list-area.width - Tokens.gutter-content);
+                height: 2px;
+                border-radius: 1px;
+                background: Theme.accent-background;
+            }
+            if root.manual-drop-gap >= 0 && root.view.grid-mode : Rectangle {
+                property <int> item-index: min(root.manual-drop-gap, root.view.rows.length - 1);
+                property <ItemRect> item-box: root.item-rect(self.item-index);
+                x: self.item-box.left + (root.manual-drop-gap == root.view.rows.length
+                    ? self.item-box.width + root.item-grid.gap / 2 : -root.item-grid.gap / 2);
+                y: self.item-box.top + rows-scroll.content-y;
+                width: 2px;
+                height: self.item-box.height;
+                border-radius: 1px;
+                background: Theme.accent-background;
+            }
+
+            // "Folder not found" banner: inaccessible folder (network
+            // drive not started, missing mount). We KEEP the tab + this message
+            // PERSISTENT; it disappears on its own once the folder becomes
+            // accessible again (automatic recheck, see `recheck-unavailable`).
+            if root.view.unavailable : Rectangle {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: parent.height;
+                background: Theme.background;
+                // LEFT-ALIGNED block — on a narrow/cramped view, a
+                // centered warning can "fall" outside the visible area or get
+                // clipped; anchored on the left, it always stays legible. Centered
+                // vertically only.
+                VerticalLayout {
+                    alignment: center;              // centers the block VERTICALLY
+                    spacing: 7px;
+                    padding-left: 22px;
+                    padding-right: 22px;
+                    padding-top: 24px;
+                    padding-bottom: 24px;
+                    // Icon wrapped in a LEFT-aligned HorizontalLayout: a
+                    // fixed-size Image is NOT stretched by the VerticalLayout.
+                    HorizontalLayout {
+                        alignment: start;
+                        Image {
+                            source: @image-url("../../assets/icons/network.svg");
+                            width: 24px;
+                            height: 24px;
+                            colorize: Tokens.danger;
+                        }
+                    }
+                    Text {
+                        text: Strings.tab-unavailable;
+                        font-size: 14px;
+                        font-weight: 700;
+                        color: Theme.foreground;
+                        horizontal-alignment: left;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: root.view.current-path;
+                        font-size: 12px;
+                        color: Theme.foreground.with-alpha(0.65);
+                        horizontal-alignment: left;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: Strings.tab-unavailable-hint;
+                        font-size: 11px;
+                        color: Theme.foreground.with-alpha(0.5);
+                        horizontal-alignment: left;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            // SINGLE, STABLE TouchArea above the viewport: handles hover,
+            // clicks (single / Ctrl / Shift / right / double) and rubber-band, by
+            // resolving the item through the shared content point hit-test.
+            // Since it is never virtualized, mouse-up is always received
+            // → the rubber-band ends cleanly even after auto-scroll.
+            sel-touch := TouchArea {
+                // This TouchArea covers the viewport to handle clicks, hover, and
+                // the selection rectangle without depending on virtualized rows.
+                // It reserves 14px on the right for the native scrollbar in case of
+                // overflow, and keeps x=0 to keep local coordinates
+                // aligned. `gutter-strip` covers the inset outside the clip.
+                x: 0;
+                y: 0;
+                width: rows-scroll.content-height > rows-scroll.height
+                    ? parent.width - 14px
+                    : parent.width;
+                height: parent.height;
+
+                property <length> down-x;
+                property <length> down-y;
+                property <bool> dragging: false;
+                // Was the press on a ROW (≥ gutter) → file drag;
+                // otherwise (dead zone) → selection rectangle.
+                property <bool> down-on-row: false;
+                property <int> down-idx: -1;
+                // Was the entry already selected AT THE TIME of the new
+                // press? This is the signature of Explorer's slow second click.
+                property <bool> down-was-selected: false;
+                // A click that primarily serves to ACTIVATE another view must never
+                // count as the slow second click of an Explorer rename.
+                property <bool> down-view-was-active: false;
+                // Same lock for a click that primarily serves to CLOSE a
+                // backdrop-less context menu. On release the menu is already closed,
+                // so its state must be stored BEFORE `close-ctx-menu()`.
+                property <bool> down-overlay-was-open: false;
+                // Modifiers stored on press (source: pointer event)
+                // → rubber-band mode robust to a keyboard focus loss.
+                property <bool> down-ctrl: false;
+                property <bool> down-shift: false;
+                property <bool> file-drag: false;
+                // A selection rectangle closed by something other than the
+                // release that drew it (an overlay taking the pointer). The
+                // release still arrives here and must then extend nothing.
+                property <bool> rb-cancelled: false;
+                // Did the gesture that just ended drag? `dragging` is reset when
+                // the release is handled, so it cannot answer for a backend that
+                // reports the double-click afterwards. This one is only re-armed
+                // by the NEXT press, which makes the answer valid whichever of
+                // the two arrives first.
+                property <bool> last-gesture-dragged: false;
+                // Rename candidate armed on release of the second click. The
+                // delay gives priority to a double-click; path + index make
+                // the check robust to a re-list/re-sort during the wait.
+                property <bool> rename-pending: false;
+                property <int> rename-candidate-idx: -1;
+                property <string> rename-candidate-dir: "";
+                property <string> rename-candidate-name: "";
+                property <int> rename-candidate-tab: -1;
+                property <int> rename-candidate-activation: -1;
+                // An activation (double-click) consumes the whole click sequence
+                // that produced it. The counter, captured on pointer-down, makes the
+                // decision independent of the backend's `double-clicked`/pointer-up
+                // ordering and of any reentrancy during ShellExecute.
+                property <int> activation-generation: 0;
+                property <int> activation-at-down: 0;
+                // Also prevents a fast third click from accidentally becoming
+                // a "slow second click" right after launching an entry.
+                property <bool> activation-cooldown: false;
+
+                function cancel-rename-candidate() {
+                    self.rename-pending = false;
+                    self.rename-candidate-idx = -1;
+                    self.rename-candidate-activation = -1;
+                }
+                // Folder/tab change, overlay, active panel, keystroke, or
+                // click in the chrome: all invalidate the candidate's context.
+                property <string> dir-watch: root.view.current-path;
+                property <int> tab-watch: root.view.active-tab-idx;
+                property <int> dismiss-serial: Dismiss.serial;
+                // The click that brings the window back to the front is what
+                // the window manager asked for, not a second click on an entry.
+                // The view already refuses to read a click as a rename when it
+                // primarily served to activate another VIEW; a window that was
+                // not in front deserves exactly the same, and gets the same
+                // guard rather than a second one.
+                property <int> window-activations: WindowFocus.activations;
+                property <int> keyboard-serial: root.keyboard-interaction-gen;
+                property <bool> overlay-watch: root.overlay-open;
+                property <bool> active-watch: root.active;
+                changed dir-watch => { self.cancel-rename-candidate(); }
+                changed tab-watch => { self.cancel-rename-candidate(); }
+                changed dismiss-serial => { self.cancel-rename-candidate(); }
+                changed window-activations => {
+                    self.cancel-rename-candidate();
+                    self.activation-cooldown = true;
+                    rename-activation-cooldown-timer.restart();
+                }
+                changed keyboard-serial => { self.cancel-rename-candidate(); }
+                changed overlay-watch => {
+                    if (self.overlay-watch) {
+                        self.cancel-rename-candidate();
+                        // An overlay takes the pointer, so the left release that
+                        // would have ended a selection rectangle may never reach
+                        // this area. The rectangle is closed here, keeping what it
+                        // had already selected. This covers the context menu
+                        // opened with the left button still held down, and every
+                        // other popup that can appear mid-gesture.
+                        if (root.rb-active) {
+                            root.rb-active = false;
+                            self.rb-cancelled = true;
+                        }
+                        // A column being reordered is cut the same way. It lives
+                        // in this panel rather than in the window, so the window's
+                        // own cancel does not reach it; the header follows this
+                        // flag going down and stops looking carried.
+                        if (root.col-drag-active) {
+                            root.col-drag-active = false;
+                            root.col-drag-id = "";
+                            root.col-drop-idx = -1;
+                        }
+                        // And the middle-click auto-scroll, which ends on the
+                        // middle button coming up: lose that release and the
+                        // view scrolls on its own with nothing to stop it.
+                        root.mid-scroll-active = false;
+                    }
+                }
+                changed active-watch => {
+                    if (!self.active-watch) { self.cancel-rename-candidate(); }
+                }
+                // This gesture is over even though the button may still be
+                // down, so whatever is left of it is ignored until the NEXT
+                // press. Two ways in: the drag was externalized (native OLE),
+                // whose modal loop swallows the release, or it was cut short by
+                // a menu taking the pointer. Both would otherwise leave a
+                // "phantom" drag, or turn a stale release into a click.
+                property <bool> gesture-done: false;
+
+                // The window can cut the drag from under this area: a menu
+                // opening mid-gesture, Escape, or the handover to a native
+                // drag. The local gesture ends with it — otherwise a release
+                // that did arrive would still be read as a drop, and the same
+                // gesture would keep drawing a rectangle it no longer owns.
+                property <bool> fd-watch: root.file-drag-active;
+                changed fd-watch => {
+                    if (!self.fd-watch && self.file-drag) {
+                        self.dragging = false;
+                        self.file-drag = false;
+                        self.gesture-done = true;
+                    }
+                }
+
+                // Ctrl+wheel zooms entries; Shift+wheel scrolls horizontally.
+                // Otherwise the wheel scrolls normally
+                // (the viewport sits under this TouchArea, which captures the events).
+                scroll-event(ev) => {
+                    // The row under a stationary pointer changes during a scroll:
+                    // a deferred rename must never target the old entry.
+                    self.cancel-rename-candidate();
+                    // During a FILE DRAG: the wheel ALWAYS SCROLLS the
+                    // hovered view (never zooms, even with Ctrl+drag) → reach an
+                    // off-screen folder without releasing the drag. This branch
+                    // precedes the overlay gate because the drag is itself part of
+                    // `any-overlay-open`.
+                    if (root.file-drag-active) {
+                        if (root.file-drag-over) {
+                            root.scroll-rows(ev.delta-x, ev.delta-y, ev.modifiers.shift);
+                        }
+                        return accept;
+                    }
+                    // A modal overlay is open → we consume the wheel event without
+                    // doing anything: the view must not scroll/zoom under the popup.
+                    if (root.overlay-open) {
+                        return accept;
+                    }
+                    // Ctrl+wheel = zoom. We read the modifier CARRIED BY
+                    // THE EVENT (`ev.modifiers.control`), the AUTHORITATIVE
+                    // keyboard state maintained by Slint's core, rather than
+                    // `root.ctrl-down`: the latter is only up to date if
+                    // `key-scope` has keyboard focus. Since an element can take it
+                    // away (hover/click elsewhere), `ctrl-down` used to stay stuck
+                    // at false → Ctrl+wheel stopped zooming and scrolled instead.
+                    if (ev.modifiers.control && ev.delta-y != 0) {
+                        root.activate();
+                        root.zoom-adjusting = true;
+                        let anchored-top: length = root.zoom-step(
+                            ev.delta-y > 0 ? 1 : -1,
+                            max(0px, -rows-scroll.content-y),
+                            rows-scroll.width,
+                            rows-scroll.height,
+                            self.mouse-x,
+                            self.mouse-y);
+                        // The callback is synchronous: the rows' geometry is
+                        // already the new one. Re-applying the anchor AFTER this relayout
+                        // prevents an absolute scroll value from targeting other
+                        // files when the heights change.
+                        rows-scroll.content-y = clamp(
+                            -anchored-top, root.rb-min-vy, 0px);
+                        root.zoom-adjusting = false;
+                        // Intermediate notifications were coalesced:
+                        // a single final publish drives virtualization,
+                        // thumbnail priority, drag-hover, and mouse hover.
+                        root.report-rows-viewport();
+                        root.update-drag-hover-row();
+                        root.update-pointer-hover();
+                        root.zoom-feedback(self.absolute-position.x + self.mouse-x,
+                            self.absolute-position.y + self.mouse-y);
+                        return accept;
+                    }
+                    root.scroll-rows(ev.delta-x, ev.delta-y, ev.modifiers.shift);
+                    return accept;
+                }
+
+                moved => {
+                    // Externalized drag (native OLE): we ignore any movement
+                    // until the next press — otherwise `self.pressed` staying true
+                    // (release consumed by the modal loop) would restart a
+                    // phantom drag.
+                    if (self.gesture-done) { return; }
+                    if (self.file-drag && self.dragging && !root.file-drag-active) {
+                        self.gesture-done = true;
+                        self.dragging = false;
+                        self.file-drag = false;
+                        return;
+                    }
+                    if (self.pressed) {
+                        if (!self.dragging
+                                && (abs(self.mouse-x - self.down-x) > 4px
+                                    || abs(self.mouse-y - self.down-y) > 4px)) {
+                            self.cancel-rename-candidate();
+                            self.dragging = true;
+                            if (self.down-on-row) {
+                                // Press on a file/folder → cross-view drag.
+                                self.file-drag = true;
+                                root.file-drag-started(self.down-idx,
+                                    self.absolute-position.x + self.mouse-x,
+                                    self.absolute-position.y + self.mouse-y);
+                            } else {
+                                // Dead zone → selection rectangle. Mode based on the
+                                // modifier: Ctrl = subtract, Shift = add,
+                                // otherwise replace. The bridge captures the base;
+                                // no more `deselect-all` here (the 1st UPDATE handles it
+                                // in replace mode).
+                                self.file-drag = false;
+                                root.rb-active = true;
+                                root.rubber-band-begin(self.down-ctrl ? 2 : (self.down-shift ? 1 : 0));
+                                root.rb-anchor-x = self.down-x;
+                                root.rb-anchor-cy = self.down-y - rows-scroll.content-y;
+                            }
+                        }
+                        if (self.dragging && self.file-drag) {
+                            root.file-drag-progress(
+                                self.absolute-position.x + self.mouse-x,
+                                self.absolute-position.y + self.mouse-y);
+                        } else if (self.dragging) {
+                            root.rb-cur-x = self.mouse-x;
+                            root.rb-cur-vy = self.mouse-y;
+                            root.rubber-band-update(
+                                min(root.rb-anchor-x, root.rb-cur-x),
+                                min(root.rb-anchor-cy, root.rb-cur-cy),
+                                max(root.rb-anchor-x, root.rb-cur-x),
+                                max(root.rb-anchor-cy, root.rb-cur-cy),
+                            );
+                        }
+                    }
+                    // NB: `moved` fires ONLY during a press (drag);
+                    // plain hover is handled by `changed mouse-y` below.
+                }
+
+                // Hover (no press): `mouse-y`/`mouse-x` update as the
+                // cursor moves → we highlight the row under the pointer.
+                // The left gutter (`Tokens.gutter`) is a dead zone: no
+                // hover (consistent with click/right-click, which also ignore it).
+                // `mouse-x` is handled in addition to `mouse-y` to cover a
+                // purely horizontal movement entering/exiting the gutter.
+                // (Not during middle-click auto-scroll, to avoid flickering.)
+                changed mouse-y => {
+                    if (!self.pressed && !root.mid-scroll-active) {
+                        let hover: int = root.item-index-at(self.mouse-x, self.mouse-y);
+                        root.hovered-idx = hover;
+                        if (self.rename-pending && hover != self.rename-candidate-idx) {
+                            self.cancel-rename-candidate();
+                        }
+                    }
+                }
+                changed mouse-x => {
+                    // Horizontal middle-click auto-scroll: stores the position
+                    // in the FIXED reference `mouse-x + content-x` at this instant (where
+                    // mouse-x is consistent with the geometry) → the Timer reads it without
+                    // drift. Otherwise, row hover (horizontal movement).
+                    if (root.mid-scroll-active) {
+                        root.mid-cur-fx = self.mouse-x + flickable.content-x;
+                    } else if (!self.pressed) {
+                        let hover: int = root.item-index-at(self.mouse-x, self.mouse-y);
+                        root.hovered-idx = hover;
+                        if (self.rename-pending && hover != self.rename-candidate-idx) {
+                            self.cancel-rename-candidate();
+                        }
+                    }
+                }
+
+                changed has-hover => {
+                    if (!self.has-hover) {
+                        self.cancel-rename-candidate();
+                        root.hovered-idx = -1;
+                        // Safety: if the cursor leaves the area (e.g. button
+                        // released outside), we cut the middle-click auto-scroll.
+                        root.mid-scroll-active = false;
+                    }
+                }
+
+                pointer-event(ev) => {
+                    root.pointer-modifiers(ev.modifiers.control, ev.modifiers.shift);
+                    // Any new interaction cancels a previous candidate.
+                    // The current left click may arm a new one on up.
+                    if (ev.kind == PointerEventKind.down) {
+                        self.cancel-rename-candidate();
+                    }
+                    // SIDE mouse buttons (X1/X2) = Back / Forward
+                    // in the panel's history, like Windows Explorer.
+                    if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.back) {
+                        root.activate();
+                        root.go-back();
+                    }
+                    if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.forward) {
+                        root.activate();
+                        root.go-forward();
+                    }
+                    if (ev.kind == PointerEventKind.down
+                            && ev.button == PointerEventButton.left) {
+                        // Modifiers stored from the EVENT (authoritative
+                        // source, up to date even if `key-scope` doesn't have
+                        // keyboard focus). The rubber-band mode captured a
+                        // moment later in `moved` relies on this rather
+                        // than `root.ctrl-down`/`shift-down` (which can be
+                        // stuck after a focus loss).
+                        self.down-ctrl = ev.modifiers.control;
+                        self.down-shift = ev.modifiers.shift;
+                        // Captured BEFORE `activate()`: after the call, `root.active`
+                        // would already be true and the information would be lost.
+                        self.down-view-was-active = root.active;
+                        // Captured BEFORE `close-ctx-menu()` to distinguish a real
+                        // second click from a click meant to dismiss the menu.
+                        self.down-overlay-was-open = root.overlay-open;
+                        root.activate();
+                        // A left click closes the context menu (and still goes on
+                        // to select the row on release).
+                        root.close-ctx-menu();
+                        self.down-x = self.mouse-x;
+                        self.down-y = self.mouse-y;
+                        self.dragging = false;
+                        self.file-drag = false;
+                        self.rb-cancelled = false;  // new press → re-arm
+                        self.last-gesture-dragged = false;
+                        self.gesture-done = false;  // new press → re-arm
+                        self.activation-at-down = self.activation-generation;
+                        // Is the press on a row (outside the gutter)?
+                        self.down-idx = root.item-index-at(self.mouse-x, self.mouse-y);
+                        self.down-on-row = self.down-idx >= 0;
+                        self.down-was-selected = self.down-idx >= 0
+                            && self.down-idx < root.view.rows.length
+                            && root.view.rows[self.down-idx].selected;
+                    }
+                    if (ev.kind == PointerEventKind.up
+                            && ev.button == PointerEventButton.left) {
+                        // The rectangle dies with the button that drew it,
+                        // whichever branch below claims this release. Closing it
+                        // inside the drag branch alone left it frozen on screen
+                        // whenever another branch took the release first — and a
+                        // rectangle still drawn once the mouse is up is the one
+                        // outcome the user has no way to undo.
+                        let rb-was-live: bool = root.rb-active && !self.rb-cancelled;
+                        root.rb-active = false;
+                        if (self.gesture-done) {
+                            // The gesture was ended elsewhere — handed to a
+                            // native drag, or cut short by a menu taking the
+                            // pointer. Its release selects nothing: reading it
+                            // as a click would move the selection under the very
+                            // menu the user just opened.
+                        } else if (self.activation-at-down != self.activation-generation) {
+                            // End of a sequence consumed by `double-clicked`:
+                            // does not select the entry that appeared under the mouse
+                            // after a navigation, and never arms the rename.
+                        } else if (self.dragging && self.file-drag) {
+                            // End of a file drag → MainWindow decides
+                            // (drop menu if ANOTHER view is under the cursor).
+                            root.file-drag-dropped(
+                                self.absolute-position.x + self.mouse-x,
+                                self.absolute-position.y + self.mouse-y);
+                            self.file-drag = false;
+                        } else if (self.dragging) {
+                            if (rb-was-live) {
+                                // FINAL update at the RELEASE position before
+                                // closing: a fast drag often releases between two
+                                // coalesced `moved` events → the band was only extended
+                                // up to the last `moved`, leaving the last
+                                // swept rows out of the selection.
+                                root.rb-cur-x = self.mouse-x;
+                                root.rb-cur-vy = self.mouse-y;
+                                root.rubber-band-update(
+                                    min(root.rb-anchor-x, root.rb-cur-x),
+                                    min(root.rb-anchor-cy, root.rb-cur-cy),
+                                    max(root.rb-anchor-x, root.rb-cur-x),
+                                    max(root.rb-anchor-cy, root.rb-cur-cy),
+                                );
+                            }
+                            // A rectangle already cancelled extends nothing. The
+                            // branch is still taken so the release cannot fall
+                            // through to the click handling below, which would
+                            // discard the very selection the rectangle just made.
+                        } else {
+                            // Left gutter AND right dead zone (beyond the
+                            // columns) are NOT entry click zones: a
+                            // left click there deselects (blank area).
+                            let idx: int = root.item-index-at(self.mouse-x, self.mouse-y);
+                            if (idx < 0) {
+                                root.deselect-all();
+                            } else if (ev.modifiers.control) {
+                                root.row-ctrl-clicked(idx);
+                            } else if (ev.modifiers.shift) {
+                                root.row-shift-clicked(idx);
+                            } else {
+                                // The callback reports whether this row was
+                                // ALREADY the entire selection. A click that
+                                // collapses a multiple selection onto one entry
+                                // is the user DROPPING the others, not asking to
+                                // rename what they kept — and on the clicked row
+                                // alone the two are indistinguishable, since it
+                                // was selected before and after.
+                                let was-sole-selection: bool = root.row-clicked(idx);
+                                // A first click selects. Only a following click
+                                // on this already-selected entry arms the popup.
+                                // The Timer will still check hover, identity, and state.
+                                if (!self.activation-cooldown
+                                        && self.down-view-was-active
+                                        && !self.down-overlay-was-open
+                                        && was-sole-selection
+                                        && self.down-was-selected && idx == self.down-idx) {
+                                    self.rename-candidate-idx = idx;
+                                    self.rename-candidate-dir = root.view.current-path;
+                                    self.rename-candidate-name = root.view.rows[idx].name;
+                                    self.rename-candidate-tab = root.view.active-tab-idx;
+                                    self.rename-candidate-activation = self.activation-generation;
+                                    self.rename-pending = true;
+                                }
+                            }
+                        }
+                        self.last-gesture-dragged = self.dragging;
+                        self.dragging = false;
+                        root.request-focus();
+                    }
+                    // Middle-click held down → auto-scroll (origin = press
+                    // position). Release (any button) → stop.
+                    if (ev.kind == PointerEventKind.down
+                            && ev.button == PointerEventButton.middle) {
+                        root.activate();
+                        root.mid-origin-y = self.mouse-y;
+                        root.mid-origin-fx = self.mouse-x + flickable.content-x;
+                        root.mid-cur-fx = root.mid-origin-fx;
+                        root.mid-scroll-active = true;
+                    }
+                    if (ev.kind == PointerEventKind.up
+                            && ev.button == PointerEventButton.middle) {
+                        root.mid-scroll-active = false;
+                    }
+                    if (ev.kind == PointerEventKind.down
+                            && ev.button == PointerEventButton.right) {
+                        root.activate();
+                        // Right-click in the left gutter OR the right dead zone
+                        // = background menu (Paste…) even if a row is there.
+                        let ridx: int = root.item-index-at(self.mouse-x, self.mouse-y);
+                        if (ridx < 0) {
+                            root.empty-right-clicked(
+                                self.absolute-position.x + self.mouse-x,
+                                self.absolute-position.y + self.mouse-y);
+                        } else {
+                            root.right-clicked(
+                                ridx,
+                                self.absolute-position.x + self.mouse-x,
+                                self.absolute-position.y + self.mouse-y);
+                        }
+                    }
+                }
+
+                double-clicked => {
+                    // An entry opens on a double-click only when the second click
+                    // was a plain click. A gesture that dragged is a selection
+                    // rectangle: two of them drawn quickly across the same row are
+                    // a coincidence of position, not a request to open it. Checked
+                    // before the counter below moves, so the release still ends the
+                    // rectangle through its normal branch.
+                    if (self.dragging || self.last-gesture-dragged) { return; }
+                    // Double-click keeps its opening semantics and always
+                    // wins over the slow second-click. Incrementing BEFORE the
+                    // application-level call also invalidates a Timer already queued if
+                    // opening the file causes a focus loss or re-enters the
+                    // native event loop.
+                    self.cancel-rename-candidate();
+                    self.activation-generation += 1;
+                    self.activation-cooldown = true;
+                    rename-activation-cooldown-timer.restart();
+                    // Respects the dead zones (gutter / beyond the columns).
+                    let idx: int = root.item-index-at(self.mouse-x, self.mouse-y);
+                    if (idx >= 0) {
+                        root.activate();
+                        root.row-activated(idx);
+                    } else if (self.mouse-x < Tokens.gutter) {
+                        // A double-click in the GUTTER selects everything, like
+                        // Ctrl+A. Deliberately not the other two dead regions a
+                        // single click uses to deselect: past the last column,
+                        // and below the last row. That last one covers most of
+                        // the view in a sparse folder, so landing in it by
+                        // accident and selecting every entry is a nuisance the
+                        // user did not ask for. The gutter is a narrow strip
+                        // nobody crosses without meaning to.
+                        //
+                        // Same `mouse-x` the hover hit test uses, so the same
+                        // frame: the gutter belongs to the scrolling content
+                        // and slides out of reach when the view is scrolled
+                        // right, exactly as the rest of the row does.
+                        //
+                        // `activate` first, because the selection callback acts
+                        // on the ACTIVE view.
+                        root.activate();
+                        root.select-all();
+                    }
+                }
+            }
+
+            // Explorer-style rename: after the second click, wait a bit
+            // and only open if the pointer is still targeting EXACTLY the same
+            // entry. F2 and the context menu still use the same route.
+            rename-delay-timer := Timer {
+                interval: 500ms;
+                // IMPORTANT: the Timer's lifecycle must be driven by
+                // reactive state. A `running: false` + `restart()` gets canceled
+                // by the next Slint re-evaluation and makes the nominal case
+                // inoperative. `cancel-rename-candidate()` is enough to stop it.
+                running: sel-touch.rename-pending;
+                triggered => {
+                    // `stop()` normally cancels the event. The explicit check
+                    // additionally guards against a callback already queued during
+                    // an external application activation.
+                    let was-pending: bool = sel-touch.rename-pending;
+                    let idx: int = sel-touch.rename-candidate-idx;
+                    let activation: int = sel-touch.rename-candidate-activation;
+                    sel-touch.cancel-rename-candidate();
+                    if (was-pending
+                            && activation == sel-touch.activation-generation
+                            && root.active && !root.overlay-open && !root.file-drag-active
+                            && idx >= 0 && idx < root.view.rows.length
+                            && root.view.current-path == sel-touch.rename-candidate-dir
+                            && root.view.active-tab-idx == sel-touch.rename-candidate-tab
+                            && root.hovered-idx == idx
+                            && root.view.rows[idx].selected
+                            && root.view.rows[idx].name == sel-touch.rename-candidate-name) {
+                        root.rename-selected();
+                    }
+                }
+            }
+
+            rename-activation-cooldown-timer := Timer {
+                interval: 500ms;
+                // Same principle: the guard always returns to false after the
+                // delay, even if the activation modified the model or focus.
+                running: sel-touch.activation-cooldown;
+                triggered => { sel-touch.activation-cooldown = false; }
+            }
+
+            if root.rb-active : Rectangle {
+                // Converts the rectangle (in content coords) back to visible.
+                x: min(root.rb-anchor-x, root.rb-cur-x);
+                y: min(root.rb-anchor-cy, root.rb-cur-cy) + rows-scroll.content-y;
+                width: abs(root.rb-cur-x - root.rb-anchor-x);
+                height: abs(root.rb-cur-cy - root.rb-anchor-cy);
+                background: Theme.accent-background.with-alpha(0.15);
+                border-width: 1px;
+                border-color: Theme.accent-background.with-alpha(0.55);
+            }
+
+            // Automatic scroll when the rectangle reaches an edge.
+            // As long as the rubber-band is active and the mouse is within the
+            // edge zone, we scroll the viewport; since `rb-cur-cy` is reactive to
+            // scroll, the selection extends on its own to the revealed rows.
+            Timer {
+                interval: 16ms;
+                running: root.rb-active;
+                triggered => {
+                    if (root.rb-cur-vy < 24px && rows-scroll.content-y < 0px) {
+                        rows-scroll.content-y = min(0px, rows-scroll.content-y + 18px);
+                        root.rubber-band-update(
+                            min(root.rb-anchor-x, root.rb-cur-x),
+                            min(root.rb-anchor-cy, root.rb-cur-cy),
+                            max(root.rb-anchor-x, root.rb-cur-x),
+                            max(root.rb-anchor-cy, root.rb-cur-cy),
+                        );
+                    } else if (root.rb-cur-vy > list-area.height - 24px
+                            && rows-scroll.content-y > root.rb-min-vy) {
+                        rows-scroll.content-y = max(root.rb-min-vy, rows-scroll.content-y - 18px);
+                        root.rubber-band-update(
+                            min(root.rb-anchor-x, root.rb-cur-x),
+                            min(root.rb-anchor-cy, root.rb-cur-cy),
+                            max(root.rb-anchor-x, root.rb-cur-x),
+                            max(root.rb-anchor-cy, root.rb-cur-cy),
+                        );
+                    }
+                }
+            }
+
+            // Auto-scroll during a FILE DRAG when the cursor nears the top/bottom
+            // edge of the body → reaches an off-screen folder; `drag-folder-row`
+            // follows the scroll, so the target updates on its own. Active only on
+            // the hovered panel. `list-area` is the unscrolled body frame, so
+            // `file-drag-abs-y - list-area.y` is the in-body offset the edges use.
+            DragEdgeScroller {
+                active: root.file-drag-active && root.file-drag-over;
+                cursor-y: root.file-drag-abs-y;
+                frame-y: list-area.absolute-position.y;
+                frame-h: list-area.height;
+                min-vy: root.rb-min-vy;
+                content-y <=> rows-scroll.content-y;
+            }
+
+            // Auto-scroll on middle-click held down (browser/PDF style):
+            // as long as the middle button is held, we scroll at a speed
+            // proportional to the gap between the mouse and the press point
+            // (10px dead zone to stay still near the origin). The
+            // two axes are independent → diagonal scrolling is possible.
+            Timer {
+                interval: 16ms;
+                running: root.mid-scroll-active;
+                triggered => {
+                    let dead: length = 10px;
+                    // --- Vertical (exact Flickable content-y) ---
+                    if (rows-scroll.content-height > rows-scroll.height) {
+                        let d: length = sel-touch.mouse-y - root.mid-origin-y;
+                        let eff: length = d > dead ? d - dead : (d < -dead ? d + dead : 0px);
+                        rows-scroll.content-y = clamp(
+                            rows-scroll.content-y - eff / 6, root.rb-min-vy, 0px);
+                    }
+                    // Horizontal (Flickable content-x) — FIXED reference ---
+                    if (flickable.content-width > flickable.width) {
+                        let dx: length = root.mid-cur-fx - root.mid-origin-fx;
+                        let effx: length = dx > dead ? dx - dead : (dx < -dead ? dx + dead : 0px);
+                        flickable.content-x = clamp(
+                            flickable.content-x - effx / 6,
+                            -(flickable.content-width - flickable.width), 0px);
+                    }
+                }
+            }
+        }
+                } // closes the VerticalLayout inside the Flickable
+            } // closes Flickable
+
+            // ===== Custom horizontal scrollbar (visible on overflow) =====
+            if needs-hscroll : hscrollbar := Rectangle {
+                x: 0;
+                y: parent.height - 7px;
+                width: parent.width;
+                height: 5px;
+                // TRANSPARENT track (no more background band): discreet, can
+                // no longer read as a dark line.
+                background: transparent;
+                border-radius: 2.5px;
+
+                property <length> thumb-w:
+                    max(30px, self.width * flickable.width / max(1px, flickable.content-width));
+
+                // Thumb: position driven by the Flickable's content-x.
+                Rectangle {
+                    x: -flickable.content-x
+                        / max(1px, flickable.content-width - flickable.width)
+                        * (hscrollbar.width - hscrollbar.thumb-w);
+                    y: 0;
+                    width: hscrollbar.thumb-w;
+                    height: parent.height;
+                    // Dimmed (0.22 at rest, formerly 0.4) → light indicator, not a
+                    // dark bar; crisp accent on hover/drag.
+                    background: thumb-touch.has-hover || thumb-touch.pressed
+                        ? Theme.accent-background.with-alpha(0.7)
+                        : Theme.foreground.with-alpha(0.22);
+                    border-radius: parent.border-radius;
+
+                    property <length> drag-start-x;
+                    property <length> drag-start-content-x;
+                    thumb-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        pointer-event(ev) => {
+                            if (ev.button == PointerEventButton.left
+                                    && ev.kind == PointerEventKind.down) {
+                                root.close-ctx-menu();
+                                parent.drag-start-x = self.absolute-position.x + self.mouse-x;
+                                parent.drag-start-content-x = flickable.content-x;
+                            }
+                        }
+                        moved => {
+                            if (self.pressed) {
+                                flickable.content-x = parent.drag-start-content-x
+                                    - (self.absolute-position.x + self.mouse-x - parent.drag-start-x)
+                                        / max(1px, hscrollbar.width - hscrollbar.thumb-w)
+                                        * (flickable.content-width - flickable.width);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ===== Custom VERTICAL scrollbar (visible on vertical overflow) =====
+            // Pinned to the RIGHT edge of the VIEW (not the content) → ALWAYS visible,
+            // even when the columns overflow horizontally. Same
+            // style/logic as the
+            // custom horizontal scrollbar.
+            if root.rb-min-vy < 0px : vscrollbar := Rectangle {
+                x: parent.width - 7px;
+                // Below the header band, whatever its height: in manual order
+                // it carries a pill above the column titles and is taller.
+                y: root.header-height + root.header-gap;
+                width: 5px;
+                // Stops above the hscrollbar.
+                height: flickable.height - root.header-height - root.header-gap;
+                background: transparent;
+                border-radius: 2.5px;
+
+                property <length> thumb-h:
+                    max(30px, self.height * rows-scroll.height / max(1px, rows-scroll.content-height));
+
+                Rectangle {
+                    x: 0;
+                    // Position driven by content-y (∈ [rb-min-vy, 0]).
+                    y: -rows-scroll.content-y
+                        / max(1px, rows-scroll.content-height - rows-scroll.height)
+                        * (vscrollbar.height - vscrollbar.thumb-h);
+                    width: parent.width;
+                    height: vscrollbar.thumb-h;
+                    background: vthumb-touch.has-hover || vthumb-touch.pressed
+                        ? Theme.accent-background.with-alpha(0.7)
+                        : Theme.foreground.with-alpha(0.22);
+                    border-radius: parent.border-radius;
+
+                    property <length> drag-start-y;
+                    property <length> drag-start-content-y;
+                    vthumb-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        pointer-event(ev) => {
+                            if (ev.button == PointerEventButton.left
+                                    && ev.kind == PointerEventKind.down) {
+                                root.close-ctx-menu();
+                                parent.drag-start-y = self.absolute-position.y + self.mouse-y;
+                                parent.drag-start-content-y = rows-scroll.content-y;
+                            }
+                        }
+                        moved => {
+                            if (self.pressed) {
+                                rows-scroll.content-y = clamp(
+                                    parent.drag-start-content-y
+                                        - (self.absolute-position.y + self.mouse-y - parent.drag-start-y)
+                                            / max(1px, vscrollbar.height - vscrollbar.thumb-h)
+                                            * (rows-scroll.content-height - rows-scroll.height),
+                                    root.rb-min-vy, 0px);
+                            }
+                        }
+                    }
+                }
+            }
+        } // closes the wrapper Rectangle (Flickable + scrollbar)
+
+        // ===== Footer =====
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+            height: 18px;
+            Text {
+                text: root.footer-text;
+                font-size: 11px;
+                color: Theme.foreground.with-alpha(0.6);
+            }
+        }
+    }
+
+        vbar-right := VTabBar {
+            width: root.tab-mode == 2 ? root.vbar-w : 0px;
+            visible: root.tab-mode == 2;
+            on-left: false;
+            tabs: root.view.tabs;
+            active-tab-idx: root.view.active-tab-idx;
+            overlay-open: root.overlay-open;
+            tab-drag-active: root.drag-active;
+            new-tab-tooltip: Strings.tab-new-tooltip;
+            show-tooltip: root.tab-tooltip-enabled;
+            reorder-here: root.tab-mode == 2 && root.drag-active
+                && root.drag-over && root.drag-in-bar;
+            reorder-cur: root.drag-abs-y - root.vtabs-col-y - self.vp-y;
+            cursor-in-bar-y: root.drag-abs-y - root.vtabs-col-y;
+            preview-idx: root.tab-mode == 2 ? root.drag-preview-idx : -1;
+            preview-pos: root.tab-drop-x;
+            claim-drop(g, gy) => { root.report-tab-drop(g, gy); }
+            tab-clicked(i) => { root.activate(); root.tab-clicked(i); }
+            tab-closed(i) => { root.activate(); root.tab-closed(i); }
+            tab-context(i, x, y) => { root.activate(); root.tab-context(i, x, y); }
+            tab-drag-progress(i, ax, ay) => { root.tab-drag-progress(i, ax, ay); }
+            tab-drag-completed(i, ax, ay) => {
+                root.tab-drag-completed(i, root.drag-preview-idx, ax, ay);
+            }
+            tab-new => { root.activate(); root.close-ctx-menu(); root.tab-new(); }
+            bar-clicked => { root.activate(); root.close-ctx-menu(); }
+            bar-context(x, y) => { root.activate(); root.tab-bar-context(x, y); }
+            wheel(fwd) => { root.tab-wheel(fwd); }
+            scrolled(vy) => { root.tabs-scrolled(vy); }
+            scroll-target(ti, fwd, vp, vw) => {
+                return root.scroll-target(ti, fwd, vp, vw);
+            }
+            // Resize (bar on the RIGHT): width = bar's right edge
+            // (panel + width − padding 7) − mouse.
+            grip-moved(ax) => {
+                root.vbar-live-w = root.absolute-position.x + root.width - 7px - ax;
+            }
+            grip-done => { root.vbar-resized(root.vbar-w); }
+        }
+    } // closes the root row [left bar · content · right bar]
+
+    // ===== Left gutter: draggable strip =====
+    // The `body-left` inset is VISUALLY part of the gutter, but no
+    // TouchArea in the body can cover it: `list-area` has `clip: true` and the
+    // Flickable also clips — and a clip bounds the HIT-TEST just as much as the rendering.
+    // (Trying to extend `sel-touch` toward negative x's therefore fails, and on
+    // top of that shifts all its local coordinates.) We place here, as the last child of
+    // content-clip — so above the root row and `activate-bg`, but
+    // BELOW the panel's overlays (context menu, drop targets) — a
+    // strip that drives the SAME rubber-band: same `rb-*` properties, same
+    // callbacks, same auto-scroll (the Timer only reads root properties).
+    // Coordinates converted into `list-area`'s frame (`x - body-left`, hence
+    // always negative): consistent with `item-index-at`, which sees it as a dead
+    // zone there. Zero width when the LEFT vertical tab bar is
+    // displayed: that space then belongs to it.
+    gutter-strip := TouchArea {
+        x: 0;
+        y: root.body-top;
+        width: root.tab-mode == 1 ? 0px : root.list-inset-x;
+        height: list-area.height;
+
+        property <length> down-x;   // list-area position (negative)
+        property <length> down-y;
+        property <bool> dragging;
+        // Modifiers stored on press (event = authoritative source) →
+        // rubber-band mode robust to a keyboard focus loss.
+        property <bool> down-ctrl: false;
+        property <bool> down-shift: false;
+        // Set by `double-clicked`, which Slint emits BEFORE the second
+        // release. Without it that release would deselect everything the
+        // double-click just selected. `sel-touch` solves the same problem
+        // with its activation counter; this strip only needs the one bit.
+        property <bool> taken-by-double: false;
+
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down
+                    && ev.button == PointerEventButton.left) {
+                root.activate();
+                root.close-ctx-menu();
+                self.down-x = self.mouse-x - root.list-inset-x;
+                self.down-y = self.mouse-y;
+                self.down-ctrl = ev.modifiers.control;
+                self.down-shift = ev.modifiers.shift;
+                self.dragging = false;
+                self.taken-by-double = false;
+            }
+            if (ev.kind == PointerEventKind.up
+                    && ev.button == PointerEventButton.left) {
+                if (self.dragging) {
+                    root.rb-active = false;   // clean end of the rubber-band
+                } else if (!self.taken-by-double) {
+                    // Plain click on the blank area → deselection, like the
+                    // inner gutter (see `sel-touch`).
+                    root.deselect-all();
+                }
+                self.dragging = false;
+            }
+        }
+
+        // Same gesture as the inner gutter: this strip is the outer half of
+        // the very same left margin, and just as narrow, so a double-click
+        // here selects everything too. The large blank area below the last
+        // row is excluded on both sides (see `sel-touch`).
+        double-clicked => {
+            if (self.dragging) {
+                return;
+            }
+            self.taken-by-double = true;
+            root.activate();
+            root.select-all();
+        }
+
+        moved => {
+            if (self.pressed) {
+                if (!self.dragging
+                        && (abs(self.mouse-x - root.list-inset-x - self.down-x) > 4px
+                            || abs(self.mouse-y - self.down-y) > 4px)) {
+                    self.dragging = true;
+                    root.rb-active = true;
+                    root.rubber-band-begin(self.down-ctrl ? 2 : (self.down-shift ? 1 : 0));
+                    root.rb-anchor-x = self.down-x;
+                    root.rb-anchor-cy = self.down-y - rows-scroll.content-y;
+                }
+                if (self.dragging) {
+                    root.rb-cur-x = self.mouse-x - root.list-inset-x;
+                    root.rb-cur-vy = self.mouse-y;
+                    root.rubber-band-update(
+                        min(root.rb-anchor-x, root.rb-cur-x),
+                        min(root.rb-anchor-cy, root.rb-cur-cy),
+                        max(root.rb-anchor-x, root.rb-cur-x),
+                        max(root.rb-anchor-cy, root.rb-cur-cy),
+                    );
+                }
+            }
+        }
+    }
+    } // closes content-clip (rectangular clip wrapper = crisp)
+
+    // Draw the outline above the clipped header and body. Keep it outside the
+    // rounded content tree so no offscreen layer or input overlay is needed.
+    Rectangle {
+        background: transparent;
+        border-width: root.outline-width;
+        border-color: root.outline-color;
+        border-radius: Tokens.radius-panel;
+    }
+
+    // ===== File drop target =====
+    // Veil + accent outline on the hovered view during a file drag
+    // (except the source view). Purely visual (no TouchArea).
+    if root.file-drag-over && !root.is-file-drag-source : Rectangle {
+        background: Theme.accent-background.with-alpha(0.10);
+        border-width: 2px;
+        border-color: Theme.accent-background;
+        border-radius: Tokens.radius-panel;
+    }
+
+    // ===== Close / merge previews =====
+    // (A) Hovering the "x" → RED veil (explicit close = destruction).
+    if root.close-hover : Rectangle {
+        background: Tokens.danger.with-alpha(0.10);
+    }
+    // (B) Dragging the last tab → NEUTRAL grey veil (absorption, not danger).
+    // The content is additionally faded to 55% (see the VerticalLayout's opacity).
+    if root.leaving : Rectangle {
+        background: Theme.foreground.with-alpha(0.05);
+    }
+    // (C) Swap: both views of the pair carry the SAME mark, at the same
+    // instant. Two scales of one signal — the veil carries far, and is what
+    // makes the far end of the pair noticed across the screen; the inner filet
+    // says the verb up close.
+    //
+    // A filet was chosen over a fill because it is one pixel whatever the
+    // tile's area: the two members of a pair weigh the same to the eye even
+    // when their sizes do not. And the accent outline alone could not carry
+    // the message — the view being carried is almost always the ACTIVE one,
+    // which already wears it.
+    //
+    // Nothing fades here. Fading to 55% is the word for "this view dissolves",
+    // which is true of an absorption and false of a swap: nothing is lost, it
+    // comes back elsewhere.
+    //
+    // These two are NOT conditional, unlike the veils above: they fade rather
+    // than cut, and an element that comes and goes cannot fade. The colour
+    // itself is animated, so no layer is forced on the subtree. At rest both
+    // are fully transparent.
+    Rectangle {
+        background: root.swap-lit
+            ? Theme.accent-background.with-alpha(0.08)
+            : Theme.accent-background.with-alpha(0.0);
+        animate background { duration: 110ms; easing: ease-out; }
+    }
+    // Inset by 3px, so the filet runs on the bare surface ring that
+    // `Tokens.panel-pad` leaves all around the content: no listing, no
+    // thumbnail, however colourful, ever reaches it.
+    Rectangle {
+        x: 3px;
+        y: 3px;
+        width: parent.width - 6px;
+        height: parent.height - 6px;
+        background: transparent;
+        border-width: 1px;
+        border-color: root.swap-lit
+            ? Theme.accent-background.with-alpha(0.45)
+            : Theme.accent-background.with-alpha(0.0);
+        border-radius: Tokens.radius-panel - 3px;
+        animate border-color { duration: 110ms; easing: ease-out; }
+    }
+
+    // ===== Drop zone overlay =====
+    // During a tab or whole-view drag, show the candidate zone:
+    // the accent plate occupies the half the new panel would take (or
+    // the whole panel in the center = move), + an oriented cut line.
+    // Only one zone visible at a time (by design): only the panel under the
+    // cursor has `drag-over`. Purely visual (no TouchArea → intercepts
+    // nothing; the drag stays driven by the tab).
+    // No plate when the tab insertion line is active (header):
+    // strip → insertion line; body → zone plate. Clean separation.
+    if root.drop-preview-zone > 0 : Rectangle {
+        // Candidate plate.
+        Rectangle {
+            x: root.drop-preview-zone == 3 ? root.width / 2 : 0px;
+            y: root.drop-preview-zone == 5 ? root.height / 2 : 0px;
+            width: (root.drop-preview-zone == 2 || root.drop-preview-zone == 3) ? root.width / 2 : root.width;
+            height: (root.drop-preview-zone == 4 || root.drop-preview-zone == 5) ? root.height / 2 : root.height;
+            background: Theme.accent-background.with-alpha(0.16);
+            border-width: 2px;
+            border-color: Theme.accent-background.with-alpha(0.9);
+            border-radius: Tokens.radius-overlay;
+        }
+        // Cut line — vertical (side by side) or horizontal (stacked).
+        if root.drop-preview-zone == 2 || root.drop-preview-zone == 3 : Rectangle {
+            x: root.width / 2 - 1px;
+            width: 2px;
+            height: root.height;
+            background: Theme.accent-background;
+        }
+        if root.drop-preview-zone == 4 || root.drop-preview-zone == 5 : Rectangle {
+            y: root.height / 2 - 1px;
+            width: root.width;
+            height: 2px;
+            background: Theme.accent-background;
+        }
+    }
+
+    // Visual guide only: the drag source retains pointer capture. Instances exist
+    // solely in the hovered view, with no per-file or idle pointer bindings.
+    if root.drop-guide-zone > 0 : Rectangle {
+        x: root.body-left;
+        y: root.body-top;
+        width: max(0px, root.body-right - root.body-left);
+        height: max(0px, root.height - root.body-top);
+        for zone in [1, 2, 3, 4, 5] : Rectangle {
+            property <bool> chosen: root.drop-guide-zone == zone;
+            visible: zone == 1 || root.view-drag-over || root.drag-panel-split-edges;
+            width: min(32px, parent.width * 0.14, parent.height * 0.14);
+            height: self.width;
+            x: parent.width * (zone == 2 ? 0.2 : zone == 3 ? 0.8 : 0.5) - self.width / 2;
+            y: parent.height * (zone == 4 ? 0.2 : zone == 5 ? 0.8 : 0.5) - self.height / 2;
+            border-radius: 6px;
+            background: Theme.background.with-alpha(self.chosen ? 0.92 : 0.7);
+            border-width: 1px;
+            border-color: Theme.accent-background.with-alpha(self.chosen ? 0.85 : 0.25);
+            Image {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: parent.width * 0.65;
+                height: self.width;
+                source: zone == 1 ? (root.view-drag-over
+                        ? @image-url("../../assets/icons/swap.svg")
+                        : (root.tab-drag-active ? @image-url("../../assets/icons/move.svg")
+                            : @image-url("../../assets/icons/folder.svg")))
+                    : zone == 2 ? @image-url("../../assets/icons/arrow-left.svg")
+                    : zone == 3 ? @image-url("../../assets/icons/arrow-right.svg")
+                    : zone == 4 ? @image-url("../../assets/icons/arrow-up.svg")
+                    : @image-url("../../assets/icons/arrow-down.svg");
+                colorize: Theme.accent-background.with-alpha(parent.chosen ? 0.95 : 0.45);
+            }
+        }
+    }
+}

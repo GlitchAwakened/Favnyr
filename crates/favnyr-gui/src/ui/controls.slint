@@ -1,0 +1,646 @@
+// Small reusable controls: text fields with explicit editing shortcuts, icon
+// and text buttons, the modal backdrop, drag auto-scroll and the progress toast.
+
+import { LineEdit } from "widgets.slint";
+import { Dismiss, KeyAdapter, Tip } from "globals.slint";
+import { Theme, Tokens } from "theme.slint";
+
+export component NavIconButton inherits Rectangle {
+    callback clicked();
+    /// Variant with position: (button x, y BELOW the button + 4px), in
+    /// absolute coordinates read by the INTERNAL TouchArea — the same reliable
+    /// path used for tooltip positioning (`Tip`). Used by buttons that
+    /// OPEN a menu anchored below them. Emitted in addition to `clicked`.
+    callback clicked-at(length, length);
+    in property <string> glyph;
+    in property <image> icon;
+    in property <string> tooltip-text;
+    in property <bool> enabled: true;
+    in property <bool> selected: false;
+    /// Unicode glyph size (ignored if `icon` is set).
+    in property <length> glyph-size: 18px;
+    /// false = does NOT increment the global Dismiss counter on click. REQUIRED for
+    /// a button that OPENS a menu: MainWindow's (deferred) `changed dismiss-watch`
+    /// would otherwise close the menu right AFTER it opens — the same
+    /// reason the split token never bumped Dismiss.
+    in property <bool> dismiss-bump: true;
+
+    width: 32px;
+    height: 28px;
+    border-radius: 6px;
+    background: root.selected ? Theme.accent-background.with-alpha(0.3) : touch.has-hover && root.enabled
+        ? Theme.alternate-background
+        : transparent;
+    opacity: root.enabled ? 1.0 : 0.35;
+
+    if root.icon.width > 0 : Image {
+        source: root.icon;
+        width: 16px;
+        height: 16px;
+        colorize: Theme.foreground;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    if root.icon.width == 0 : Text {
+        text: root.glyph;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        font-size: root.glyph-size;
+        color: Theme.foreground;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            if (root.dismiss-bump) { Dismiss.serial += 1; }
+            root.clicked-at(
+                self.absolute-position.x,
+                self.absolute-position.y + root.height + 4px);
+            root.clicked();
+        }
+        // Tooltip below the button (URL bar on top). Sets/clears the global Tip.
+        changed has-hover => {
+            if (self.has-hover && root.tooltip-text != "") {
+                Tip.text = root.tooltip-text;
+                Tip.x = self.absolute-position.x;
+                Tip.y = self.absolute-position.y + root.height + 4px;
+            } else if (Tip.text == root.tooltip-text) {
+                Tip.text = "";
+            }
+        }
+    }
+}
+
+// Text field with EDITING shortcuts wired explicitly.
+//
+// Slint normally handles Ctrl+A/C/X/V in its `TextInput`… but only if
+// the backend delivers the LETTER (`text == "a"`): its shortcut resolution
+// only compares letters, and an earlier check rejects CONTROL characters
+// before even getting there. Depending on the keyboard layer, Ctrl+A can arrive
+// as `"\u{1}"` (SOH) rather than `"a"` — the editing shortcuts then become
+// silently inert, including in our popups.
+//
+// `TextInput` calls this `key-pressed` callback BEFORE its own handling: we
+// therefore cover both encodings, once and for all, for every
+// field (this component is used in place of `LineEdit`).
+export component EditTextInput inherits TextInput {
+    /// Applies Ctrl+A/C/X/V and returns `true` if the key was consumed.
+    /// Public: fields that already have their own `key-pressed` (Escape…)
+    /// call it instead of duplicating the logic.
+    public function edit-shortcut(ev: KeyEvent) -> bool {
+        if (ev.modifiers.control && !ev.modifiers.alt && !ev.modifiers.meta
+                && !ev.modifiers.shift) {
+            let k = KeyAdapter.normalize-key(ev.text);
+            if (k == "A" || ev.text == "\u{1}") {
+                self.select-all();
+                return true;
+            }
+            if (k == "C" || ev.text == "\u{3}") {
+                self.copy();
+                return true;
+            }
+            // Cut/paste make no sense on a read-only field.
+            if (!self.read-only && (k == "X" || ev.text == "\u{18}")) {
+                self.cut();
+                return true;
+            }
+            if (!self.read-only && (k == "V" || ev.text == "\u{16}")) {
+                self.paste();
+                return true;
+            }
+        }
+        return false;
+    }
+    key-pressed(ev) => {
+        return self.edit-shortcut(ev) ? accept : reject;
+    }
+}
+
+export component EditLineEdit inherits LineEdit {
+    /// A field standing in front of a list keeps only what editing text
+    /// needs and offers every other combination to the application, which
+    /// resolves it through the shortcut catalogue. Opt-in: a field in a
+    /// dialog owns its whole keyboard and leaves this off.
+    in property <bool> list-behind: false;
+    /// A key the field declined. `true` = the application took it.
+    callback app-key(KeyEvent) -> bool;
+
+    /// Does this key belong to the field rather than to whatever is behind?
+    /// Cut, copy and paste are answered before this and are not listed: on a
+    /// focused field they mean the text, as they do everywhere else.
+    pure function claims-key(ev: KeyEvent) -> bool {
+        if (ev.modifiers.control || ev.modifiers.alt || ev.modifiers.meta) {
+            return false;
+        }
+        return ev.text == Key.Backspace || ev.text == Key.Delete
+            || ev.text == Key.LeftArrow || ev.text == Key.RightArrow
+            || ev.text == Key.Home || ev.text == Key.End
+            || (ev.text >= " " && ev.text < "\u{F700}");
+    }
+    key-pressed(ev) => {
+        // Alt/Meta excluded: those are other combinations (e.g. Alt+Enter).
+        if (ev.modifiers.control && !ev.modifiers.alt && !ev.modifiers.meta) {
+            // Shift+Ctrl+letter is left to the rest of the application.
+            if (!ev.modifiers.shift) {
+                let k = KeyAdapter.normalize-key(ev.text);
+                if (k == "A" || ev.text == "\u{1}") {
+                    self.select-all();
+                    return accept;
+                }
+                if (k == "C" || ev.text == "\u{3}") {
+                    self.copy();
+                    return accept;
+                }
+                if (k == "X" || ev.text == "\u{18}") {
+                    self.cut();
+                    return accept;
+                }
+                if (k == "V" || ev.text == "\u{16}") {
+                    self.paste();
+                    return accept;
+                }
+            }
+        }
+        if (root.list-behind && !root.claims-key(ev)) {
+            return root.app-key(ev) ? accept : reject;
+        }
+        return reject;
+    }
+}
+
+// Search input shared by filterable lists. The shared LineEdit owns text
+// editing and its single clear action; callers only provide the filter callback.
+export component SearchField inherits Rectangle {
+    in property <string> placeholder-text;
+    in-out property <string> text;
+    callback edited(string);
+
+    height: 32px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: Theme.surface;
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 6px;
+        spacing: 6px;
+        Image {
+            width: 14px;
+            height: 14px;
+            y: (parent.height - self.height) / 2;
+            source: @image-url("../../assets/icons/search.svg");
+            colorize: Theme.foreground.with-alpha(0.5);
+        }
+        search-input := EditLineEdit {
+            placeholder-text: root.placeholder-text;
+            horizontal-stretch: 1;
+            text <=> root.text;
+            edited(value) => { root.edited(value); }
+        }
+    }
+}
+
+// Shared deferred focus for LineEdits created inside a conditional popup.
+// The one-iteration delay lets Slint finish building the widget and
+// avoids the cycles observed with a direct focus() in `changed *-open`.
+export component DeferredLineEditFocus inherits Rectangle {
+    in-out property <bool> armed: false;
+    in property <bool> blocked: false;
+    callback apply-focus();
+    width: 0px;
+    height: 0px;
+    Timer {
+        interval: 1ms;
+        running: root.armed && !root.blocked;
+        triggered => {
+            root.apply-focus();
+            root.armed = false;
+        }
+    }
+}
+
+// Auto-scrolls a scroll frame while a drag hovers near its top or bottom edge,
+// so a drop target sitting off-screen can be reached without releasing the drag.
+// Bind `content-y` two-way to the target ScrollView/Flickable; the timer only
+// nudges it within [min-vy, 0]. Inputs are in the window's absolute frame:
+// `cursor-y - frame-y` is the pointer's offset inside the visible area. Shared
+// by the file list and the favorites tree so both drag-scroll with the same feel.
+export component DragEdgeScroller inherits Rectangle {
+    in property <bool> active;          // a drag is in progress over this frame
+    in property <length> cursor-y;      // absolute pointer Y
+    in property <length> frame-y;       // absolute Y of the visible frame's top
+    in property <length> frame-h;       // visible frame height
+    in property <length> min-vy;        // most-negative content-y (0 if it all fits)
+    in-out property <length> content-y;
+    // Edge band that arms the scroll, and the per-tick step.
+    property <length> edge: 30px;
+    property <length> step: 15px;
+    width: 0px;
+    height: 0px;
+    Timer {
+        interval: 16ms;
+        running: root.active;
+        triggered => {
+            // A zero-height frame (a collapsed section) has nothing to scroll and
+            // a bogus `min-vy` — never touch its `content-y`, or it would be left
+            // scrolled past its content and render empty once re-expanded.
+            if (root.frame-h <= 0px) {
+                return;
+            }
+            let top: length = root.cursor-y - root.frame-y;
+            if (top >= 0px && top < root.edge && root.content-y < 0px) {
+                root.content-y = min(0px, root.content-y + root.step);
+            } else if (top > root.frame-h - root.edge && top <= root.frame-h
+                    && root.content-y > root.min-vy) {
+                root.content-y = max(root.min-vy, root.content-y - root.step);
+            }
+        }
+    }
+}
+
+/// Checkbox for a destructive list: ticked means "this one goes".
+///
+/// The danger color distinguishes removal from the regular CheckBox's accent.
+/// It must not share the success color used for copy operations.
+///
+/// Square rather than round: in Favnyr a disc is a state the user does not set
+/// (the modified-workspace dot, a count badge), a rounded square is a target
+/// one clicks — the eight colour swatches are squares.
+export component MarkBox inherits Rectangle {
+    in property <bool> checked;
+    callback toggled(bool);
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    background: root.checked ? Tokens.danger : transparent;
+    border-width: root.checked ? 0px : 1.5px;
+    border-color: mark-touch.has-hover
+        ? Tokens.danger.with-alpha(0.55)
+        : Theme.foreground.with-alpha(0.35);
+    animate background, border-color { duration: 110ms; easing: ease-out; }
+    if root.checked : Image {
+        source: @image-url("../../assets/icons/check.svg");
+        width: 10px;
+        height: 10px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        // The palette resolves ink against the destructive fill.
+        colorize: Theme.danger-foreground;
+    }
+    mark-touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.toggled(!root.checked); }
+    }
+}
+
+// Full-window dim behind a modal card. It ALWAYS swallows the wheel: an
+// unhandled scroll would otherwise fall through to whatever sits behind the
+// modal (the settings panel, the file view underneath) and scroll or select
+// there while the modal is up. Clicks on the dim are absorbed; set
+// `dismiss-on-click` to also close the modal from a click in the dim.
+export component ModalBackdrop inherits Rectangle {
+    in property <bool> dismiss-on-click: false;
+    callback dismiss();
+    background: Theme.modal-overlay;
+    TouchArea {
+        scroll-event(ev) => { return accept; }
+        // A backdrop covers everything outside its dialog, so a click here is
+        // still a click "somewhere else": it closes the floating menus even
+        // when the backdrop itself dismisses nothing.
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down) { Dismiss.serial += 1; }
+        }
+        clicked => { if (root.dismiss-on-click) { root.dismiss(); } }
+    }
+}
+
+// Compact affordance bound to an input FIELD rather than to a dialog: it acts
+// on the text and never closes anything. Drawn as a link — muted label over a
+// 1px rule, accent on hover — so it cannot be taken for one more action button,
+// and so it costs a fraction of a button's width in every language. A button
+// here would not fit: four of them overflow the card in every language but
+// English.
+export component FieldLink inherits Rectangle {
+    callback clicked();
+    in property <string> text;
+    horizontal-stretch: 0;
+    HorizontalLayout {
+        padding-left: 4px;
+        padding-right: 4px;
+        VerticalLayout {
+            alignment: center;
+            spacing: 1px;
+            Text {
+                text: root.text;
+                font-size: 12px;
+                color: fl-touch.has-hover
+                    ? Theme.accent-background
+                    : Theme.foreground.with-alpha(0.62);
+            }
+            // Slint's Text carries no underline property: the rule is a 1px
+            // rectangle sized by the layout, so it always matches the label.
+            Rectangle {
+                height: 1px;
+                background: fl-touch.has-hover
+                    ? Theme.accent-background
+                    : Theme.foreground.with-alpha(0.28);
+            }
+        }
+    }
+    fl-touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// A secondary hint rendered independently from the editable content.
+export component HintEdit inherits Rectangle {
+    in-out property <string> text;
+    in property <bool> read-only: false;
+    in property <string> hint;
+    callback edited(string);
+    height: 32px;
+    edit := EditLineEdit {
+        width: parent.width;
+        height: parent.height;
+        text <=> root.text;
+        read-only: root.read-only;
+        edited(t) => { root.edited(t); }
+    }
+    // Overlaid hint, visible only when the field is empty. Not
+    // interactive → clicks fall through to the LineEdit underneath.
+    Text {
+        x: 10px;
+        width: parent.width - 16px;
+        height: parent.height;
+        visible: root.text == "";
+        text: root.hint;
+        font-size: 13px;
+        color: Theme.foreground.with-alpha(0.3);
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    // Puts the caret at the end and scrolls there. Text appended from outside
+    // (the tag buttons) lands past the visible width on a long command, so
+    // without this the click produces no visible change at all.
+    public function focus-end() {
+        edit.focus();
+        edit.set-selection-offsets(99999, 99999);
+    }
+}
+
+// Small text button reusable in the Workspaces overlay.
+export component WsButton inherits Rectangle {
+    callback clicked();
+    in property <string> label;
+    in property <bool> primary: false;
+    in property <bool> danger: false;
+    height: 28px;
+    border-radius: 5px;
+    background: root.primary
+        ? (touch.has-hover ? Theme.accent-background.with-alpha(0.85) : Theme.accent-background)
+        : (root.danger
+            ? (touch.has-hover ? Tokens.danger.with-alpha(0.2) : transparent)
+            : (touch.has-hover ? Theme.alternate-background : transparent));
+    border-width: 1px;
+    border-color: root.primary
+        ? Theme.accent-background
+        : (root.danger ? Tokens.danger.with-alpha(0.4) : Theme.border);
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        Text {
+            text: root.label;
+            font-size: 12px;
+            color: root.primary
+                ? Theme.accent-foreground
+                : (root.danger ? Tokens.danger : Theme.foreground);
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+    }
+    touch := TouchArea { clicked => { root.clicked(); } }
+}
+
+// Small icon button (glyph OR SVG image) with an optional tooltip.
+export component WsIconBtn inherits Rectangle {
+    callback clicked();
+    in property <string> glyph;       // used if `icon` is not provided
+    in property <image> icon;
+    in property <string> tooltip;     // tooltip (empty = none)
+    in property <bool> danger: false;
+    // Amber variant: ⟳ "Save changes" on the current MODIFIED
+    // row — warning tint, matches the row's amber dot.
+    in property <bool> amber: false;
+    // Accent variant: the action is not merely available, it is IN EFFECT,
+    // the way the workspace icon of the loaded row is tinted. Used by the
+    // theme swatch so a glance says whether a theme is imposed.
+    in property <bool> accent: false;
+    width: 28px;
+    height: 28px;
+    accessible-role: button;
+    accessible-label: root.tooltip;
+    border-radius: 6px;
+    background: touch.has-hover
+        ? (root.danger
+            ? Tokens.danger.with-alpha(0.13)
+            : (root.amber ? Tokens.warning.with-alpha(0.16) : Theme.accent-background.with-alpha(0.18)))
+        : transparent;
+
+    if root.icon.width > 0 : Image {
+        source: root.icon;
+        width: 15px;
+        height: 15px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        colorize: root.amber
+            ? Tokens.warning
+            : (root.accent
+                ? Theme.accent-background
+                : (touch.has-hover
+                    ? (root.danger ? Tokens.danger : Theme.foreground)
+                    : Theme.foreground.with-alpha(0.6)));
+    }
+    if root.icon.width == 0 : Text {
+        text: root.glyph;
+        font-size: 14px;
+        color: root.amber
+            ? Tokens.warning
+            : (touch.has-hover
+                ? (root.danger ? Tokens.danger : Theme.foreground)
+                : Theme.foreground.with-alpha(0.6));
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+        // Tooltip ABOVE the button via the global Tip (rendered at the
+        // window level → never clipped by the strip, including on the 1st row).
+        changed has-hover => {
+            if (self.has-hover && root.tooltip != "") {
+                Tip.text = root.tooltip;
+                Tip.x = self.absolute-position.x;
+                Tip.y = self.absolute-position.y - 26px;
+            } else if (Tip.text == root.tooltip) {
+                Tip.text = "";
+            }
+        }
+    }
+}
+
+// Progress toast.
+// Non-blocking floating card (no backdrop) anchored bottom-right.
+// 6px bar, progress measured in bytes or items, animation in
+// indeterminate mode, and a Cancel or Close button depending on the state.
+export component ProgressToast inherits Rectangle {
+    in property <int> op-state;          // 1 running,2 scan,3 success,4 error,5 cancelled
+    in property <float> progress;        // 0..1
+    in property <bool> indeterminate;
+    in property <string> title;
+    in property <string> detail;
+    in property <string> percent;
+    in property <string> cancel-label;
+    callback cancel();
+    callback dismiss();
+
+    width: 360px;
+    height: 88px;
+    background: Theme.background;
+    border-radius: Tokens.radius-overlay;
+    border-width: 1px;
+    border-color: Theme.border;
+    drop-shadow-blur: 24px;
+    drop-shadow-color: Theme.shadow.with-alpha(0.35);
+    drop-shadow-offset-y: 6px;
+
+    property <bool> terminal: root.op-state == 3 || root.op-state == 4 || root.op-state == 5;
+    property <color> fill-color: root.op-state == 4
+        ? Tokens.danger
+        : (root.op-state == 5 ? Theme.foreground.with-alpha(0.35) : Theme.accent-background);
+    property <bool> sweep: false;
+
+    // Absorbs clicks on the card (but NOT elsewhere → non-blocking).
+    TouchArea { }
+
+    VerticalLayout {
+        padding: 12px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 5px;
+
+        // Line 1: title + percentage + "x" (terminal state).
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: root.title;
+                font-size: 13px;
+                font-weight: 600;
+                color: root.op-state == 4 ? Tokens.danger : Theme.foreground;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            Text {
+                text: root.percent;
+                font-size: 13px;
+                font-weight: 600;
+                color: Theme.foreground.with-alpha(0.7);
+                vertical-alignment: center;
+            }
+            if root.terminal : Rectangle {
+                width: 18px;
+                height: 18px;
+                border-radius: 4px;
+                background: dismiss-touch.has-hover ? Theme.alternate-background : transparent;
+                Image {
+                    source: @image-url("../../assets/icons/close.svg");
+                    width: 11px;
+                    height: 11px;
+                    colorize: Theme.foreground.with-alpha(0.6);
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                dismiss-touch := TouchArea {
+                    clicked => { root.dismiss(); }
+                }
+            }
+        }
+
+        // Line 2: track + fill.
+        Rectangle {
+            height: 6px;
+            border-radius: 3px;
+            background: Theme.foreground.with-alpha(0.12);
+            clip: true;
+            if !root.indeterminate : Rectangle {
+                x: 0;
+                width: parent.width * clamp(root.progress, 0, 1);
+                height: parent.height;
+                border-radius: 3px;
+                background: root.fill-color;
+                animate width { duration: 120ms; easing: ease-out; }
+            }
+            if root.indeterminate : Rectangle {
+                width: parent.width * 0.3;
+                height: parent.height;
+                border-radius: 3px;
+                background: Theme.accent-background;
+                x: root.sweep ? parent.width - self.width : 0px;
+                animate x { duration: 1100ms; easing: ease-in-out; }
+            }
+        }
+
+        // Detail can include a second line for throughput and remaining time.
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: root.detail;
+                font-size: 11px;
+                color: Theme.foreground.with-alpha(0.6);
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            if !root.terminal : Rectangle {
+                width: 78px;
+                height: 24px;
+                border-radius: 5px;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: cancel-touch.has-hover ? Theme.alternate-background : transparent;
+                Text {
+                    text: root.cancel-label;
+                    font-size: 12px;
+                    color: Theme.foreground.with-alpha(0.85);
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                cancel-touch := TouchArea {
+                    clicked => { root.cancel(); }
+                }
+            }
+        }
+    }
+
+    // Indeterminate animation: ping-pong of the glowing block.
+    Timer {
+        interval: 1100ms;
+        running: root.indeterminate && root.op-state == 2;
+        triggered => { root.sweep = !root.sweep; }
+    }
+
+    // Auto-dismiss: success after 1.5s, cancelled after 1.2s. Held by the card
+    // itself so that each toast in the stack times out on its own.
+    //
+    // An error never times out. A long copy can end while nobody is at the
+    // machine, and a countdown would erase the only trace of the failure
+    // before anyone read it — the two states that do expire merely confirm
+    // what was just asked, and losing them costs nothing. The "x" closes an
+    // error card, as it closes the others.
+    Timer {
+        interval: root.op-state == 5 ? 1200ms : 1500ms;
+        running: root.op-state == 3 || root.op-state == 5;
+        triggered => { root.dismiss(); }
+    }
+}

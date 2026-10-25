@@ -1,0 +1,116 @@
+import { WidgetStyle, WidgetFocus } from "style.slint";
+
+// Shared activation semantics keep keyboard and accessibility actions identical.
+export component ActionArea inherits FocusScope {
+    focus-on-click: true;
+    callback activated();
+    callback scrolled(PointerScrollEvent) -> EventResult;
+    out property <bool> hovered: touch.has-hover;
+    out property <bool> pressed: touch.pressed;
+    public function activate() {
+        if root.enabled { root.activated(); }
+    }
+    key-pressed(e) => {
+        if root.enabled && !e.modifiers.control && !e.modifiers.alt && !e.modifiers.meta
+            && (e.text == Key.Space || e.text == Key.Return) {
+            root.activate();
+            return accept;
+        }
+        reject
+    }
+    key-released(e) => {
+        if e.text == Key.Space || e.text == Key.Return {
+            return accept;
+        }
+        reject
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { if root.focus-on-click { root.focus(); } root.activate(); }
+        scroll-event(e) => { root.scrolled(e) }
+    }
+}
+
+export component Button inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <bool> primary: false;
+    out property <bool> has-focus: action.has-focus;
+    callback clicked();
+    forward-focus: action;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { action.activate(); }
+    min-width: max(32px, label.preferred-width + 24px);
+    min-height: max(32px, label.preferred-height + 10px);
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: !root.enabled ? (root.primary ? transparent : WidgetStyle.border)
+        : action.pressed ? WidgetStyle.border : root.primary ? WidgetStyle.accent-border : WidgetStyle.control-border;
+    background: !root.enabled ? (root.primary ? WidgetStyle.accent-disabled : WidgetStyle.disabled)
+        : action.pressed ? (root.primary ? WidgetStyle.accent.with-alpha(0.8) : WidgetStyle.pressed)
+        : action.hovered ? (root.primary ? WidgetStyle.accent.with-alpha(0.9) : WidgetStyle.hover)
+        : root.primary ? WidgetStyle.accent : WidgetStyle.control;
+    animate background, border-color { duration: 150ms; }
+    label := Text {
+        text: root.text;
+        color: !root.enabled ? (root.primary ? WidgetStyle.accent-disabled-text : WidgetStyle.disabled-text)
+            : action.pressed ? (root.primary ? WidgetStyle.accent-pressed-text : WidgetStyle.secondary)
+            : root.primary ? WidgetStyle.accent-foreground : WidgetStyle.foreground;
+        animate color { duration: 150ms; }
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+    if root.has-focus && root.enabled: WidgetFocus { border-radius: 4px; }
+    action := ActionArea { enabled: root.enabled; focus-on-click: false; activated => { root.clicked(); } }
+}
+
+export component CheckBox inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in-out property <bool> checked;
+    out property <bool> has-focus: action.has-focus;
+    callback toggled();
+    forward-focus: action;
+    accessible-role: checkbox;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-checked: root.checked;
+    accessible-action-default => { action.activate(); }
+    min-width: 30px + label.preferred-width;
+    min-height: max(18px, label.preferred-height);
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    box := Rectangle {
+        x: 0px; y: (parent.height - self.height) / 2; width: 18px; height: 18px;
+        border-radius: 2px; border-width: root.checked ? 0px : 1px;
+        border-color: root.enabled && !action.pressed ? WidgetStyle.strong-border : WidgetStyle.strong-disabled;
+        background: !root.enabled ? (root.checked ? WidgetStyle.accent-disabled : transparent)
+            : action.pressed ? (root.checked ? WidgetStyle.accent.with-alpha(0.8) : WidgetStyle.check-pressed)
+            : action.hovered ? (root.checked ? WidgetStyle.accent.with-alpha(0.9) : WidgetStyle.check-hover)
+            : root.checked ? WidgetStyle.accent : WidgetStyle.check-background;
+        animate background, border-color { duration: 150ms; }
+        if root.checked: Image {
+            x: 3px; y: 3px; width: 12px; height: 12px;
+            source: @image-url("../../../assets/icons/check.svg");
+            colorize: !root.enabled ? WidgetStyle.accent-disabled-text
+                : action.pressed ? WidgetStyle.accent-pressed-text : WidgetStyle.accent-foreground;
+        }
+    }
+    label := Text {
+        x: 30px; width: max(0px, parent.width - self.x);
+        text: root.text; color: root.enabled ? WidgetStyle.foreground : WidgetStyle.disabled-text;
+        horizontal-alignment: left; vertical-alignment: center;
+        accessible-role: none;
+    }
+    if root.has-focus && root.enabled: WidgetFocus { border-radius: 4px; }
+    action := ActionArea {
+        enabled: root.enabled;
+        focus-on-click: false;
+        activated => { root.checked = !root.checked; root.toggled(); }
+    }
+}

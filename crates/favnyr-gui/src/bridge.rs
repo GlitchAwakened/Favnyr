@@ -47,7 +47,7 @@ use favnyr_core::thumbnail::{self, Thumbnail};
 use favnyr_core::workspace::{
     self, ItemArrangement, SidebarSectionsState, TabState, ViewState, WorkspaceState,
 };
-use favnyr_core::{Config, Lang, Theme, paths};
+use favnyr_core::{Config, Lang, paths};
 
 use crate::actions;
 use crate::clipboard;
@@ -66,12 +66,14 @@ use crate::{
 const MIN_SPLIT_RATIO: f32 = 0.08;
 
 mod archive;
+mod folder_stats;
 mod item_geometry;
 mod properties;
 mod recovery;
 mod search;
 mod shutdown;
 
+use folder_stats::{Job as FolderStatsJob, request_folder_stats};
 use item_geometry::{GridLayout, ItemAnchor, ItemBand, ItemBands};
 
 /// Context remembered for the "Open with" picker between enumeration
@@ -577,6 +579,9 @@ struct Panel {
     /// a refresh on the same folder (preserve selection) from a
     /// context change like a tab/panel switch (reset selection).
     displayed_path: PathBuf,
+    /// Native sort data retained only when recursive dates participate in sorting.
+    /// Background results can then reorder existing rows without filesystem I/O.
+    folder_stat_entries: Vec<Entry>,
     /// Columns specific to the panel (order, visibility, and width).
     /// Independent from other panels; persisted per panel in the
     /// workspace .toml. Always normalized (`columns::sanitize`).
@@ -666,6 +671,7 @@ impl Panel {
             rendered_first: Cell::new(0),
             rendered_end: Cell::new(0),
             displayed_path: initial,
+            folder_stat_entries: Vec::new(),
             columns: columns::sanitize(columns),
             hidden_count: 0,
             unavailable: false,
@@ -1183,8 +1189,8 @@ pub struct AppState {
     // Recursive folder stats: modification date + size -----
     /// Queue of recursive folder-stats computations — mtime + size in ONE shared
     /// walk — consumed by the background worker.
-    rmtime_tx: mpsc::Sender<RMtimeJob>,
-    rmtime_rx: Rc<RefCell<Option<mpsc::Receiver<RMtimeJob>>>>,
+    rmtime_tx: mpsc::Sender<FolderStatsJob>,
+    rmtime_rx: Rc<RefCell<Option<mpsc::Receiver<FolderStatsJob>>>>,
     /// Generation: invalidates stale jobs (folder left / a depth changed).
     rmtime_gen: Arc<AtomicU64>,
     /// In-memory cache (folder path → recursive Unix mtime). Session only.
@@ -1753,11 +1759,24 @@ pub fn install(window: &MainWindow, state: AppState) {
     // The "Open with…" entry (native picker) only exists on Windows.
     window.set_platform_windows(cfg!(windows));
     window.set_platform_linux(cfg!(target_os = "linux"));
-    window.set_theme_pref(match cfg.theme {
-        Theme::Auto => 0,
-        Theme::Light => 1,
-        Theme::Dark => 2,
-    });
+    {
+        let st = state.clone();
+        crate::theme::install(
+            window,
+            &cfg,
+            move |preference, id| {
+                st.persist_config(|c| {
+                    c.theme = preference;
+                    c.theme_id = id;
+                })
+            },
+            show_notice,
+        );
+        // A restored session names the workspace it was on, which may impose a
+        // theme of its own. Neither of the paths that normally apply one runs
+        // at startup, so it is resolved here.
+        apply_workspace_theme(window, &state);
+    }
     // Default tab bar position (settings).
     window.set_tabbar_default_pref(cfg.default_tab_bar_mode.min(2) as i32);
     // Display mode for newly created tabs and views (settings).
@@ -3060,16 +3079,9 @@ pub fn install(window: &MainWindow, state: AppState) {
             // the previous language until the sidebar was toggled by hand.
             refresh_sidebar(&w, &st); // capacity gauges + their hover hint
             push_favorites_ui(&w, &st); // "Favorites (root)" in the container list
-        });
-    }
-
-    // ----- Theme -----
-    {
-        let st = state.clone();
-        window.on_theme_changed(move |idx: i32| {
-            let theme = Theme::all().get(idx as usize).copied().unwrap_or_default();
-            info!(theme = theme.code(), "theme changed");
-            st.persist_config(|c| c.theme = theme);
+            // Workspace rows name the theme they impose and the holder of each
+            // keyboard slot, both composed here from the catalog.
+            refresh_workspaces_ui(&w, &st);
         });
     }
 
@@ -3696,6 +3708,8 @@ pub fn install(window: &MainWindow, state: AppState) {
             let has_favorite_target = sel.iter().any(|p| favorite_target_exists(p));
             w.set_ctx_selection_has_dir(has_dir);
             w.set_ctx_selection_has_favorite_target(has_favorite_target);
+            // Same rule as the delete action, so the entry names what it will do.
+            w.set_ctx_selection_in_trash(sel.iter().any(|p| ops::is_in_trash(p)));
             // Slot already applied, so the strip can point at it. Taken from
             // the primary item: with a mixed selection the strip shows what the
             // first folder carries and assigns to all of them.
@@ -3711,41 +3725,18 @@ pub fn install(window: &MainWindow, state: AppState) {
             } else {
                 openers::CTX_FILE
             };
-            let n_custom = push_ctx_custom_entries(&w, &st, bit, &sel);
+            push_ctx_custom_entries(&w, &st, bit, &sel);
             w.set_ctx_custom_bg(false);
             // Windows SHELL context menu for the selection.
-            let n_shell = refresh_shell_menu(&w, &st, &sel);
-            // Full menu height, needed to know whether the menu still fits
-            // below the pointer. It repeats the Slint binding term for term:
-            // a base holding every row that is always there, then one term per
-            // row that can be hidden, on the very condition that renders it.
-            // The two sides have to be changed together.
-            let h = 350.0
-                + if can_reveal_result { 26.0 } else { 0.0 }
-                + if primary_dir { 0.0 } else { 26.0 }
-                + if primary_dir && sel.len() == 1 {
-                    26.0
-                } else {
-                    0.0
-                }
-                + if sel.len() == 1 { 26.0 } else { 0.0 }
-                + if has_favorite_target { 26.0 } else { 0.0 }
-                + if has_dir || sel.len() == 1 { 26.0 } else { 0.0 }
-                + if n_custom > 0 {
-                    n_custom as f32 * 26.0 + 1.0
-                } else {
-                    0.0
-                }
-                + if n_shell > 0 {
-                    n_shell as f32 * 26.0 + 1.0
-                } else {
-                    0.0
-                };
-            let (x, y) = clamp_ctx_menu_pos(&w, x, y, h);
+            refresh_shell_menu(&w, &st, &sel);
             // Refreshes the "Open with" flyout filtered by the TARGETED file's
             // extension → programs suited to this specific file.
             push_openers_ui(&w, &st);
             w.set_ctx_on_empty(false);
+            // The pointer position goes out as it came in. Keeping the menu
+            // inside the window takes its height, which depends on the rows
+            // just pushed above, so the view does it where that height is
+            // already known rather than having this side predict it.
             w.set_ctx_menu_x(x);
             w.set_ctx_menu_y(y);
             arm_context_menu_navigation(&w);
@@ -4517,11 +4508,58 @@ pub fn install(window: &MainWindow, state: AppState) {
             // Selection present → take the first path; otherwise → cwd.
             // `open_terminal` handles the path-or-parent mapping internally.
             let target = paths.first().cloned().unwrap_or_else(|| st.current_path());
-            if let Err(err) = actions::open_terminal(&target) {
+            let preferred = st.snapshot_config().terminal;
+            if let Err(err) = actions::open_terminal(&target, &preferred) {
                 error!(error = %err, "open_terminal failed");
             }
         });
     }
+    {
+        let st = state.clone();
+        let weak = window.as_weak();
+        window.on_refresh_terminals(move || {
+            let Some(w) = weak.upgrade() else { return };
+            refresh_terminals(&w, &st);
+        });
+    }
+    {
+        let st = state.clone();
+        let weak = window.as_weak();
+        window.on_terminal_changed(move |index: i32| {
+            let Some(w) = weak.upgrade() else { return };
+            let config = st.snapshot_config();
+            let rows = terminal_rows(
+                &actions::detected_terminals(),
+                &config.terminal,
+                config.language,
+            );
+            match rows
+                .into_iter()
+                .nth(index.max(0) as usize)
+                .map(|(_, row)| row)
+            {
+                Some(TerminalRow::Choose(program)) => {
+                    info!(terminal = %program, "terminal preference changed");
+                    st.persist_config(|c| c.terminal = program);
+                }
+                Some(TerminalRow::Browse) => {
+                    // A terminal installed outside the places the list looks,
+                    // which on Windows is where most of them are.
+                    if let Some(program) = openwith::browse_for_exe(config.language) {
+                        info!(terminal = %program, "terminal chosen by browsing for it");
+                        st.persist_config(|c| c.terminal = program);
+                    }
+                }
+                None => {}
+            }
+            // Rebuilt in every case: a dismissed picker leaves the list
+            // showing a row that stands for nothing.
+            refresh_terminals(&w, &st);
+        });
+    }
+    // Built once here so the row the settings hold is shown before the list
+    // has ever been opened.
+    refresh_terminals(window, &state);
 
     // ext: Copy path / Copy name -----
     {
@@ -4925,25 +4963,27 @@ pub fn install(window: &MainWindow, state: AppState) {
     // "Type-ahead" filter of the active view — SHARED with the
     // by-extension filter: the same keystrokes feed one OR the other depending
     // on whether the active tab's "extension filter" mode is on. -----
+    //
+    // Two ways in, and both end up in `edit_active_filter`. The bar edits the
+    // whole text when it has the keyboard; single keystrokes come through
+    // when the list has it instead and the bar is only showing the result.
+    {
+        let st = state.clone();
+        let weak = window.as_weak();
+        window.on_filter_set(move |text: SharedString| {
+            let Some(w) = weak.upgrade() else { return };
+            edit_active_filter(&w, &st, |filter| {
+                filter.clear();
+                filter.push_str(text.as_ref());
+            });
+        });
+    }
     {
         let st = state.clone();
         let weak = window.as_weak();
         window.on_filter_type(move |ch: SharedString| {
             let Some(w) = weak.upgrade() else { return };
-            if st.active_manual_order() {
-                return;
-            }
-            if st.active_ext_filter_on() {
-                st.with_tabs_mut(|b| {
-                    let a = b.active;
-                    b.tabs[a].ext_filter.push_str(ch.as_ref());
-                });
-            } else {
-                st.filter.borrow_mut().push_str(ch.as_ref());
-            }
-            let cur = st.current_path();
-            refresh_listing(&w, &st, &cur);
-            w.set_active_filter(st.filter.borrow().clone().into());
+            edit_active_filter(&w, &st, |filter| filter.push_str(ch.as_ref()));
         });
     }
     {
@@ -4951,20 +4991,9 @@ pub fn install(window: &MainWindow, state: AppState) {
         let weak = window.as_weak();
         window.on_filter_backspace(move || {
             let Some(w) = weak.upgrade() else { return };
-            if st.active_manual_order() {
-                return;
-            }
-            if st.active_ext_filter_on() {
-                st.with_tabs_mut(|b| {
-                    let a = b.active;
-                    b.tabs[a].ext_filter.pop();
-                });
-            } else {
-                st.filter.borrow_mut().pop();
-            }
-            let cur = st.current_path();
-            refresh_listing(&w, &st, &cur);
-            w.set_active_filter(st.filter.borrow().clone().into());
+            edit_active_filter(&w, &st, |filter| {
+                filter.pop();
+            });
         });
     }
     {
@@ -5560,27 +5589,14 @@ pub fn install(window: &MainWindow, state: AppState) {
             selection_set_all(&st.active_rows_model(), false);
             st.set_selection_anchor(-1);
             // Commands pinned to the view BACKGROUND (bit 4) — target the
-            // current folder (e.g. "Git Bash here").
-            let n_custom = push_ctx_custom_entries(&w, &st, openers::CTX_BACKGROUND, &[]);
+            // current folder (e.g. "open a shell here").
+            push_ctx_custom_entries(&w, &st, openers::CTX_BACKGROUND, &[]);
             w.set_ctx_custom_bg(true);
             // Shell menu of the CURRENT FOLDER "as an item":
-            // exposes the full PeaZip menu, Git Bash here, Select left folder…
+            // exposes the full menus of archivers, shells, comparison tools…
             // where Windows's "background" menu is much sparser.
             let cur = st.current_path();
-            let n_shell = refresh_shell_menu(&w, &st, std::slice::from_ref(&cur));
-            // Reduced menu (empty area): 194 px + pinned + shell.
-            let h = 194.0
-                + if n_custom > 0 {
-                    n_custom as f32 * 26.0 + 1.0
-                } else {
-                    0.0
-                }
-                + if n_shell > 0 {
-                    n_shell as f32 * 26.0 + 1.0
-                } else {
-                    0.0
-                };
-            let (x, y) = clamp_ctx_menu_pos(&w, x, y, h);
+            refresh_shell_menu(&w, &st, std::slice::from_ref(&cur));
             w.set_ctx_on_empty(true);
             w.set_ctx_menu_x(x);
             w.set_ctx_menu_y(y);
@@ -5726,12 +5742,23 @@ pub fn install(window: &MainWindow, state: AppState) {
             if paths.is_empty() {
                 return;
             }
+            // An item already in a trash cannot go back to one: deleting it is
+            // permanent, so it gets the same confirmation as Shift+Delete.
+            let in_trash = paths.iter().filter(|p| ops::is_in_trash(p)).count();
+            if in_trash > 0 {
+                w.set_delete_warning_from_trash(in_trash == paths.len());
+                *st.delete_pending.borrow_mut() = paths;
+                w.set_delete_warning_permanent(true);
+                w.set_delete_warning_open(true);
+                return;
+            }
             if cfg!(windows)
                 && paths
                     .iter()
                     .any(|p| favnyr_core::places::is_network_path(p))
             {
                 *st.delete_pending.borrow_mut() = paths;
+                w.set_delete_warning_from_trash(false);
                 w.set_delete_warning_permanent(false);
                 w.set_delete_warning_open(true);
                 return;
@@ -5805,6 +5832,7 @@ pub fn install(window: &MainWindow, state: AppState) {
             if paths.is_empty() {
                 return;
             }
+            w.set_delete_warning_from_trash(paths.iter().all(|p| ops::is_in_trash(p)));
             *st.delete_pending.borrow_mut() = paths;
             w.set_delete_warning_permanent(true);
             w.set_delete_warning_open(true);
@@ -5835,7 +5863,7 @@ pub fn install(window: &MainWindow, state: AppState) {
 
     // Properties: the system's **native** dialog, on both platforms —
     // Windows via the shell (Security/Details/Versions tabs…), Linux via
-    // `org.freedesktop.FileManager1` (Dolphin, Nautilus, Nemo, Caja…). There is
+    // `org.freedesktop.FileManager1` (the desktop's own file manager). There is
     // no more internal panel: as with the other desktop integrations
     // (opening via `xdg-open`, `zenity`/`kdialog` picker…), a failure is
     // simply reported to the user.
@@ -6536,10 +6564,7 @@ pub fn install(window: &MainWindow, state: AppState) {
             .and_then(|layout| layout.insertion_gap(count.max(0) as usize, x, y, keep))
             .map_or(-1, |index| index as i32)
     });
-    // Background worker for the recursive mtime — same pattern.
-    if let Some(rx) = state.rmtime_rx.borrow_mut().take() {
-        spawn_rmtime_worker(rx, state.rmtime_gen.clone(), window.as_weak());
-    }
+    folder_stats::connect(window, &state);
     // Background worker for image metadata — same pattern.
     if let Some(rx) = state.imgmeta_rx.borrow_mut().take() {
         spawn_imgmeta_worker(rx, state.imgmeta_gen.clone(), window.as_weak());
@@ -6893,59 +6918,6 @@ pub fn install(window: &MainWindow, state: AppState) {
             // queue before the next thumbnail is started.
             st.thumb_scheduler.complete(Path::new(&key), serial);
         });
-    }
-
-    // Recursive folder stats ready: cache the mtime and/or size and apply them
-    // to the "modified"/"age" cells and the "size" cell of the matching FOLDER
-    // row. An empty string for a metric means "not computed" for this job.
-    {
-        let st = state.clone();
-        window.on_folder_stats_ready(
-            move |panel_idx: i32,
-                  row_idx: i32,
-                  path: SharedString,
-                  mtime_str: SharedString,
-                  size_str: SharedString| {
-                let m = mtime_str.parse::<i64>().ok();
-                let s = size_str.parse::<u64>().ok();
-                if m.is_none() && s.is_none() {
-                    return;
-                }
-                let key = path.to_string();
-                if let Some(m) = m {
-                    st.rmtime_cache.borrow_mut().insert(key.clone(), m);
-                }
-                if let Some(s) = s {
-                    st.size_cache.borrow_mut().insert(key.clone(), s);
-                }
-                let lang = st.config.borrow().language;
-                let now = now_unix();
-                let target = PathBuf::from(&key);
-                let panels = st.panels.borrow();
-                let Some(panel) = usize::try_from(panel_idx)
-                    .ok()
-                    .and_then(|index| panels.get(index))
-                else {
-                    return;
-                };
-                let Some(row_index) = usize::try_from(row_idx).ok() else {
-                    return;
-                };
-                let model = &panel.rows_model;
-                let Some(mut row) = model.row_data(row_index) else {
-                    return;
-                };
-                if row.is_dir && row_path(&row) == target {
-                    if let Some(m) = m {
-                        apply_rmtime_to_row(&mut row, m, now, lang);
-                    }
-                    if let Some(s) = s {
-                        row.size = rfs::format_size(s, i18n::size_units(lang)).into();
-                    }
-                    model.set_row_data(row_index, row);
-                }
-            },
-        );
     }
 
     // ----- Column resizing: PER PANEL -----
@@ -7458,6 +7430,11 @@ pub fn install(window: &MainWindow, state: AppState) {
                         st.remember_workspace_saved();
                         st.persist_workspace();
                         update_window_title(&w, &st);
+                        // A new workspace carries no theme of its own, so the
+                        // screen goes back to the global one. Without this it
+                        // kept the colours of the workspace it was saved from,
+                        // which that new workspace does not impose.
+                        apply_workspace_theme(&w, &st);
                         w.set_ws_toast(w.global::<crate::Strings>().get_ws_toast_saved());
                         w.set_ws_name_taken(false);
                     }
@@ -7493,6 +7470,56 @@ pub fn install(window: &MainWindow, state: AppState) {
                     Err(err) => {
                         error!(error = %err, id = %id, slot, "assign workspace slot failed")
                     }
+                }
+            });
+        });
+    }
+    // Theme of a workspace. Deferred like every other row action: refreshing
+    // the list destroys the row whose callback is running.
+    {
+        let st = state.clone();
+        let weak = window.as_weak();
+        window.on_ws_set_theme(move |id: SharedString, theme: SharedString| {
+            let st = st.clone();
+            let weak = weak.clone();
+            let id = id.to_string();
+            let theme = theme.to_string();
+            defer(move || {
+                let Some(w) = weak.upgrade() else { return };
+                let wanted = (!theme.is_empty()).then_some(theme.as_str());
+                let saved = match workspace::set_workspace_theme(&paths::workspaces_dir(), &id, wanted) {
+                    Ok(()) => {
+                        info!(id = %id, theme = %theme, "workspace theme set");
+                        true
+                    }
+                    Err(err) => {
+                        error!(error = %err, id = %id, theme = %theme, "set workspace theme failed");
+                        false
+                    }
+                };
+                // Share one fresh listing between the preview, picker, rows
+                // and keyboard slots, including the result of a refused write.
+                let metas = workspace::list_named_workspaces(&paths::workspaces_dir());
+                let is_current = metas.iter().any(|meta| {
+                    meta.id == id
+                        && st.current_workspace.borrow().as_deref() == Some(meta.name.as_str())
+                });
+                if saved && is_current {
+                    apply_workspace_theme_from_listing(&w, &st, &metas);
+                }
+                // The tick of the open picker, from what the file now holds
+                // rather than from what was clicked, so a refused write shows
+                // as the choice staying where it was.
+                if w.get_ws_theme_picker_open() && w.get_ws_theme_picker_id() == id.as_str() {
+                    let stored = metas
+                        .iter()
+                        .find(|meta| meta.id == id)
+                        .and_then(|meta| meta.theme.clone())
+                        .unwrap_or_default();
+                    w.set_ws_theme_picker_current(stored.into());
+                }
+                if saved {
+                    publish_workspaces_ui(&w, &st, metas);
                 }
             });
         });
@@ -7624,7 +7651,7 @@ pub fn install(window: &MainWindow, state: AppState) {
             let id = id.to_string();
             defer(move || {
                 let Some(w) = weak.upgrade() else { return };
-                match overwrite_named_from_live(&st, &id) {
+                match overwrite_named_from_live(&w, &st, &id) {
                     Ok(()) => {
                         info!(id = %id, "workspace overwritten");
                         update_window_title(&w, &st);
@@ -7663,7 +7690,7 @@ pub fn install(window: &MainWindow, state: AppState) {
                     w.set_workspaces_open(true);
                     return;
                 };
-                match overwrite_named_from_live(&st, &id) {
+                match overwrite_named_from_live(&w, &st, &id) {
                     Ok(()) => {
                         info!(id = %id, name, "workspace saved from shortcut");
                         update_window_title(&w, &st);
@@ -7708,6 +7735,10 @@ pub fn install(window: &MainWindow, state: AppState) {
                             *st.saved_workspace.borrow_mut() = None;
                             st.persist_workspace();
                             update_window_title(&w, &st);
+                            // The theme it imposed went with its file, so the
+                            // screen goes back to the global one instead of
+                            // keeping colours nothing accounts for any more.
+                            apply_workspace_theme(&w, &st);
                         }
                         w.set_ws_toast(w.global::<crate::Strings>().get_ws_toast_deleted());
                     }
@@ -7738,6 +7769,9 @@ pub fn install(window: &MainWindow, state: AppState) {
                             *st.current_workspace.borrow_mut() = Some(new_name.clone());
                             st.persist_workspace();
                             update_window_title(&w, &st);
+                            // Same theme, new name: only the sentence in the
+                            // theme settings has to follow.
+                            apply_workspace_theme(&w, &st);
                         }
                         w.set_ws_toast(w.global::<crate::Strings>().get_ws_toast_renamed());
                     }
@@ -7824,19 +7858,28 @@ fn current_workspace_id(state: &AppState) -> Option<String> {
 }
 
 /// Overwrites a named workspace with the live state and synchronizes, in this
-/// order, the current identity, the single dirty snapshot, and the session workspace.
+/// order, the current identity, the single dirty snapshot, the session
+/// workspace and the theme that identity carries.
 /// Shared by the Update button, Ctrl+S, and the "save and…" safeguard.
-fn overwrite_named_from_live(state: &AppState, id: &str) -> favnyr_core::Result<()> {
+///
+/// The ⟳ of another row ends up here too, and that one does move the current
+/// identity: the workspace it overwrites becomes the loaded one, so its own
+/// theme takes the screen. Applying it here rather than at each call site
+/// keeps the theme tied to the identity instead of to three callers.
+fn overwrite_named_from_live(
+    window: &MainWindow,
+    state: &AppState,
+    id: &str,
+) -> favnyr_core::Result<()> {
     let ws = state.capture_workspace();
     workspace::overwrite_named_workspace(&paths::workspaces_dir(), id, &ws)?;
-    if let Some(meta) = workspace::list_named_workspaces(&paths::workspaces_dir())
-        .into_iter()
-        .find(|meta| meta.id == id)
-    {
-        *state.current_workspace.borrow_mut() = Some(meta.name);
+    let metas = workspace::list_named_workspaces(&paths::workspaces_dir());
+    if let Some(meta) = metas.iter().find(|meta| meta.id == id) {
+        *state.current_workspace.borrow_mut() = Some(meta.name.clone());
     }
     state.remember_workspace_saved();
     state.persist_workspace();
+    apply_workspace_theme_from_listing(window, state, &metas);
     Ok(())
 }
 
@@ -7849,6 +7892,13 @@ fn load_named_into(window: &MainWindow, state: &AppState, id: &str) {
             state.replace_with_workspace(ws);
             *state.current_workspace.borrow_mut() = Some(name);
             state.remember_workspace_saved();
+            // The theme of the workspace that is now loaded, or the global one
+            // when it imposes none. Asked for before the panels are refreshed
+            // so a built-in family, which needs no reading, is already in
+            // place when they are. A theme file is read on another thread and
+            // lands a moment later, which costs nothing: resolved colours are
+            // never carried by the row models, so they follow the repaint.
+            apply_workspace_theme(window, state);
             push_sidebar_sections_ui(window, state);
             window.set_closed_tabs_available(state.has_closed_tabs());
             refresh_all_panels(window, state);
@@ -7937,7 +7987,7 @@ fn save_before_workspace_switch(window: &MainWindow, state: &AppState) -> bool {
     let Some((id, name)) = dirty_current_workspace(state) else {
         return true;
     };
-    match overwrite_named_from_live(state, &id) {
+    match overwrite_named_from_live(window, state, &id) {
         Ok(()) => {
             info!(id, "workspace saved before switching");
             let message = window
@@ -7963,6 +8013,9 @@ fn save_before_workspace_switch(window: &MainWindow, state: &AppState) -> bool {
 /// Shared by guarded reset and the confirmation dialog's reset action.
 fn reset_into(window: &MainWindow, state: &AppState) {
     state.reset_to_blank();
+    // An unnamed session holds no theme of its own, so this hands the screen
+    // back to the global theme.
+    apply_workspace_theme(window, state);
     push_sidebar_sections_ui(window, state);
     window.set_closed_tabs_available(false);
     refresh_all_panels(window, state);
@@ -8070,8 +8123,21 @@ fn dirty_current_workspace(state: &AppState) -> Option<(String, String)> {
 /// The core sorts by recency (most recent first); we reverse it here if
 /// the user has switched the sort to "oldest first".
 fn refresh_workspaces_ui(window: &MainWindow, state: &AppState) {
-    let dir = paths::workspaces_dir();
-    let mut metas = workspace::list_named_workspaces(&dir);
+    publish_workspaces_ui(
+        window,
+        state,
+        workspace::list_named_workspaces(&paths::workspaces_dir()),
+    );
+}
+
+/// Publishes rows and keyboard slots from the same disk snapshot.
+fn publish_workspaces_ui(
+    window: &MainWindow,
+    state: &AppState,
+    mut metas: Vec<workspace::NamedWorkspaceMeta>,
+) {
+    let lang = state.config.borrow().language;
+    push_workspace_slots_ui(window, state, &metas);
     let cur_name = state.current_workspace.borrow().clone();
     // Same source of truth as the title's asterisk — no second comparison
     // logic should appear here.
@@ -8099,11 +8165,113 @@ fn refresh_workspaces_ui(window: &MainWindow, state: &AppState) {
                 is_current,
                 is_dirty,
                 slot: i32::from(m.slot.unwrap_or(0)),
+                theme: workspace_theme_label(m.theme.as_deref(), lang).into(),
+                theme_id: m.theme.unwrap_or_default().into(),
             }
         })
         .collect();
     window.set_workspaces(ModelRc::new(VecModel::from(entries)));
-    push_workspace_slots_ui(window, state);
+}
+
+// : Theme of a workspace -----
+//
+// A workspace imposes a theme while it is loaded. The choice lives in the
+// workspace's own file, beside its keyboard slot, so it is not part of the
+// arrangement of views and tabs: setting one is therefore not a change to
+// save, and never makes the workspace read as modified.
+
+/// Longest theme name a row shows. Past this the name is cut rather than
+/// allowed to squeeze the workspace's own name, which matters more and is
+/// elided from the same line. The longest built-in family name is exactly
+/// this long, so the cut only ever falls on a personal theme, whose file name
+/// has no bound at all; a test holds that property as families are added. The
+/// row also caps the width of the whole line, which keeps a wide script within
+/// the same budget as a narrow one.
+const MAX_WORKSPACE_THEME_NAME: usize = 20;
+
+/// How a stored theme identifier reads on a row: the translated name of a
+/// built-in family, or the file name of a personal theme without its
+/// extension. Empty when the workspace imposes nothing.
+///
+/// Derived from the identifier rather than looked up in the theme list, so a
+/// row reads correctly before the themes folder has ever been scanned, and
+/// still names a theme whose file has since been deleted.
+fn workspace_theme_label(id: Option<&str>, lang: Lang) -> String {
+    let Some(id) = id else {
+        return String::new();
+    };
+    let name = match favnyr_core::theme::BuiltinTheme::from_id(Some(id)) {
+        Some(family) => i18n::tr(lang, family.label_key()),
+        None => favnyr_core::theme::user_file_name(id)
+            .map(|name| name.strip_suffix(".toml").unwrap_or(name).to_owned())
+            .unwrap_or_default(),
+    };
+    if name.chars().count() <= MAX_WORKSPACE_THEME_NAME {
+        return name;
+    }
+    name.chars()
+        .take(MAX_WORKSPACE_THEME_NAME)
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
+/// The theme the loaded workspace imposes, and its name for the message that
+/// explains why the theme settings show something else.
+///
+/// Reuses a caller's listing without reading or caching workspace files.
+fn loaded_workspace_theme(
+    name: Option<&str>,
+    metas: &[workspace::NamedWorkspaceMeta],
+) -> (Option<String>, String) {
+    let Some(name) = name else {
+        // An unnamed session has no file to hold a theme, which is why
+        // starting a new workspace hands the screen back to the global theme.
+        return (None, String::new());
+    };
+    let theme = metas
+        .iter()
+        .find(|meta| meta.name == name)
+        .and_then(|meta| meta.theme.clone());
+    match theme {
+        Some(theme) => (Some(theme), name.to_owned()),
+        None => (None, String::new()),
+    }
+}
+
+/// Applies whatever the loaded workspace imposes, or hands the screen back to
+/// the global theme. Called wherever the loaded workspace changes, including
+/// when it becomes the unnamed session.
+fn apply_workspace_theme(window: &MainWindow, state: &AppState) {
+    let metas = if state.current_workspace.borrow().is_some() {
+        workspace::list_named_workspaces(&paths::workspaces_dir())
+    } else {
+        Vec::new()
+    };
+    apply_workspace_theme_from_listing(window, state, &metas);
+}
+
+fn apply_workspace_theme_from_listing(
+    window: &MainWindow,
+    state: &AppState,
+    metas: &[workspace::NamedWorkspaceMeta],
+) {
+    let (theme, name) = loaded_workspace_theme(state.current_workspace.borrow().as_deref(), metas);
+    let lang = state.config.borrow().language;
+    let name = SharedString::from(name);
+    // Set before applying: the theme settings compose their sentence from
+    // these while the theme controller relabels them.
+    let moved = window.get_theme_imposed_by() != name;
+    window.set_theme_imposed_by(name);
+    window.set_theme_imposed_label(workspace_theme_label(theme.as_deref(), lang).into());
+    window.invoke_apply_workspace_theme(theme.unwrap_or_default().into());
+    // Applying the same theme as before relabels nothing, which would leave
+    // the sentence naming the workspace it named a moment ago. Recomposed here
+    // when the workspace moved under an unchanged theme, which is what
+    // renaming it does, and what overwriting another one with the live state
+    // does when both impose the same theme.
+    if moved {
+        window.invoke_refresh_theme_labels();
+    }
 }
 
 /// Publishes, for each keyboard slot, who holds it and what fires it.
@@ -8117,10 +8285,13 @@ fn refresh_workspaces_ui(window: &MainWindow, state: &AppState) {
 /// insisted on Ctrl after the user moved the binding would simply be wrong. It
 /// is also rendered with the keyboard's own key names, so it reads `Strg+1` in
 /// German.
-fn push_workspace_slots_ui(window: &MainWindow, state: &AppState) {
+fn push_workspace_slots_ui(
+    window: &MainWindow,
+    state: &AppState,
+    metas: &[workspace::NamedWorkspaceMeta],
+) {
     let lang = state.config.borrow().language;
     let km = state.keymap.borrow();
-    let metas = workspace::list_named_workspaces(&paths::workspaces_dir());
     let mut taken: Vec<SharedString> = Vec::with_capacity(workspace::MAX_WORKSPACE_SLOT as usize);
     let mut tips: Vec<SharedString> = Vec::with_capacity(workspace::MAX_WORKSPACE_SLOT as usize);
     for slot in 1..=workspace::MAX_WORKSPACE_SLOT {
@@ -9319,9 +9490,36 @@ fn refresh_annotations_ui(window: &MainWindow, state: &AppState) {
         // full path before writing. Rebuild their queues with the new indices
         // so a safe rejection cannot leave a moved row without pending data.
         request_thumbnails(state);
-        request_folder_stats(state);
+        request_folder_stats(window, state);
         request_imgmeta(state);
     }
+}
+
+/// Replaces a reordered model while keeping its cursor and range anchor tied
+/// to paths. Shared by asynchronous date sorting and folder-colour grouping.
+fn replace_reordered_rows(
+    panel: &mut Panel,
+    mut rows: Vec<FileRow>,
+    compact_icon_rows: bool,
+    item_spacing: i32,
+) -> bool {
+    let previous: Vec<_> = panel.rows_model.iter().map(|row| row_path(&row)).collect();
+    if rows.iter().map(row_path).eq(previous.iter().cloned()) {
+        return false;
+    }
+    let tab = &mut panel.tabs.tabs[panel.tabs.active];
+    let remap = |index: i32| {
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| previous.get(index))
+            .and_then(|path| rows.iter().position(|row| row_path(row) == *path))
+            .map_or(-1, |index| index as i32)
+    };
+    tab.selection_anchor = remap(tab.selection_anchor);
+    tab.cursor = remap(tab.cursor);
+    layout_rows(&mut rows, tab.zoom, compact_icon_rows, item_spacing);
+    panel.replace_rows(rows);
+    true
 }
 
 /// Reorders only panels using the colour grouping after an annotation update.
@@ -9349,33 +9547,8 @@ fn regroup_colored_folder_panels(state: &AppState) -> bool {
         }
 
         let mut rows: Vec<FileRow> = panel.rows_model.iter().collect();
-        let previous_order: Vec<PathBuf> = rows.iter().map(row_path).collect();
-        let anchor_path = usize::try_from(tab.selection_anchor)
-            .ok()
-            .and_then(|index| previous_order.get(index))
-            .cloned();
-        let cursor_path = usize::try_from(tab.cursor)
-            .ok()
-            .and_then(|index| previous_order.get(index))
-            .cloned();
-
         group_colored_folder_rows(&mut rows);
-        if rows.iter().map(row_path).eq(previous_order.iter().cloned()) {
-            continue;
-        }
-
-        let tab = &mut panel.tabs.tabs[active];
-        tab.selection_anchor = anchor_path
-            .as_deref()
-            .and_then(|path| rows.iter().position(|row| row_path(row) == path))
-            .map_or(-1, |index| index as i32);
-        tab.cursor = cursor_path
-            .as_deref()
-            .and_then(|path| rows.iter().position(|row| row_path(row) == path))
-            .map_or(-1, |index| index as i32);
-        layout_rows(&mut rows, tab.zoom, compact_icon_rows, item_spacing);
-        panel.replace_rows(rows);
-        regrouped = true;
+        regrouped |= replace_reordered_rows(panel, rows, compact_icon_rows, item_spacing);
     }
     regrouped
 }
@@ -9515,18 +9688,6 @@ fn save_openers(state: &AppState) {
 /// Clamped position of the context menu so it doesn't overflow the window.
 /// The dimensions follow the Slint template (`width: 240px`; height 402 px
 /// for the full menu, 220 px for the "empty area" menu, see `ctx-on-empty`).
-fn clamp_ctx_menu_pos(w: &MainWindow, x: f32, y: f32, menu_h: f32) -> (f32, f32) {
-    const MENU_W: f32 = 240.0;
-    let win_size = w.window().size();
-    let scale = w.window().scale_factor().max(0.01);
-    let win_w = win_size.width as f32 / scale;
-    let win_h = win_size.height as f32 / scale;
-    (
-        x.min(win_w - MENU_W - 4.0).max(4.0),
-        y.min(win_h - menu_h - 4.0).max(4.0),
-    )
-}
-
 /// Is the selection an executable (→ "Use as application")?
 fn is_executable_path(p: &Path) -> bool {
     #[cfg(windows)]
@@ -9743,15 +9904,31 @@ fn push_openers_ui(window: &MainWindow, state: &AppState) {
     push_filtered_openers_ui(window, state);
 }
 
+/// Applies `edit` to whichever filter the active view is typing into, then
+/// republishes the listing. The two filters are mutually exclusive and share
+/// one keyboard stream, so the choice between them is made here once. A view
+/// in manual order has neither and is left alone.
+fn edit_active_filter(window: &MainWindow, state: &AppState, edit: impl FnOnce(&mut String)) {
+    if state.active_manual_order() {
+        return;
+    }
+    if state.active_ext_filter_on() {
+        state.with_tabs_mut(|b| {
+            let a = b.active;
+            edit(&mut b.tabs[a].ext_filter);
+        });
+    } else {
+        edit(&mut state.filter.borrow_mut());
+    }
+    let current = state.current_path();
+    refresh_listing(window, state, &current);
+    window.set_active_filter(state.filter.borrow().clone().into());
+}
+
 /// Pushes into `ctx-custom-entries` the commands pinned for context
-/// `bit` (CTX_FILE / CTX_DIR / CTX_BACKGROUND) and returns their count — used
-/// on every context menu OPENING for both content AND height.
-fn push_ctx_custom_entries(
-    window: &MainWindow,
-    state: &AppState,
-    bit: u8,
-    targets: &[PathBuf],
-) -> usize {
+/// `bit` (CTX_FILE / CTX_DIR / CTX_BACKGROUND). Called on every context menu
+/// OPENING.
+fn push_ctx_custom_entries(window: &MainWindow, state: &AppState, bit: u8, targets: &[PathBuf]) {
     let store = state.openers.borrow();
     let items: Vec<OpenerItem> = store
         .for_context(bit)
@@ -9759,9 +9936,7 @@ fn push_ctx_custom_entries(
         .filter(|o| ctx_entry_applies(o, bit, targets))
         .map(opener_to_item)
         .collect();
-    let n = items.len();
     window.set_ctx_custom_entries(ModelRc::new(VecModel::from(items)));
-    n
 }
 
 /// Does a pinned command belong in the menu for `targets`?
@@ -9786,15 +9961,15 @@ fn ctx_entry_applies(opener: &openers::Opener, bit: u8, targets: &[PathBuf]) -> 
 /// (Re)builds the Windows SHELL context menu for `targets` (selection, or
 /// [current folder] for the dead zone — queried "as an item",
 /// the item-context approach) and pushes the entries to the UI. The `IContextMenu`
-/// session is kept in the state (the ids are only valid for it). Returns the
-/// number of entries (menu height). Disabled / failed / non-Windows → 0.
-fn refresh_shell_menu(window: &MainWindow, state: &AppState, targets: &[PathBuf]) -> usize {
+/// session is kept in the state (the ids are only valid for it). Disabled /
+/// failed / non-Windows leaves the list empty.
+fn refresh_shell_menu(window: &MainWindow, state: &AppState, targets: &[PathBuf]) {
     window.set_ctx_shell_sub_open(false); // resets the flyout from a previous opening
     let enabled = state.config.borrow().shell_ctx_menu;
     if !enabled || targets.is_empty() {
         *state.shell_menu.borrow_mut() = None;
         window.set_ctx_shell_entries(ModelRc::new(VecModel::from(Vec::<ShellCtxEntry>::new())));
-        return 0;
+        return;
     }
     let work_dir = state.current_path();
     match crate::shellmenu::build_for_paths(targets, &work_dir) {
@@ -9849,17 +10024,14 @@ fn refresh_shell_menu(window: &MainWindow, state: &AppState, targets: &[PathBuf]
                     sub,
                 });
             }
-            let n = items.len();
             *state.shell_menu.borrow_mut() = Some(session);
             *state.shell_subs.borrow_mut() = subs;
             window.set_ctx_shell_entries(ModelRc::new(VecModel::from(items)));
-            n
         }
         None => {
             *state.shell_menu.borrow_mut() = None;
             *state.shell_subs.borrow_mut() = Vec::new();
             window.set_ctx_shell_entries(ModelRc::new(VecModel::from(Vec::<ShellCtxEntry>::new())));
-            0
         }
     }
 }
@@ -11441,6 +11613,7 @@ fn apply_initial_listing(
                         annotations: &annotations_now(state),
                     },
                 );
+                folder_stats::remember_entries(state, p, &entries);
                 p.replace_rows(rows);
                 p.hidden_count = hidden_count;
                 p.unavailable = false;
@@ -11463,9 +11636,9 @@ fn apply_initial_listing(
     // isn't active (its listing may have arrived after the active panel's).
     request_thumbnails(state);
     // ACTIVE panel: watcher + other background work tied to navigation.
+    request_folder_stats(window, state);
     if is_active {
         install_watcher(state, window, path);
-        request_folder_stats(state);
         request_imgmeta(state);
     }
 }
@@ -11520,14 +11693,14 @@ fn refresh_all_panels(window: &MainWindow, state: &AppState) {
     if searching.contains(&active_idx) {
         update_panels_ui(window, state);
         request_thumbnails(state);
-        request_folder_stats(state);
+        request_folder_stats(window, state);
         request_imgmeta(state);
         return;
     }
     if active.as_os_str().is_empty() {
         update_panels_ui(window, state);
         request_thumbnails(state);
-        request_folder_stats(state);
+        request_folder_stats(window, state);
         request_imgmeta(state);
     } else {
         let active_is_network =
@@ -11537,7 +11710,7 @@ fn refresh_all_panels(window: &MainWindow, state: &AppState) {
             // The active listing will arrive later; the local panels already
             // re-read shouldn't wait on this network share for their visual work.
             request_thumbnails(state);
-            request_folder_stats(state);
+            request_folder_stats(window, state);
             request_imgmeta(state);
         }
     }
@@ -11655,6 +11828,7 @@ fn relist_panel(state: &AppState, i: usize) {
                 .and_then(|name| rows.iter().position(|row| row.name.as_str() == name))
                 .map(|index| index as i32)
                 .unwrap_or(-1);
+            folder_stats::remember_entries(state, panel, &entries);
             panel.replace_rows(rows);
             let active = panel.tabs.active;
             panel.tabs.tabs[active].selection_anchor = anchor;
@@ -12275,72 +12449,20 @@ fn set_external_file_hover(
     window.set_file_drag_selection_can_favorite(false);
     window.set_file_drag_can_open(false);
     window.set_folder_open_drag_active(false);
-    window.set_file_drag_target_invalid(false);
     window.set_file_drag_action(action as i32);
     window.set_file_drag_abs_x(wx);
     window.set_file_drag_abs_y(wy);
     window.set_file_drag_active(true);
-    let (panel, row) = external_file_target_at(window, wx, wy);
-    let item = usize::try_from(panel)
-        .ok()
-        .and_then(|panel| window.get_panels().row_data(panel))
-        .and_then(|view| {
-            usize::try_from(row)
-                .ok()
-                .and_then(|row| view.rows.row_data(row))
-        });
-    window.set_file_drag_target_panel(panel);
-    window.set_file_drag_target_row(row);
-    window.set_file_drag_target_folder(item.as_ref().is_some_and(|item| item.is_dir));
-    window.set_file_drag_target_exec(
-        item.as_ref()
-            .is_some_and(|item| !item.is_dir && item.drop_runnable),
-    );
+    // The cursor position is all this has to publish. Which viewport holds it,
+    // which row it lands on and whether that target is refused are decided by
+    // the UI, from the viewport rectangles it owns, exactly as for a drag that
+    // starts inside the window. Deciding it a second time here would mean
+    // mirroring those rectangles across the boundary, and a mirror that falls
+    // out of step contradicts the UI instead of agreeing with it.
+    //
     // OLE enters outside Slint's input dispatch. Explicitly wake the renderer
     // even when the target window was idle or inactive before the drag.
     window.window().request_redraw();
-}
-
-/// Pull the final hit from geometry, not from deferred hover notifications.
-#[cfg(windows)]
-fn external_file_target_at(window: &MainWindow, x: f32, y: f32) -> (i32, i32) {
-    for panel in 0..window.get_panels().row_count() {
-        let Some(area) = window.get_file_drop_areas().row_data(panel) else {
-            continue;
-        };
-        if !file_drop_area_contains(&area, x, y) {
-            continue;
-        }
-        let content_x = x - area.content_left;
-        let row = if content_x >= area.content_start && content_x <= area.content_right {
-            window.invoke_panel_item_at_content_point(
-                panel as i32,
-                content_x,
-                y - area.top + area.scroll_top,
-                area.grid,
-            )
-        } else {
-            -1
-        };
-        let rejected = window.get_panels().row_data(panel).is_some_and(|view| {
-            view.search_recursive
-                && usize::try_from(row)
-                    .ok()
-                    .and_then(|i| view.rows.row_data(i))
-                    .is_none_or(|item| !item.is_dir && !item.drop_runnable)
-        });
-        return if rejected {
-            (-1, -1)
-        } else {
-            (panel as i32, row)
-        };
-    }
-    (-1, -1)
-}
-
-#[cfg(any(windows, test))]
-fn file_drop_area_contains(area: &crate::FileDropArea, x: f32, y: f32) -> bool {
-    x >= area.left && x < area.left + area.width && y >= area.top && y < area.top + area.height
 }
 
 #[cfg(windows)]
@@ -12357,9 +12479,14 @@ fn clear_external_file_hover(window: &MainWindow) {
     }
 }
 
-/// Finishes an OLE drop received by Favnyr. The final target is re-read after
-/// replaying the authoritative point: executables use ShellExecute, Ctrl copies,
-/// Shift moves, and other drops use the Move/Copy/Link menu shared between views.
+/// Finishes an OLE drop received by Favnyr. The target is the one the hover
+/// settled on: executables use ShellExecute, Ctrl copies, Shift moves, and other
+/// drops use the Move/Copy/Link menu shared between views.
+///
+/// Reading the target rather than recomputing it is what makes the pill a
+/// promise: the drop lands where the indicator said it would, because both read
+/// the same answer. This runs one tick after OLE released its capture, so the
+/// hover that set that answer has already been applied.
 #[cfg(windows)]
 fn on_external_file_drop(
     window: &MainWindow,
@@ -12378,6 +12505,13 @@ fn on_external_file_drop(
     let target_panel = window.get_file_drag_target_panel();
     if target_panel < 0 {
         debug!(screen_x, screen_y, "OLE drop outside a file viewport");
+        clear_external_file_hover(window);
+        return;
+    }
+    // A search listing shows items from many folders at once, so only a folder
+    // row names a destination. The indicator refuses the rest, and so does this.
+    if window.get_file_drag_target_invalid() {
+        debug!(target_panel, "OLE drop on a target the indicator refuses");
         clear_external_file_hover(window);
         return;
     }
@@ -14171,6 +14305,7 @@ fn apply_async_listing(window: &MainWindow, state: &AppState, delivery: AsyncLis
                     }
                 }
                 count = rows.len();
+                folder_stats::remember_entries(state, panel, &entries);
                 panel.replace_rows(rows);
                 panel.tabs.tabs[active].selection_anchor = anchor;
                 panel.tabs.tabs[active].cursor = anchor;
@@ -14202,7 +14337,7 @@ fn apply_async_listing(window: &MainWindow, state: &AppState, delivery: AsyncLis
     // The panel may have become inactive during the network listing while
     // remaining visible in the split: its previews must still start.
     request_thumbnails(state);
-    request_folder_stats(state);
+    request_folder_stats(window, state);
     request_imgmeta(state);
     if is_active {
         install_watcher(state, window, &delivery.path);
@@ -14410,6 +14545,7 @@ fn refresh_listing_sync(window: &MainWindow, state: &AppState, path: &Path) {
     });
     {
         let mut panels = state.panels.borrow_mut();
+        folder_stats::remember_entries(state, &mut panels[active_idx], &entries);
         panels[active_idx].replace_rows(rows);
         panels[active_idx].displayed_path = path.to_path_buf();
         panels[active_idx].hidden_count = hidden_count;
@@ -14421,7 +14557,7 @@ fn refresh_listing_sync(window: &MainWindow, state: &AppState, path: &Path) {
     install_watcher(state, window, path);
     update_panels_ui(window, state);
     request_thumbnails(state);
-    request_folder_stats(state);
+    request_folder_stats(window, state);
     request_imgmeta(state);
     debug!(path = %path.display(), count, "listing refreshed");
 }
@@ -14842,12 +14978,6 @@ fn update_panels_ui(window: &MainWindow, state: &AppState) {
     // instant it becomes active. The model is only replaced for a
     // STRUCTURAL change (split/close → the number of panels changes).
     let existing = window.get_panels();
-    #[cfg(windows)]
-    if window.get_file_drop_areas().row_count() != views.len() {
-        window.set_file_drop_areas(ModelRc::new(VecModel::from(vec![
-            crate::FileDropArea::default(); views.len()
-        ])));
-    }
     if existing.row_count() == views.len() {
         for (i, v) in views.into_iter().enumerate() {
             existing.set_row_data(i, v);
@@ -16054,141 +16184,6 @@ fn update_panel_render_window(
     }
 }
 
-// Recursive folder modification date ----------
-
-struct RMtimeJob {
-    path: PathBuf,
-    /// Recursive mtime depth for this job (`0` = don't compute the date).
-    mtime_depth: u32,
-    /// Recursive size depth for this job (`0` = don't compute the size).
-    size_depth: u32,
-    r#gen: u64,
-    panel: usize,
-    row: usize,
-}
-
-/// Applies a (recursive) mtime to a row's "modified" + "age" cells.
-fn apply_rmtime_to_row(row: &mut FileRow, m: i64, now: i64, lang: Lang) {
-    row.modified = rfs::format_mtime(m, mtime_offset()).into();
-    row.age = rfs::format_age(m, now, i18n::age_units(lang)).into();
-    row.age_bucket = rfs::age_bucket(m, now);
-}
-
-/// Background worker: computes a folder's recursive mtime AND size off the UI
-/// thread (one shared walk) and pushes the result via
-/// `folder-stats-ready(path, mtime, size)`. Ignores stale jobs (outdated
-/// generation = folder left / a depth changed).
-fn spawn_rmtime_worker(
-    rx: mpsc::Receiver<RMtimeJob>,
-    r#gen: Arc<AtomicU64>,
-    weak: slint::Weak<MainWindow>,
-) {
-    std::thread::spawn(move || {
-        while let Ok(job) = rx.recv() {
-            if job.r#gen != r#gen.load(Ordering::Relaxed) {
-                continue;
-            }
-            // One walk yields both metrics; each is `None` when its depth is 0.
-            let (mtime, size) =
-                rfs::recursive_folder_stats(&job.path, job.mtime_depth, job.size_depth);
-            if mtime.is_none() && size.is_none() {
-                continue;
-            }
-            let path_str = job.path.to_string_lossy().to_string();
-            // An empty string means "not computed" for that metric.
-            let mtime_str = mtime.map(|m| m.to_string()).unwrap_or_default();
-            let size_str = size.map(|s| s.to_string()).unwrap_or_default();
-            let panel = job.panel as i32;
-            let row = job.row as i32;
-            let weak = weak.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(w) = weak.upgrade() {
-                    w.invoke_folder_stats_ready(
-                        panel,
-                        row,
-                        path_str.into(),
-                        mtime_str.into(),
-                        size_str.into(),
-                    );
-                }
-            });
-        }
-    });
-}
-
-/// If either "folder date" or "folder size" is enabled (its depth > 0): applies
-/// the cached recursive mtime and/or size to each panel's FOLDER rows and queues
-/// the missing computations — a single shared walk covers both. To be called
-/// after any (re)population of rows. Increments the generation.
-fn request_folder_stats(state: &AppState) {
-    let (mtime_depth, size_depth) = {
-        let c = state.config.borrow();
-        (
-            c.recursive_mtime_depth.max(0) as u32,
-            c.recursive_size_depth.max(0) as u32,
-        )
-    };
-    if mtime_depth == 0 && size_depth == 0 {
-        return;
-    }
-    let lang = state.config.borrow().language;
-    let now = now_unix();
-    let r#gen = state.rmtime_gen.fetch_add(1, Ordering::Relaxed) + 1;
-    let panels = state.panels.borrow();
-    for (panel_idx, panel) in panels.iter().enumerate() {
-        let dir = panel.tabs.tabs[panel.tabs.active].current_path.clone();
-        if panel.search.is_some() {
-            continue;
-        }
-        // NETWORK folder: a recursive walk through the share would burst a stat
-        // per subfolder — Explorer doesn't either. Keep folders' own mtime and
-        // no recursive size.
-        if favnyr_core::places::is_network_path(&dir) {
-            continue;
-        }
-        let model = &panel.rows_model;
-        for i in 0..model.row_count() {
-            let Some(mut row) = model.row_data(i) else {
-                continue;
-            };
-            if !row.is_dir {
-                continue; // only folders have recursive stats
-            }
-            let full = row_path(&row);
-            let key = full.to_string_lossy().to_string();
-            let m_cached = (mtime_depth > 0)
-                .then(|| state.rmtime_cache.borrow().get(&key).copied())
-                .flatten();
-            let s_cached = (size_depth > 0)
-                .then(|| state.size_cache.borrow().get(&key).copied())
-                .flatten();
-            if m_cached.is_some() || s_cached.is_some() {
-                if let Some(m) = m_cached {
-                    apply_rmtime_to_row(&mut row, m, now, lang);
-                }
-                if let Some(s) = s_cached {
-                    row.size = rfs::format_size(s, i18n::size_units(lang)).into();
-                }
-                model.set_row_data(i, row);
-            }
-            // Queue only what is BOTH enabled and not yet cached, so a job never
-            // recomputes a metric already known.
-            let need_mtime = mtime_depth > 0 && m_cached.is_none();
-            let need_size = size_depth > 0 && s_cached.is_none();
-            if need_mtime || need_size {
-                let _ = state.rmtime_tx.send(RMtimeJob {
-                    path: full,
-                    mtime_depth: if need_mtime { mtime_depth } else { 0 },
-                    size_depth: if need_size { size_depth } else { 0 },
-                    r#gen,
-                    panel: panel_idx,
-                    row: i,
-                });
-            }
-        }
-    }
-}
-
 // Image metadata: resolution / depth ----------
 
 struct ImgMetaJob {
@@ -16711,7 +16706,7 @@ fn row_band_for_content_range(model: &VecModel<FileRow>, y1: f32, y2: f32) -> (i
 
 /// Local<->UTC offset (seconds) applied to the "Modified" column. Set
 /// by the GUI at startup and on every timezone setting change; read by
-/// the row builders (`entry_to_row`, `apply_rmtime_to_row`, preview).
+/// the row builders and the recursive folder-statistics worker.
 /// `0` = UTC. Atomic global: the initial listing can build rows
 /// from a background thread.
 static MTIME_OFFSET_SECS: AtomicI64 = AtomicI64::new(0);
@@ -17148,6 +17143,7 @@ fn entry_to_row(e: &Entry, parent_display: &str, ctx: &RowContext) -> FileRow {
         created: created.into(),
         is_dir: e.is_dir,
         is_symlink: e.is_symlink,
+        is_share: e.is_share,
         // Only consulted for folders, so a stray slot on a file costs nothing.
         folder_slot: i32::from(annotations.color_of(&e.path)),
         comment: annotations.note_of(&e.path).into(),
@@ -17773,7 +17769,7 @@ fn perform_manual_reorder(
     if changed {
         update_panels_ui(window, state);
         request_thumbnails(state);
-        request_folder_stats(state);
+        request_folder_stats(window, state);
         request_imgmeta(state);
         window.invoke_refresh_all();
     }
@@ -17876,6 +17872,190 @@ fn clear_cut_marks<M: Model<Data = FileRow>>(model: &M) {
     }
 }
 
+// ---------- Terminal preference ----------
+
+/// Row of the terminal list in the settings.
+enum TerminalRow {
+    /// Store this program, empty standing for the automatic choice.
+    Choose(String),
+    /// Open the picker instead of storing anything.
+    Browse,
+}
+
+/// The rows the terminal list shows: the automatic choice, the terminals
+/// found on this machine, the one already chosen when it is none of those,
+/// and the row that browses for a program.
+///
+/// Built from the same two inputs when the list opens and when a row is
+/// chosen, so an index means the same thing in both.
+fn terminal_rows(detected: &[String], saved: &str, lang: Lang) -> Vec<(String, TerminalRow)> {
+    let mut rows = vec![(
+        i18n::tr(lang, "terminal_automatic"),
+        TerminalRow::Choose(String::new()),
+    )];
+    rows.extend(
+        detected
+            .iter()
+            .map(|term| (term.clone(), TerminalRow::Choose(term.clone()))),
+    );
+    if !saved.is_empty() && !detected.iter().any(|term| term == saved) {
+        // Chosen by browsing for it, or installed where the list does not
+        // look. Shown by file name alone, the whole path being far longer
+        // than the row.
+        let label = Path::new(saved)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| saved.to_owned());
+        rows.push((label, TerminalRow::Choose(saved.to_owned())));
+    }
+    rows.push((i18n::tr(lang, "terminal_browse"), TerminalRow::Browse));
+    rows
+}
+
+/// Fills the terminal list and selects the row the settings hold.
+fn refresh_terminals(window: &MainWindow, state: &AppState) {
+    let config = state.snapshot_config();
+    let rows = terminal_rows(
+        &actions::detected_terminals(),
+        &config.terminal,
+        config.language,
+    );
+    let selected = rows
+        .iter()
+        .position(|(_, row)| matches!(row, TerminalRow::Choose(p) if *p == config.terminal))
+        .unwrap_or(0) as i32;
+    let labels: Vec<SharedString> = rows.into_iter().map(|(label, _)| label.into()).collect();
+    window.set_terminal_labels(ModelRc::new(VecModel::from(labels)));
+    window.set_terminal_index(selected);
+}
+
+#[cfg(test)]
+mod workspace_theme_tests {
+    #[test]
+    fn a_shared_listing_resolves_only_the_loaded_workspaces_theme() {
+        let mut metas = vec![favnyr_core::workspace::NamedWorkspaceMeta {
+            id: "workspace01".into(),
+            name: "Workspace 01".into(),
+            views: 1,
+            tabs: 1,
+            saved_at: 0,
+            slot: Some(1),
+            theme: Some("user:theme01.toml".into()),
+        }];
+        let none = (None, String::new());
+        assert_eq!(super::loaded_workspace_theme(None, &metas), none);
+        assert_eq!(
+            super::loaded_workspace_theme(Some("Workspace 02"), &metas),
+            none
+        );
+        assert_eq!(
+            super::loaded_workspace_theme(Some("Workspace 01"), &metas),
+            (Some("user:theme01.toml".into()), "Workspace 01".into())
+        );
+        metas[0].theme = None;
+        assert_eq!(
+            super::loaded_workspace_theme(Some("Workspace 01"), &metas),
+            none
+        );
+    }
+
+    use super::{MAX_WORKSPACE_THEME_NAME, workspace_theme_label};
+    use favnyr_core::i18n::Lang;
+    use favnyr_core::theme::BuiltinTheme;
+
+    /// What a row shows for the theme a workspace imposes. The identifier is
+    /// read rather than looked up in the theme list, so the test also states
+    /// that a row reads correctly before any scan of the themes folder.
+    #[test]
+    fn a_row_names_the_theme_it_imposes_within_a_bounded_width() {
+        // No theme imposed, nothing shown: the row looks as it always did.
+        assert_eq!(workspace_theme_label(None, Lang::En), "");
+
+        // A built-in family reads under its translated name, the base family
+        // included, whose identifier only exists as an alias. None of them is
+        // ever cut, in any language: the cut exists for a file name, which has
+        // no bound. A family added past this length would be caught here.
+        for family in BuiltinTheme::ALL {
+            for lang in Lang::all() {
+                let shown = workspace_theme_label(Some(family.stored_id()), *lang);
+                assert!(!shown.is_empty(), "{family:?} {lang:?}");
+                assert!(!shown.ends_with('…'), "{shown}");
+                assert!(shown.chars().count() <= MAX_WORKSPACE_THEME_NAME, "{shown}");
+            }
+        }
+        assert_eq!(
+            workspace_theme_label(Some(BuiltinTheme::Nord.stored_id()), Lang::En),
+            "Nord"
+        );
+        // Translated, like every other name the interface shows.
+        assert_ne!(
+            workspace_theme_label(Some(BuiltinTheme::Nord.stored_id()), Lang::Ja),
+            workspace_theme_label(Some(BuiltinTheme::CatppuccinMocha.stored_id()), Lang::Ja)
+        );
+
+        // A personal theme reads under its file name, without the extension.
+        assert_eq!(
+            workspace_theme_label(Some("user:theme01.toml"), Lang::En),
+            "theme01"
+        );
+
+        // A name long enough to squeeze the workspace's own is cut, and says
+        // so. Counted in characters, so a name written in a script where one
+        // character is several bytes is cut where it reads, not mid-character.
+        let long = format!("user:{}.toml", "o".repeat(MAX_WORKSPACE_THEME_NAME + 10));
+        let shown = workspace_theme_label(Some(&long), Lang::En);
+        assert_eq!(shown.chars().count(), MAX_WORKSPACE_THEME_NAME + 1);
+        assert!(shown.ends_with('…'));
+        let wide = format!("user:{}.toml", "あ".repeat(MAX_WORKSPACE_THEME_NAME + 10));
+        let shown = workspace_theme_label(Some(&wide), Lang::Ja);
+        assert_eq!(shown.chars().count(), MAX_WORKSPACE_THEME_NAME + 1);
+        assert!(shown.starts_with('あ'));
+
+        // An identifier naming nothing shows nothing rather than itself: the
+        // stored value has already been filtered, this is the last guard.
+        assert_eq!(workspace_theme_label(Some("builtin:unknown"), Lang::En), "");
+    }
+}
+
+#[cfg(test)]
+mod terminal_choice_tests {
+    use super::{TerminalRow, terminal_rows};
+    use favnyr_core::i18n::Lang;
+
+    #[test]
+    fn the_list_keeps_the_terminal_held_even_when_it_is_not_detected() {
+        let detected = ["term01".to_string(), "term02".to_string()];
+        let shown = |rows: &[(String, TerminalRow)]| {
+            rows.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>()
+        };
+
+        // Nothing chosen: the automatic row first, what the machine has, then
+        // the way out for everything else.
+        let rows = terminal_rows(&detected, "", Lang::En);
+        assert_eq!(shown(&rows), ["Automatic", "term01", "term02", "Browse…"]);
+        assert!(matches!(&rows[0].1, TerminalRow::Choose(p) if p.is_empty()));
+        assert!(matches!(&rows[3].1, TerminalRow::Browse));
+
+        // One of the detected ones: it is not listed twice.
+        let rows = terminal_rows(&detected, "term02", Lang::En);
+        assert_eq!(shown(&rows), ["Automatic", "term01", "term02", "Browse…"]);
+
+        // Browsed for, so absent from what the machine advertises. It gets a
+        // row of its own, named after the program rather than its whole path,
+        // and that row carries the path the settings hold.
+        let rows = terminal_rows(&detected, "/opt/folder01/term03", Lang::En);
+        assert_eq!(
+            shown(&rows),
+            ["Automatic", "term01", "term02", "term03", "Browse…"]
+        );
+        assert!(matches!(&rows[3].1, TerminalRow::Choose(p) if p == "/opt/folder01/term03"));
+
+        // A machine with no terminal of its own still offers both rows.
+        let rows = terminal_rows(&[], "", Lang::En);
+        assert_eq!(shown(&rows), ["Automatic", "Browse…"]);
+    }
+}
+
 // ---------- i18n helpers ----------
 
 fn apply_language(window: &MainWindow, lang: Lang) {
@@ -17896,12 +18076,14 @@ fn apply_language(window: &MainWindow, lang: Lang) {
     window.set_language_labels(ModelRc::new(VecModel::from(lang_labels)));
     window.set_language_index(lang_idx);
 
-    let theme_labels: Vec<SharedString> = i18n::theme_labels(lang);
-    window.set_theme_labels(ModelRc::new(VecModel::from(theme_labels)));
+    window.invoke_refresh_theme_labels();
+    // The automatic and browse rows are translated, so the list is rebuilt
+    // with them rather than left in the previous language.
+    window.invoke_refresh_terminals();
 
-    // "Default tab bar position" setting: same
-    // labels as the per-view menu.
-    let tabbar_labels: Vec<SharedString> = i18n::tabbar_labels(lang);
+    // "Default tab bar position" setting: short entries of its own, the row
+    // title already naming the tab bar.
+    let tabbar_labels: Vec<SharedString> = i18n::tabbar_position_labels(lang);
     window.set_tabbar_default_labels(ModelRc::new(VecModel::from(tabbar_labels)));
 
     // The per-panel footer is recomputed by update_panels_ui (called after
@@ -18461,27 +18643,6 @@ mod tests {
         let legacy = Tab::restored(PathBuf::from("folder01"), &saved);
         assert_eq!(legacy.zoom, THUMB_DEFAULT_ZOOM);
         assert_eq!(legacy.grid_zoom, None);
-    }
-
-    #[test]
-    fn preference_file_drop_rejects_headers_footer_and_scrollbar() {
-        let area = crate::FileDropArea {
-            left: 100.0,
-            top: 80.0,
-            width: 200.0,
-            height: 300.0,
-            ..Default::default()
-        };
-        assert!(file_drop_area_contains(&area, 100.0, 80.0));
-        assert!(file_drop_area_contains(&area, 299.0, 379.0));
-        for (x, y) in [(100.0, 79.0), (100.0, 380.0), (300.0, 90.0), (99.0, 90.0)] {
-            assert!(!file_drop_area_contains(&area, x, y));
-        }
-        assert!(!file_drop_area_contains(
-            &crate::FileDropArea::default(),
-            0.0,
-            0.0
-        ));
     }
 
     #[test]

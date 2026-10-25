@@ -27,6 +27,11 @@ pub fn data_dir() -> PathBuf {
     app_dir(dirs::data_dir())
 }
 
+/// User-supplied application palettes, separate from desktop icon themes.
+pub fn themes_dir() -> PathBuf {
+    data_dir().join("themes")
+}
+
 /// Config: Linux `$XDG_CONFIG_HOME/favnyr` (default `~/.config/favnyr`);
 /// Windows `%APPDATA%\favnyr`.
 pub fn config_dir() -> PathBuf {

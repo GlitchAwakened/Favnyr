@@ -518,7 +518,7 @@ pub fn spawn_program_in(program: &Path, args: &[String], cwd: Option<&Path>) -> 
 }
 
 /// Launches an opener on a folder from a command pinned to the view's
-/// background, e.g. "Git Bash here". In this context, `{dir}` and `{file}`
+/// background, e.g. "open a shell here". In this context, `{dir}` and `{file}`
 /// both equal the current folder (in `TagContext::from_path`, `{dir}` would be
 /// the PARENT — counter-intuitive for an "here" command). OS association apps:
 /// delegated to the OS on the folder.
@@ -1024,7 +1024,7 @@ fn file_manager1_available() -> bool {
 
 /// **Desktop-native** properties dialog on Linux, via the freedesktop
 /// interface `org.freedesktop.FileManager1.ShowItemProperties` — implemented
-/// by Dolphin (KDE), Nautilus (GNOME), Nemo (Cinnamon), Caja (MATE)… We go
+/// by the file managers of the common desktops (KDE, GNOME, Cinnamon, MATE…). We go
 /// through `gdbus` (glib2, present on all common desktops): **no
 /// dependency added**, compliant with the cargo-deny policy.
 ///
@@ -1092,12 +1092,14 @@ pub fn open_trash() -> Result<()> {
         .map_err(|e| anyhow!("spawn explorer (recycle bin): {e}"))
 }
 
-/// Builds the silent launch of the Windows Terminal alias.
+/// Builds the silent launch of the Windows Terminal alias. The program is
+/// named rather than assumed, so a copy chosen by browsing for it is started
+/// with the same option as the one found on the `PATH`.
 #[cfg(windows)]
-fn windows_terminal_command(cwd: &Path) -> Command {
+fn windows_terminal_command(program: &str, cwd: &Path) -> Command {
     use std::os::windows::process::CommandExt;
 
-    let mut command = Command::new("wt.exe");
+    let mut command = Command::new(program);
     command
         .arg("-d")
         .arg(cwd)
@@ -1123,8 +1125,56 @@ fn command_prompt_command(cwd: &Path) -> Command {
     command
 }
 
+/// Builds the launch of a terminal named in the settings.
+///
+/// Windows Terminal takes the working directory as an option, because it
+/// hands the request to an instance that is already running and whose own
+/// directory is elsewhere. The others are started in the directory itself.
+#[cfg(windows)]
+fn chosen_terminal_command(program: &str, cwd: &Path) -> Command {
+    use std::os::windows::process::CommandExt;
+
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    if name == "wt.exe" {
+        return windows_terminal_command(program, cwd);
+    }
+    let mut command = Command::new(program);
+    command.current_dir(cwd);
+    // A shell is a console program and Favnyr, being graphical, has no
+    // console to hand down, so one is created for it. A graphical terminal
+    // opens a window of its own and is given none.
+    if matches!(name.as_str(), "cmd.exe" | "powershell.exe" | "pwsh.exe") {
+        command.creation_flags(CREATE_NEW_CONSOLE);
+    } else {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            // Several terminals ship a small console launcher next to their
+            // graphical program, and browsing for one may well land on it.
+            // Windows allocates a console for a console-subsystem image that
+            // is given none, which flashes a window before the terminal
+            // appears; the decision comes from the image header and these
+            // flags, so redirecting the handles above does not prevent it. A
+            // genuinely graphical program has no console either way, so this
+            // costs it nothing.
+            .creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 /// Opens a terminal with `cwd` set to the folder containing `path`.
-pub fn open_terminal(path: &Path) -> Result<()> {
+///
+/// `preferred` is the terminal chosen in the settings, empty for none. It is
+/// scoped to this application: nothing here consults or changes what the
+/// system opens elsewhere. A terminal that cannot be started any more, having
+/// been uninstalled since it was chosen, gives way to the automatic choice,
+/// because a shortcut that opens another terminal beats one that does nothing.
+pub fn open_terminal(path: &Path, preferred: &str) -> Result<()> {
     let cwd = if path.is_dir() {
         path.to_path_buf()
     } else {
@@ -1132,11 +1182,33 @@ pub fn open_terminal(path: &Path) -> Result<()> {
             .map(Path::to_path_buf)
             .ok_or_else(|| anyhow!("no parent for {}", path.display()))?
     };
+    let chosen = if preferred.is_empty() {
+        None
+    } else if terminal_is_available(preferred) {
+        Some(preferred)
+    } else {
+        warn!(
+            terminal = %preferred,
+            "the terminal chosen in the settings was not found, falling back"
+        );
+        None
+    };
 
     #[cfg(windows)]
     {
+        if let Some(program) = chosen {
+            match chosen_terminal_command(program, &cwd).spawn() {
+                Ok(_) => {
+                    info!(terminal = %program, cwd = %cwd.display(), "opening the chosen terminal");
+                    return Ok(());
+                }
+                Err(error) => {
+                    warn!(error = %error, terminal = %program, "chosen terminal failed to start");
+                }
+            }
+        }
         // Windows Terminal (`wt`) first: clean window, `-d` = cwd.
-        match windows_terminal_command(&cwd).spawn() {
+        match windows_terminal_command("wt.exe", &cwd).spawn() {
             Ok(_) => {
                 info!(cwd = %cwd.display(), "opening Windows Terminal");
                 return Ok(());
@@ -1155,8 +1227,11 @@ pub fn open_terminal(path: &Path) -> Result<()> {
     }
     #[cfg(not(windows))]
     {
-        let term = pick_terminal()
-            .ok_or_else(|| anyhow!("no terminal detected ($TERMINAL or known candidates)"))?;
+        let term = match chosen {
+            Some(program) => program.to_string(),
+            None => pick_terminal()
+                .ok_or_else(|| anyhow!("no terminal detected ($TERMINAL or known candidates)"))?,
+        };
         info!(terminal = %term, cwd = %cwd.display(), "opening a terminal");
         Command::new(&term)
             .args(working_directory_args(&term, &cwd))
@@ -1168,6 +1243,78 @@ pub fn open_terminal(path: &Path) -> Result<()> {
             .map(|_| ())
             .map_err(|e| anyhow!("spawn '{term}' in '{}': {e}", cwd.display()))
     }
+}
+
+/// Terminals the settings offer, in the order the list shows them. The same
+/// list drives the automatic choice, which takes the first one present.
+///
+/// They are names resolved through the `PATH`, which is where terminals are
+/// installed here, so what the list offers is what the machine really has.
+#[cfg(not(windows))]
+const TERMINAL_CANDIDATES: &[&str] = &[
+    "kgx",            // GNOME Console
+    "konsole",        // KDE
+    "gnome-terminal", // legacy GNOME
+    "kitty",
+    "alacritty",
+    "foot",
+    "wezterm",
+    "xfce4-terminal",
+    "lxterminal",
+    "tilix",
+    "xterm",
+];
+
+/// Terminals the settings offer, in the order Favnyr already tries them.
+///
+/// Only what Windows itself provides is named. Other terminals install
+/// outside the `PATH`, so looking for them by name would find nothing and
+/// offering them by name would promise something that cannot be started:
+/// they are chosen by browsing for the program instead. `wt.exe` is listed
+/// although it is absent from older systems, exactly as the automatic choice
+/// already tries it before falling back.
+#[cfg(windows)]
+const TERMINAL_CANDIDATES: &[&str] = &["wt.exe", "powershell.exe", "cmd.exe"];
+
+/// The terminals to list in the settings. Empty is a valid answer, and means
+/// the automatic choice is the only one on offer.
+#[cfg(not(windows))]
+pub fn detected_terminals() -> Vec<String> {
+    TERMINAL_CANDIDATES
+        .iter()
+        .filter(|c| which(c))
+        .map(|c| (*c).to_string())
+        .collect()
+}
+
+#[cfg(windows)]
+pub fn detected_terminals() -> Vec<String> {
+    TERMINAL_CANDIDATES
+        .iter()
+        .map(|c| (*c).to_string())
+        .collect()
+}
+
+/// True when the terminal named in the settings can still be started.
+///
+/// A terminal chosen by browsing for it is a full path, and that path must
+/// still lead to a file: this is what notices one uninstalled since.
+#[cfg(not(windows))]
+fn terminal_is_available(program: &str) -> bool {
+    if program.contains('/') {
+        Path::new(program).is_file()
+    } else {
+        which(program)
+    }
+}
+
+/// Same, for a platform where a bare name is not looked up in the `PATH`.
+/// The list only offers terminals the system provides, so such a name is
+/// taken on trust and a launch that fails falls back as it always did.
+#[cfg(windows)]
+fn terminal_is_available(program: &str) -> bool {
+    let path = Path::new(program);
+    !path.is_absolute() || path.is_file()
 }
 
 // ----- Internal helpers (Linux only) -----
@@ -1213,20 +1360,7 @@ pub(crate) fn pick_terminal() -> Option<String> {
             tracing::warn!(term = %t, "$TERMINAL set but not found, falling back");
         }
     }
-    const CANDIDATES: &[&str] = &[
-        "kgx",            // GNOME Console
-        "konsole",        // KDE
-        "gnome-terminal", // legacy GNOME
-        "kitty",
-        "alacritty",
-        "foot",
-        "wezterm",
-        "xfce4-terminal",
-        "lxterminal",
-        "tilix",
-        "xterm",
-    ];
-    CANDIDATES
+    TERMINAL_CANDIDATES
         .iter()
         .find(|c| which(c))
         .map(|c| (*c).to_string())
@@ -1707,7 +1841,7 @@ mod unix_terminal_tests {
 
 #[cfg(all(test, windows))]
 mod terminal_tests {
-    use super::{command_prompt_command, windows_terminal_command};
+    use super::{chosen_terminal_command, command_prompt_command, windows_terminal_command};
     use std::ffi::OsStr;
     use std::path::Path;
 
@@ -1715,7 +1849,7 @@ mod terminal_tests {
     fn terminal_commands_do_not_use_an_intermediate_cmd_start() {
         let cwd = Path::new(r"C:\Work folder");
 
-        let wt = windows_terminal_command(cwd);
+        let wt = windows_terminal_command("wt.exe", cwd);
         assert_eq!(wt.get_program(), OsStr::new("wt.exe"));
         assert_eq!(
             wt.get_args().collect::<Vec<_>>(),
@@ -1726,6 +1860,43 @@ mod terminal_tests {
         assert_eq!(cmd.get_program(), OsStr::new("cmd.exe"));
         assert_eq!(cmd.get_args().count(), 0);
         assert_eq!(cmd.get_current_dir(), Some(cwd));
+    }
+
+    /// How a terminal named in the settings reaches its branch. The choice is
+    /// keyed on the file name, so a program designated by its full path has to
+    /// land where its bare name would, and the path itself must be handed to
+    /// the system unchanged rather than reduced to that name.
+    ///
+    /// Only two outcomes are observable on a built command: the directory
+    /// given as an option, or given as the process directory. Which of the
+    /// latter also creates a console cannot be read back, `Command` exposing
+    /// no accessor for its creation flags.
+    #[test]
+    fn a_chosen_terminal_is_routed_by_its_file_name() {
+        let cwd = Path::new(r"C:\Work folder");
+        let as_option = [OsStr::new("-d"), cwd.as_os_str()];
+
+        // The directory has to travel as an option here, because the window is
+        // opened by an instance already running elsewhere. Matching ignores
+        // case, as the file system does.
+        for program in ["wt.exe", "WT.EXE", r"C:\Program Files\folder01\wt.exe"] {
+            let built = chosen_terminal_command(program, cwd);
+            assert_eq!(built.get_program(), OsStr::new(program), "{program}");
+            assert_eq!(built.get_args().collect::<Vec<_>>(), as_option, "{program}");
+        }
+
+        // Everything else is started in the directory itself, and receives no
+        // option: one it does not know would make it refuse to start.
+        for program in [
+            r"C:\Windows\System32\cmd.exe",
+            "powershell.exe",
+            r"C:\Program Files\folder01\myterm.exe",
+        ] {
+            let built = chosen_terminal_command(program, cwd);
+            assert_eq!(built.get_program(), OsStr::new(program), "{program}");
+            assert_eq!(built.get_args().count(), 0, "{program}");
+            assert_eq!(built.get_current_dir(), Some(cwd), "{program}");
+        }
     }
 }
 

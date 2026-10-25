@@ -1,0 +1,423 @@
+// Row of the saved workspaces list.
+
+import { Strings } from "strings.slint";
+import { Tip } from "globals.slint";
+import { Theme, Tokens } from "theme.slint";
+import { EditTextInput, WsButton, WsIconBtn } from "controls.slint";
+
+// A row in the list of saved workspaces. Handles inline rename and
+// the two-step delete confirmation locally.
+// Row of a workspace, with three mutually exclusive states:
+// normal (click = load, actions revealed on hover), editing (inline rename),
+// delete confirmation (two-step red bar).
+export component WorkspaceRow inherits Rectangle {
+    callback load();
+    callback overwrite();
+    callback update-now();   // direct "Update" (current amber pill)
+    callback delete();
+    callback rename(string);
+    in property <string> name;
+    in property <int> panels;
+    in property <int> tabs;
+    // CURRENTLY loaded workspace (accent rail + semibold name) and, if
+    // modified without being saved, DIRTY (dot + amber "Update" pill).
+    in property <bool> is-current: false;
+    in property <bool> is-dirty: false;
+    /// Keyboard slot that loads this workspace, 1 to 9. Zero = none.
+    in property <int> slot: 0;
+    /// Tooltip naming the combination that fires that slot, already composed
+    /// and localized. Empty when the action carries no combination.
+    in property <string> slot-tip;
+    /// Asks for the slot picker, anchored at the badge.
+    callback pick-slot(length, length);
+    /// Name of the theme this workspace imposes while loaded, already
+    /// localized and capped in length, empty when it follows the global one.
+    in property <string> theme;
+    /// Asks for the theme picker, anchored at the swatch.
+    callback pick-theme(length, length);
+    property <bool> editing: false;
+    property <bool> confirming-delete: false;
+    property <bool> confirming-overwrite: false;
+    // Armed on entering edit mode to focus the field AFTER layout (see
+    // focus-timer in the edit block) — a direct `focus()` in `init` loops.
+    property <bool> focus-armed: false;
+
+    // --- Deferred state transitions (anti "Recursion detected") ---
+    // A button that modifies `editing`/`confirming-*` from its own
+    // `clicked` would get DESTROYED (the `if` block containing it disappears)
+    // during the callback's execution → reentrancy. We therefore go through a
+    // `pending` property (referenced by no `if`, so the button survives the
+    // click); a Timer applies the transition on the next event-loop turn.
+    // codes: 1=enter edit · 2=enter delete-confirm · 3=exit edit
+    //         · 4=exit delete-confirm · 5=enter overwrite-confirm
+    //         · 6=exit overwrite-confirm.
+    property <int> pending: 0;
+    property <string> pending-rename: "";
+    property <bool> pending-delete: false;
+    property <bool> pending-overwrite: false;
+    Timer {
+        interval: 1ms;
+        running: root.pending != 0;
+        triggered => {
+            if (root.pending == 1) { root.editing = true; root.focus-armed = true; }
+            if (root.pending == 2) { root.confirming-delete = true; }
+            if (root.pending == 3) {
+                root.editing = false;
+                if (root.pending-rename != "") { root.rename(root.pending-rename); }
+                root.pending-rename = "";
+            }
+            if (root.pending == 4) {
+                root.confirming-delete = false;
+                if (root.pending-delete) { root.delete(); }
+                root.pending-delete = false;
+            }
+            if (root.pending == 5) { root.confirming-overwrite = true; }
+            if (root.pending == 6) {
+                root.confirming-overwrite = false;
+                if (root.pending-overwrite) { root.overwrite(); }
+                root.pending-overwrite = false;
+            }
+            root.pending = 0;
+        }
+    }
+
+    height: 44px;
+    border-radius: 7px;
+    background: root.confirming-delete
+        ? Tokens.danger.with-alpha(0.10)
+        : (root.confirming-overwrite
+            ? Theme.accent-background.with-alpha(0.10)
+            : ((row-touch.has-hover || root.editing)
+                ? Theme.alternate-background
+                : transparent));
+
+    // The "Load" TouchArea covers the whole row, including action buttons,
+    // to keep a stable hover state. The icons' nested TouchAreas
+    // capture their own clicks; the row's only receives the empty areas.
+    row-touch := TouchArea {
+        // Provides a stable `has-hover` that encompasses the child buttons.
+        // Loading goes through the explicit "Load" button, with no accidental
+        // row-click that would overwrite the current layout). The child
+        // TouchAreas capture their own clicks since they're deeper.
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 8px;
+        spacing: 10px;
+
+        // ===== NORMAL mode =====
+        // Leading slot: the keyboard badge when this workspace holds one, and
+        // otherwise the workspace icon it replaces. That icon says nothing a
+        // row in a list of workspaces does not already say, where the badge is
+        // an address worth reading at rest: nine of them line up in one column
+        // and answer "which one is on 3" at a glance, which a badge revealed
+        // only on hover could not.
+        //
+        // A rounded square because it is a target one clicks, per the shape
+        // rule a disc is a state and a square is a target, and it borrows the
+        // key cap recipe of the shortcuts settings so the digit reads as a key.
+        if !root.editing && !root.confirming-delete && !root.confirming-overwrite : Rectangle {
+            // The CELL takes the row's height, left to the layout, and the
+            // badge inside it carries the fixed size. Giving the fixed size to
+            // the cell itself pinned it to the top of the row: a layout places
+            // a child of fixed height, it does not centre it.
+            width: 20px;
+            // No x or y on the two below: outside a layout, an element whose
+            // coordinates are left out is centred on that axis, which is
+            // exactly what is wanted here and needs no measurement of a parent.
+            Rectangle {
+                width: 20px;
+                height: 20px;
+                border-radius: 5px;
+                border-width: 1px;
+                // Filled when assigned. Empty and hovered, it becomes the
+                // hollow outline the colour swatches already use for "nothing
+                // assigned", so the place to click is shown without a word.
+                border-color: root.slot > 0
+                    ? (slot-touch.has-hover
+                        ? Theme.foreground.with-alpha(0.45)
+                        : Theme.border)
+                    : (row-touch.has-hover
+                        ? (slot-touch.has-hover
+                            ? Theme.foreground.with-alpha(0.45)
+                            : Theme.foreground.with-alpha(0.30))
+                        : Colors.transparent);
+                background: root.slot > 0 ? Theme.surface : Colors.transparent;
+                if root.slot > 0 : Text {
+                    text: root.slot;
+                    font-size: 11px;
+                    font-weight: 600;
+                    color: Theme.foreground;
+                }
+            }
+            // The icon stays while the row is at rest and carries no slot, so
+            // an untouched list looks exactly as it did. Declared after the
+            // badge, which is then invisible, so it paints in its place.
+            if root.slot == 0 && !row-touch.has-hover : Image {
+                width: 16px;
+                height: 16px;
+                source: @image-url("../../assets/icons/workspace.svg");
+                colorize: root.is-current ? Theme.accent-background : Theme.foreground.with-alpha(0.5);
+            }
+            slot-touch := TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.pick-slot(self.absolute-position.x,
+                        self.absolute-position.y + self.height);
+                }
+                changed has-hover => {
+                    if (self.has-hover) {
+                        Tip.text = root.slot > 0 && root.slot-tip != ""
+                            ? root.slot-tip
+                            : Strings.ws-slot-assign;
+                        Tip.x = self.absolute-position.x;
+                        Tip.y = self.absolute-position.y - 26px;
+                    } else {
+                        Tip.text = "";
+                    }
+                }
+            }
+        }
+
+        if !root.editing && !root.confirming-delete && !root.confirming-overwrite : Text {
+            text: root.name;
+            font-size: 14px;
+            // Semibold name on the currently loaded workspace.
+            font-weight: root.is-current ? 600 : 400;
+            color: Theme.foreground;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        // "Unsaved changes" dot, AT THE END OF THE NAME (status
+        // marker: doesn't shift the icon+name alignment of other rows,
+        // persists at rest AND on hover). Tooltip on hover to remove
+        // ambiguity about its meaning (widened hover area; the dot centers).
+        if !root.editing && !root.confirming-delete && !root.confirming-overwrite && root.is-dirty : Rectangle {
+            width: 16px;
+            dot-touch := TouchArea {
+                changed has-hover => {
+                    if (self.has-hover) {
+                        Tip.text = Strings.ws-dirty-tooltip;
+                        Tip.x = self.absolute-position.x - 70px;
+                        Tip.y = self.absolute-position.y - 26px;
+                    } else if (Tip.text == Strings.ws-dirty-tooltip) {
+                        Tip.text = "";
+                    }
+                }
+                Rectangle {
+                    width: 6px;
+                    height: 6px;
+                    border-radius: 3px;
+                    background: Tokens.warning;
+                }
+            }
+        }
+        // Metadata at rest (unchanged even on a modified workspace: the only
+        // amber signal at rest remains the dot above).
+        // A workspace imposing a theme names it here, so loading one is never
+        // a surprise. The width is capped and the text elided: the theme name
+        // comes last, so a long one gives way before the workspace name does.
+        if !root.editing && !root.confirming-delete && !root.confirming-overwrite && !row-touch.has-hover : Text {
+            text: root.panels + " " + Strings.ws-panels-short + "  ·  " + root.tabs + " " + Strings.ws-tabs-short
+                + (root.theme != "" ? "  ·  " + root.theme : "");
+            font-size: 12px;
+            color: Theme.foreground.with-alpha(0.45);
+            vertical-alignment: center;
+            max-width: 150px;
+            overflow: elide;
+        }
+        // …replaced on hover by the secondary actions (with tooltips).
+        if !root.editing && !root.confirming-delete && !root.confirming-overwrite && row-touch.has-hover : HorizontalLayout {
+            spacing: 2px;
+            // On the current MODIFIED row, the ⟳ "overwrite" becomes the
+            // "Save changes" action: tinted amber (matches the
+            // dot) and a single DIRECT click (unambiguous intent). On other
+            // rows, it keeps its 2-step confirmation.
+            WsIconBtn {
+                icon: @image-url("../../assets/icons/overwrite.svg");
+                amber: root.is-dirty;
+                tooltip: root.is-dirty ? Strings.ws-dirty-save-action : Strings.ws-update;
+                clicked => {
+                    if (root.is-dirty) { root.update-now(); }
+                    else { root.pending = 5; } // enter overwrite confirmation
+                }
+            }
+            WsIconBtn {
+                icon: @image-url("../../assets/icons/pencil.svg");
+                tooltip: Strings.ws-rename;
+                clicked => { root.pending = 1; } // enter edit mode (deferred)
+            }
+            // Theme of this workspace. A palette rather than a brush: the
+            // rename pencil sits immediately to its left, and two diagonal
+            // tools at this size read as the same icon. Tinted with the
+            // CURRENT accent when a theme is imposed, never with that theme's
+            // own colour: resolved colours do not travel in an item model,
+            // and a theme file's accent belongs to no fixed palette.
+            // The delete action stays last, where a destructive one belongs.
+            theme-btn := WsIconBtn {
+                icon: @image-url("../../assets/icons/palette.svg");
+                accent: root.theme != "";
+                // The imposed theme names itself, as the slot badge shows its
+                // combination; otherwise the button offers to impose one.
+                tooltip: root.theme != "" ? root.theme : Strings.ws-theme-assign;
+                clicked => {
+                    root.pick-theme(theme-btn.absolute-position.x,
+                        theme-btn.absolute-position.y + theme-btn.height);
+                }
+            }
+            WsIconBtn {
+                icon: @image-url("../../assets/icons/trash.svg");
+                danger: true;
+                tooltip: Strings.ws-delete;
+                clicked => { root.pending = 2; } // enter delete confirmation (deferred)
+            }
+        }
+        // "Load" button — always visible (explicit primary action).
+        if !root.editing && !root.confirming-delete && !root.confirming-overwrite : WsButton {
+            label: Strings.ws-load;
+            primary: true;
+            clicked => { root.load(); }
+        }
+
+        // ===== EDIT mode (inline rename) =====
+        // NB: the TextInput fills via `horizontal-stretch` in an inner
+        // layout (NOT via `width: parent.width - X`). In a repeated
+        // component (`for`), a width computed from `parent.width`
+        // creates a layout cycle → "Recursion detected".
+        if root.editing : HorizontalLayout {
+            spacing: 6px;
+            padding-top: 7px;
+            padding-bottom: 7px;
+            // Deferred focus: `edit-input.focus()` is called by this Timer on
+            // the event-loop turn following the field's appearance (stable layout),
+            // NOT in the TextInput's `init` (which loops in a repeater).
+            // `focus-armed` is set by the main Timer on entering edit mode.
+            Timer {
+                interval: 1ms;
+                running: root.focus-armed;
+                triggered => {
+                    edit-input.focus();
+                    // Caret at the end of the line (no full selection).
+                    edit-input.set-selection-offsets(99999, 99999);
+                    root.focus-armed = false;
+                }
+            }
+            // No `y: parent.height…` or fixed `height:` on the Rectangle:
+            // in a repeated component, a geometry depending on
+            // `parent.height` triggers a vertical layout cycle
+            // ("Recursion detected"). The HL's padding gives the height;
+            // the Rectangle fills it, the TextInput is centered.
+            Rectangle {
+                horizontal-stretch: 1;
+                background: Theme.background;
+                border-radius: 5px;
+                border-width: 1px;
+                border-color: Theme.accent-background;
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    edit-input := EditTextInput {
+                        horizontal-stretch: 1;
+                        text: root.name;
+                        font-size: 13px;
+                        color: Theme.foreground;
+                        vertical-alignment: center;
+                        single-line: true;
+                        selection-background-color: Theme.accent-background.with-alpha(0.5);
+                        // Focus handled by the `focus-timer` above (deferred,
+                        // outside `init`) — calling focus() from `init` inside
+                        // a repeated component re-enters its own creation and
+                        // Slint reports a recursion error.
+                        accepted => {
+                            root.pending-rename = self.text;
+                            root.pending = 3;
+                        }
+                        key-pressed(event) => {
+                            if (event.text == Key.Escape) { root.pending = 3; return accept; }
+                            // Same here: local override → explicit call.
+                            if (self.edit-shortcut(event)) { return accept; }
+                            return reject;
+                        }
+                    }
+                }
+            }
+            WsIconBtn {
+                icon: @image-url("../../assets/icons/check.svg");
+                clicked => {
+                    root.pending-rename = edit-input.text;
+                    root.pending = 3;
+                }
+            }
+            WsIconBtn {
+                icon: @image-url("../../assets/icons/close.svg");
+                clicked => { root.pending = 3; }
+            }
+        }
+
+        // ===== DELETE CONFIRMATION mode (two-step red bar) =====
+        if root.confirming-delete : HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: Strings.ws-delete-confirm;
+                font-size: 13px;
+                color: Tokens.danger;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            WsButton {
+                label: Strings.btn-cancel;
+                clicked => { root.pending = 4; } // exit confirmation (deferred)
+            }
+            WsButton {
+                label: Strings.ws-delete;
+                danger: true;
+                clicked => {
+                    root.pending-delete = true;
+                    root.pending = 4; // exit + delete (deferred)
+                }
+            }
+        }
+
+        // ===== OVERWRITE CONFIRMATION mode (two-step accent bar) =====
+        if root.confirming-overwrite : HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: Strings.ws-overwrite-confirm;
+                font-size: 13px;
+                color: Theme.foreground;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            WsButton {
+                label: Strings.btn-cancel;
+                clicked => { root.pending = 6; } // exit without overwriting (pending-overwrite false)
+            }
+            WsButton {
+                label: Strings.ws-update;
+                primary: true;
+                clicked => {
+                    root.pending-overwrite = true;
+                    root.pending = 6; // exit + overwrite (deferred)
+                }
+            }
+        }
+    }
+    } // closes row-touch (enclosing TouchArea)
+
+    // "Loaded workspace" identity rail. Overlaid on the left
+    // edge, purely decorative (captures no clicks). VERY THIN and
+    // subtle bar (2px, 85% accent). Hardcoded height (34 = 44 − 2x5): reading
+    // `parent.height` in a repeated component can create a vertical layout
+    // cycle ("Recursion detected", see edit mode).
+    if root.is-current : Rectangle {
+        x: 0;
+        y: 5px;
+        width: 2px;
+        height: 34px;
+        border-radius: 1px;
+        background: Theme.accent-background.with-alpha(0.85);
+    }
+}

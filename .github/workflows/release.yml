@@ -32,7 +32,7 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential pkg-config libfontconfig1-dev \
-            curl ca-certificates git
+            curl ca-certificates git dpkg-dev
 
       - uses: actions/checkout@v4
 
@@ -90,6 +90,32 @@ jobs:
           path: dist/favnyr-linux-x86_64.tar.gz
           if-no-files-found: error
 
+      # Packaged here rather than in a job of its own, because the binary and
+      # the container that produced it are already present. That proximity is
+      # not a convenience: `dpkg-shlibdeps` reads the library floors out of the
+      # binary, so a package built on a newer distribution would declare floors
+      # no older system can satisfy.
+      #
+      # The Debian changelog is written from the version being packaged instead
+      # of being kept in the repository, so it cannot describe anything but the
+      # package it travels in.
+      - name: Debian package
+        run: |
+          cargo install cargo-deb --locked
+          version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          printf 'favnyr (%s-1) unstable; urgency=medium\n\n  * Favnyr %s.\n\n -- %s  %s\n' \
+            "$version" "$version" \
+            'GlitchAwakened <314985819+GlitchAwakened@users.noreply.github.com>' \
+            "$(date -R)" > packaging/changelog.Debian
+          cargo deb -p favnyr-gui --no-build
+          dpkg-deb -I target/debian/*.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: favnyr-deb
+          path: target/debian/*.deb
+          if-no-files-found: error
+
   windows:
     name: Windows binary
     runs-on: windows-latest
@@ -107,10 +133,61 @@ jobs:
           path: target/release/favnyr.exe
           if-no-files-found: error
 
+  # Nothing is compiled here. The RPM is built from the binary the Linux job
+  # produced, so a single compilation feeds both packages and the low glibc
+  # floor is carried over.
+  #
+  # It runs on Fedora, and that is the whole point: only an RPM distribution
+  # supplies the dependency generator the packaging tool looks for. Without it
+  # the tool falls back on `ldd`, which walks the entire library chain and ends
+  # up demanding fontconfig's own dependencies, none of which this binary ever
+  # loads. Measured: seven spurious requirements, gone once the generator is
+  # present.
+  rpm:
+    name: RPM package
+    needs: [linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: favnyr-linux-x86_64
+          path: artifacts
+
+      # Where the packaging metadata expects to find it.
+      - name: Unpack the binary
+        run: |
+          mkdir -p target/release
+          tar -xzf artifacts/favnyr-linux-x86_64.tar.gz -C target/release favnyr
+          chmod +x target/release/favnyr
+
+      - name: Build the RPM
+        run: |
+          docker run --rm -v "$PWD":/src -w /src \
+            registry.fedoraproject.org/fedora:44 bash -c '
+            set -e
+            dnf install -y -q rpm-build cargo gcc
+            cargo install cargo-generate-rpm --locked
+            export PATH="$HOME/.cargo/bin:$PATH"
+            cargo generate-rpm -p crates/favnyr-gui
+            echo "--- computed dependencies ---"
+            rpm -qpR target/generate-rpm/*.rpm
+          '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: favnyr-rpm
+          path: target/generate-rpm/*.rpm
+          if-no-files-found: error
+
   publish:
     name: Publish release
-    needs: [linux, windows]
+    needs: [linux, windows, rpm]
     runs-on: ubuntu-latest
+    # A release is created for a version tag and nothing else. Without this,
+    # a manual run on a branch would publish a release named after that branch.
+    if: startsWith(github.ref, 'refs/tags/v')
     # Only what the release needs. `id-token` lets GitHub mint the short-lived
     # identity the attestation is signed with, and `attestations` lets it be
     # recorded. Declaring any permission sets the others to none, so the three
@@ -128,11 +205,17 @@ jobs:
       # downloaded, since a browser drops them straight into Downloads. The
       # Linux side is already a named .tar.gz (built and permission-preserved
       # in the `linux` job); only the Windows binary needs renaming here.
+      #
+      # The two packages keep the names their own tooling gave them. Debian
+      # calls this architecture amd64 and RPM calls it x86_64; renaming either
+      # one would contradict the architecture declared inside it.
       - name: Collect binaries
         run: |
           mkdir -p dist
           cp artifacts/favnyr-linux-x86_64/favnyr-linux-x86_64.tar.gz dist/
           cp artifacts/favnyr-windows-x86_64/favnyr.exe dist/favnyr-windows-x86_64.exe
+          cp artifacts/favnyr-deb/*.deb dist/
+          cp artifacts/favnyr-rpm/*.rpm dist/
           ls -l dist
 
       # Signs a statement binding each file's digest to this repository, this
@@ -151,6 +234,8 @@ jobs:
           subject-path: |
             dist/favnyr-linux-x86_64.tar.gz
             dist/favnyr-windows-x86_64.exe
+            dist/*.deb
+            dist/*.rpm
 
       - name: Create the release
         env:
@@ -161,7 +246,9 @@ jobs:
             --title "${{ github.ref_name }}" \
             --generate-notes \
             dist/favnyr-linux-x86_64.tar.gz \
-            dist/favnyr-windows-x86_64.exe
+            dist/favnyr-windows-x86_64.exe \
+            dist/*.deb \
+            dist/*.rpm
 
   # Prints the two values the Nix recipe needs for this release, and stops
   # there. Editing `packaging/nix/package.nix` is two lines of typing : what is

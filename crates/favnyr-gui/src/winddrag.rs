@@ -20,7 +20,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND, POINTL};
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
@@ -29,6 +29,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Com::StructuredStorage::{IStorage, StgCreateDocfile};
 use windows::Win32::System::Com::{
+    APTTYPE, APTTYPE_MAINSTA, APTTYPE_MTA, APTTYPE_STA, APTTYPEQUALIFIER, CoGetApartmentType,
     CoTaskMemFree, DVASPECT_CONTENT, FORMATETC, IDataObject, IStream, STGC_DEFAULT, STGM_CREATE,
     STGM_READWRITE, STGM_SHARE_EXCLUSIVE, TYMED_HGLOBAL, TYMED_ISTORAGE, TYMED_ISTREAM,
 };
@@ -44,8 +45,8 @@ use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     CFSTR_FILECONTENTS, CFSTR_FILEDESCRIPTORW, CFSTR_LOGICALPERFORMEDDROPEFFECT,
     CFSTR_PERFORMEDDROPEFFECT, CFSTR_SHELLIDLIST, DragQueryFileW, FILEDESCRIPTORW,
-    FILEGROUPDESCRIPTORW, HDROP, IDataObjectAsyncCapability, IShellFolder, SHDoDragDrop,
-    SHGetDesktopFolder, SHParseDisplayName,
+    FILEGROUPDESCRIPTORW, HDROP, IDataObjectAsyncCapability, IShellFolder, IsUserAnAdmin,
+    SHDoDragDrop, SHGetDesktopFolder, SHParseDisplayName,
 };
 use windows::core::{Interface, PCWSTR, Ref, implement};
 
@@ -235,7 +236,7 @@ impl IDropTarget_Impl for FavnyrDropTarget_Impl {
         // the source — the two questions a refused drag raises, and which
         // cannot be told apart from the outside, the pointer showing the
         // system's refusal either way.
-        debug!(
+        info!(
             ?kind,
             allowed = format!("0x{allowed:X}"),
             ?action,
@@ -280,6 +281,7 @@ impl IDropTarget_Impl for FavnyrDropTarget_Impl {
     }
 
     fn DragLeave(&self) -> windows::core::Result<()> {
+        info!("OLE drag left Favnyr");
         self.incoming_kind.set(IncomingDataKind::None);
         self.allowed_effects.set(0);
         (self.handler)(IncomingFileDrag::Leave);
@@ -482,6 +484,25 @@ thread_local! {
     static DROP_TARGET: RefCell<Option<IDropTarget>> = const { RefCell::new(None) };
 }
 
+/// Reports the calling thread's COM apartment without initializing or changing
+/// it. This distinguishes registration failures from incompatible COM state.
+fn apartment_kind() -> &'static str {
+    let mut kind = APTTYPE::default();
+    let mut qualifier = APTTYPEQUALIFIER::default();
+    if unsafe { CoGetApartmentType(&mut kind, &mut qualifier) }.is_err() {
+        return "none";
+    }
+    if kind == APTTYPE_STA {
+        "sta"
+    } else if kind == APTTYPE_MAINSTA {
+        "main-sta"
+    } else if kind == APTTYPE_MTA {
+        "mta"
+    } else {
+        "other"
+    }
+}
+
 /// Replaces the very minimal file drop target installed by winit. The latter
 /// only reports "file entered/left/dropped", without the DragOver position;
 /// Favnyr needs that position to target the panel, row, and executable. Must
@@ -512,7 +533,12 @@ pub fn init_drop_target(hwnd: isize, handler: impl Fn(IncomingFileDrag) + 'stati
         match unsafe { RegisterDragDrop(HWND(hwnd as *mut c_void), &target) } {
             Ok(()) => {
                 *slot.borrow_mut() = Some(target);
-                debug!(hwnd, "Favnyr OLE drop target registered");
+                info!(
+                    hwnd,
+                    apartment = apartment_kind(),
+                    admin_token = unsafe { IsUserAnAdmin().as_bool() },
+                    "Favnyr OLE drop target registered"
+                );
                 true
             }
             Err(err) => {
@@ -607,8 +633,8 @@ fn classify_formats(
         } else {
             // Standard CF_HDROP uses HGLOBAL. Some application data objects
             // additionally advertise IStream and synthesize both CF_HDROP and
-            // Shell IDList Array from temporary paths (PeaZip's public
-            // TDropFileSource implementation is one example). CIDA is not a
+            // Shell IDList Array from temporary paths (the drag source of some
+            // archivers is one example). CIDA is not a
             // lifetime guarantee in that case, so capture before Drop returns.
             IncomingDataKind::ApplicationPaths
         }

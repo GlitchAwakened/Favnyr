@@ -1,0 +1,126 @@
+# Catppuccin Mocha and Latte, adapted to the application's semantic roles.
+# The notice is embedded with this data so binary distributions retain it.
+#
+# MIT License
+#
+# Copyright (c) 2021 Catppuccin
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+schema_version = 1
+
+# Latte: soft neutral surfaces, mauve focus, blue links and warm folder icons.
+# Notification tints and unspecified contrasting inks use the shared resolver.
+[light.opacity]
+hidden = 0.58
+age = 0.16
+
+[light.colors]
+background = "#E6E9EF"
+surface = "#EFF1F5"
+toolbar = "#DCE0E8"
+alternate_background = "#CCD0DA"
+foreground = "#4C4F69"
+border = "#9CA0B0"
+accent_background = "#8839EF"
+accent_foreground = "#EFF1F5"
+danger = "#D20F39"
+danger_foreground = "#EFF1F5"
+success = "#40A02B"
+warning = "#DF8E1D"
+extension = "#1E66F5"
+track = "#CCD0DA"
+disk_normal = "#BCC0CC"
+tooltip_background = "#4C4F69"
+tooltip_foreground = "#EFF1F5"
+shadow = "#000000"
+modal_overlay = "#4C4F6973"
+file_application = "#40A02B"
+file_archive = "#FE640B"
+file_audio = "#8839EF"
+file_document = "#1E66F5"
+file_image = "#D20F39"
+file_video = "#179299"
+file_registry = "#6C6F85"
+folder_default = "#DF8E1D"
+folder_red = "#D20F39"
+folder_green = "#40A02B"
+folder_teal = "#179299"
+folder_blue = "#1E66F5"
+folder_violet = "#8839EF"
+folder_pink = "#EA76CB"
+folder_slate = "#6C6F85"
+age_hour = "#D20F39"
+age_hours = "#FE640B"
+age_day = "#DF8E1D"
+age_week = "#40A02B"
+age_month = "#179299"
+age_year = "#1E66F5"
+age_older = "#6C6F85"
+
+# Mocha: base content over mantle chrome, with pastel accents and dark ink.
+[dark.opacity]
+hidden = 0.55
+age = 0.20
+
+[dark.colors]
+background = "#181825"
+surface = "#1E1E2E"
+toolbar = "#181825"
+alternate_background = "#313244"
+foreground = "#CDD6F4"
+border = "#45475A"
+accent_background = "#CBA6F7"
+accent_foreground = "#1E1E2E"
+danger = "#F38BA8"
+danger_foreground = "#1E1E2E"
+success = "#A6E3A1"
+warning = "#F9E2AF"
+extension = "#89B4FA"
+tooltip_background = "#11111B"
+tooltip_foreground = "#CDD6F4"
+shadow = "#11111B"
+modal_overlay = "#11111B99"
+file_application = "#A6E3A1"
+file_archive = "#FAB387"
+file_audio = "#CBA6F7"
+file_document = "#89B4FA"
+file_image = "#F38BA8"
+file_video = "#94E2D5"
+file_registry = "#A6ADC8"
+folder_default = "#F9E2AF"
+folder_red = "#F38BA8"
+folder_green = "#A6E3A1"
+folder_teal = "#94E2D5"
+folder_blue = "#89B4FA"
+folder_violet = "#CBA6F7"
+folder_pink = "#F5C2E7"
+folder_slate = "#A6ADC8"
+folder_red_foreground = "#1E1E2E"
+folder_green_foreground = "#1E1E2E"
+folder_teal_foreground = "#1E1E2E"
+folder_blue_foreground = "#1E1E2E"
+folder_violet_foreground = "#1E1E2E"
+folder_pink_foreground = "#1E1E2E"
+folder_slate_foreground = "#1E1E2E"
+age_hour = "#F38BA8"
+age_hours = "#FAB387"
+age_day = "#F9E2AF"
+age_week = "#A6E3A1"
+age_month = "#94E2D5"
+age_year = "#89B4FA"
+age_older = "#A6ADC8"

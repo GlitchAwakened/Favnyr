@@ -325,6 +325,13 @@ struct NamedWorkspaceFile {
     /// an existing collection reads back unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     slot: Option<u8>,
+    /// Theme this workspace imposes while it is loaded, absent to follow the
+    /// application's own choice. It sits beside the slot rather than inside
+    /// the state because it is an attribute of the workspace, not part of the
+    /// arrangement of views and tabs: setting it is therefore not a change to
+    /// save, and it never makes the workspace read as modified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    theme: Option<String>,
     state: WorkspaceState,
 }
 
@@ -352,6 +359,8 @@ pub struct NamedWorkspaceMeta {
     pub saved_at: u64,
     /// Keyboard slot that loads it, when it holds one.
     pub slot: Option<u8>,
+    /// Theme it imposes while loaded, when it imposes one.
+    pub theme: Option<String>,
 }
 
 /// Validates that an `id` is safe as a file name (anti path-traversal).
@@ -419,6 +428,9 @@ pub fn list_named_workspaces(dir: &Path) -> Vec<NamedWorkspaceMeta> {
                 // rather than as an error: the collection stays loadable, and
                 // the workspace simply answers to no shortcut.
                 slot: file.slot.filter(|s| slot_is_valid(*s)),
+                // Same reading for a theme naming neither a built-in family
+                // nor a theme file: the workspace simply imposes none.
+                theme: file.theme.filter(|id| crate::theme::id_is_known(id)),
             });
         }
     }
@@ -453,6 +465,10 @@ pub fn save_named_workspace(dir: &Path, name: &str, state: &WorkspaceState) -> R
         name: name.trim().to_string(),
         saved_at: now_nanos(),
         slot: None,
+        // A new workspace imposes no theme. Copying the one on screen would
+        // create a choice nobody asked for, and after a few saves the
+        // application's own theme would look as though it did nothing.
+        theme: None,
         state: state.clone(),
     };
     write_named(dir, &id, &file)?;
@@ -520,6 +536,28 @@ pub fn workspace_with_slot(dir: &Path, slot: u8) -> Option<String> {
         .into_iter()
         .find(|meta| meta.slot == Some(slot))
         .map(|meta| meta.id)
+}
+
+/// Gives `id` the theme it imposes while loaded, or `None` to let it follow
+/// the application's own choice.
+///
+/// Unlike a keyboard slot, a theme is held by as many workspaces as want it,
+/// so nothing has to be taken from another holder. Neither save date moves:
+/// choosing a theme is not a save, and the list is ordered by recency.
+///
+/// An unknown identifier is refused here rather than written and ignored at
+/// the next read, which would look like the choice had been silently dropped.
+pub fn set_workspace_theme(dir: &Path, id: &str, theme: Option<&str>) -> Result<()> {
+    if let Some(value) = theme
+        && !crate::theme::id_is_known(value)
+    {
+        return Err(crate::error::Error::Workspace(format!(
+            "unknown workspace theme: {value:?}"
+        )));
+    }
+    let mut file = read_named(dir, id)?;
+    file.theme = theme.map(str::to_owned);
+    write_named(dir, id, &file)
 }
 
 /// Renames a workspace (only changes the `name` field, keeps the `id`/file).
@@ -717,6 +755,7 @@ zoom = 5
                     name: "workspace01".into(),
                     saved_at: 1,
                     slot: None,
+                    theme: None,
                     state,
                 };
                 let encoded = toml::to_string(&named).unwrap();
@@ -1078,6 +1117,83 @@ name =",
         )
         .unwrap();
         assert_eq!(slot_of(&dir, &first), None);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A theme sits beside the slot and behaves like it: independent of the
+    /// arrangement, untouched by a save, and held by as many workspaces as
+    /// want it, since nothing makes it exclusive.
+    #[test]
+    fn a_workspace_theme_is_independent_of_its_arrangement() {
+        let dir = temp_dir("theme");
+        let first = save_named_workspace(&dir, "First", &sample()).unwrap();
+        let second = save_named_workspace(&dir, "Second", &sample()).unwrap();
+        let theme_of = |dir: &std::path::Path, id: &str| {
+            list_named_workspaces(dir)
+                .into_iter()
+                .find(|meta| meta.id == id)
+                .and_then(|meta| meta.theme)
+        };
+
+        // A fresh workspace imposes nothing, and the field is omitted from its
+        // file, so a collection written before this existed reads back as is.
+        assert_eq!(theme_of(&dir, &first), None);
+        let path = dir.join(format!("{first}.toml"));
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("theme"));
+
+        // Both kinds of identifier are storable, the base family included:
+        // its own identifier is absent, which is why it needs its alias.
+        for id in ["builtin:base", "builtin:atom", "user:my_theme.toml"] {
+            set_workspace_theme(&dir, &first, Some(id)).unwrap();
+            assert_eq!(theme_of(&dir, &first).as_deref(), Some(id));
+        }
+
+        // Saving and renaming leave it alone: it is not part of the state.
+        overwrite_named_workspace(&dir, &first, &sample()).unwrap();
+        assert_eq!(
+            theme_of(&dir, &first).as_deref(),
+            Some("user:my_theme.toml")
+        );
+        rename_named_workspace(&dir, &first, "Renamed").unwrap();
+        assert_eq!(
+            theme_of(&dir, &first).as_deref(),
+            Some("user:my_theme.toml")
+        );
+
+        // Nothing is exclusive: a second workspace takes the same theme
+        // without the first losing it.
+        set_workspace_theme(&dir, &second, Some("user:my_theme.toml")).unwrap();
+        assert_eq!(
+            theme_of(&dir, &first).as_deref(),
+            Some("user:my_theme.toml")
+        );
+        assert_eq!(
+            theme_of(&dir, &second).as_deref(),
+            Some("user:my_theme.toml")
+        );
+
+        // Clearing returns the workspace to the application's own choice.
+        set_workspace_theme(&dir, &first, None).unwrap();
+        assert_eq!(theme_of(&dir, &first), None);
+
+        // An unknown identifier is refused rather than stored and then
+        // ignored, which would look like the choice had been dropped.
+        for id in ["builtin:unknown", "user:../my_theme.toml", "my_theme"] {
+            assert!(set_workspace_theme(&dir, &first, Some(id)).is_err(), "{id}");
+            assert_eq!(theme_of(&dir, &first), None);
+        }
+
+        // A value written by hand that names nothing reads back as no theme,
+        // leaving the workspace loadable.
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            text.replace("name =", "theme = \"builtin:nonsense\"\nname ="),
+        )
+        .unwrap();
+        assert_eq!(theme_of(&dir, &first), None);
+        assert!(load_named_workspace(&dir, &first).is_ok());
 
         let _ = std::fs::remove_dir_all(dir);
     }

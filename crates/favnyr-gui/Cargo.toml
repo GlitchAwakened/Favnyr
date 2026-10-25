@@ -5,7 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Favnyr's Slint user interface (main binary)."
+# Reads as the one-line summary of the Linux packages built from this crate,
+# so it is written for whoever browses a package manager, not for a developer.
+# No leading article: a package summary is a label, not a sentence.
+description = "Modern and lightweight file manager"
 publish = false   # application (never published to crates.io)
 
 [[bin]]
@@ -75,3 +78,75 @@ slint-build = { workspace = true }
 # SDK shipped with the MSVC toolchain.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+# Debian package description, read by the `cargo deb` tool. That tool is
+# installed on the side and invoked by hand or by the release workflow, so it
+# is not a dependency of the project and nothing here reaches `Cargo.lock`.
+#
+# The package is named after the binary rather than after this crate, and it
+# carries exactly the three files the portable archive carries: the executable,
+# the icon, and the desktop entry whose `Icon=favnyr` line dictates where the
+# icon has to land.
+[package.metadata.deb]
+name = "favnyr"
+maintainer = "GlitchAwakened <314985819+GlitchAwakened@users.noreply.github.com>"
+copyright = "2025-2026, GlitchAwakened"
+# A short notice rather than the licence itself: a Debian system already ships
+# the GPL texts, and copying 35 kB of it into every package is what the policy
+# asks to avoid.
+license-file = ["../../packaging/debian-copyright", "0"]
+# Written from the version being built rather than kept in the repository, so
+# it can never drift from the package it describes.
+changelog = "../../packaging/changelog.Debian"
+section = "utils"
+priority = "optional"
+# Line breaks are kept as written: a Debian description is a folded field
+# where every line travels as it stands, so wrapping it here is what keeps it
+# readable in a package manager.
+extended-description = """
+Favnyr is a lightweight file browser for Windows and Linux. At its core are
+workspaces: separate environments that keep their own views, tabs, folders,
+layouts, and display settings. You could have one workspace for work, another
+for games, and another for learning a new subject, then switch between them in
+just two clicks. Favorites remain shared and persistent across all workspaces.
+
+Each workspace can contain multiple split views and movable tabs. Tabs can be
+dragged between views, detached, or dropped onto another view to create a new
+split layout.
+
+Favnyr also includes shortcuts, local and network drives, configurable keyboard
+shortcuts, and custom commands."""
+# Resolved by dpkg-shlibdeps from the binary itself, which is why the package
+# has to be built where it will be installed: a library floor read on a newer
+# distribution would be wrong for an older one.
+depends = "$auto"
+# Each one widens what Favnyr can do without being needed to start it: video
+# and PDF thumbnails, then the archive recipes. The alternative covers the
+# 7-Zip package being renamed between releases.
+suggests = "ffmpeg, poppler-utils, 7zip | p7zip-full"
+assets = [
+    ["target/release/favnyr", "usr/bin/", "755"],
+    ["../../packaging/favnyr.desktop", "usr/share/applications/", "644"],
+    [
+        "assets/favnyr.svg",
+        "usr/share/icons/hicolor/scalable/apps/favnyr.svg",
+        "644",
+    ],
+]
+
+# RPM description, read by the `cargo generate-rpm` tool. Same arrangement as
+# the Debian one above: installed on the side, absent from `Cargo.lock`, and
+# fed by the binary built once for both formats.
+#
+# The licence travels in full here, unlike in the Debian package: an RPM
+# distribution expects every package to carry its own licence text under
+# `/usr/share/licenses`, where Debian expects a reference to a shared copy.
+[package.metadata.generate-rpm]
+name = "favnyr"
+summary = "Modern and lightweight file manager"
+assets = [
+    { source = "target/release/favnyr", dest = "/usr/bin/favnyr", mode = "755" },
+    { source = "../../packaging/favnyr.desktop", dest = "/usr/share/applications/favnyr.desktop", mode = "644" },
+    { source = "assets/favnyr.svg", dest = "/usr/share/icons/hicolor/scalable/apps/favnyr.svg", mode = "644" },
+    { source = "../../LICENSE", dest = "/usr/share/licenses/favnyr/LICENSE", mode = "644", doc = true },
+]

@@ -1,0 +1,193 @@
+import { ActionArea } from "buttons.slint";
+import { ScrollView } from "scroll.slint";
+import { WidgetStyle, WidgetFocus } from "style.slint";
+
+// Popup content shared by selectors and text editing menus.
+export component ChoiceList inherits FocusScope {
+    in property <[string]> model;
+    in property <[bool]> allowed;
+    in-out property <int> current-index;
+    in property <bool> select-on-navigation: false;
+    callback selected(int);
+    callback navigated(int);
+    callback dismissed();
+    property <length> row-height: 40px;
+    height: min(6, root.model.length) * root.row-height + 8px;
+    accessible-role: list;
+    function pick(index: int) {
+        if root.enabled && index >= 0 && index < root.model.length
+            && (root.allowed.length == 0 || root.allowed[index]) {
+            root.selected(index);
+        }
+    }
+    public function reveal-current() {
+        let top = max(0, root.current-index) * root.row-height;
+        if top < -scroll.content-y {
+            scroll.content-y = -top;
+        } else if top + root.row-height > -scroll.content-y + scroll.height {
+            scroll.content-y = scroll.height - top - root.row-height;
+        }
+    }
+    key-pressed(e) => {
+        if !root.enabled { return reject; }
+        if e.text == Key.Escape || e.text == Key.Tab || e.text == Key.Backtab {
+            root.dismissed();
+            return e.text == Key.Escape ? accept : reject;
+        }
+        if e.text == Key.Return || e.text == Key.Space {
+            root.pick(root.current-index);
+            return accept;
+        }
+        if e.text == Key.UpArrow || e.text == Key.DownArrow || e.text == Key.Home || e.text == Key.End {
+            let next = e.text == Key.Home ? 0 : e.text == Key.End ? root.model.length - 1
+                : root.current-index + (e.text == Key.UpArrow ? -1 : 1);
+            root.current-index = next.clamp(0, max(0, root.model.length - 1));
+            root.reveal-current();
+            if root.select-on-navigation { root.navigated(root.current-index); }
+            return accept;
+        }
+        reject
+    }
+    Rectangle {
+        background: WidgetStyle.menu;
+        border-width: 1px; border-radius: 7px; border-color: WidgetStyle.menu-border;
+        drop-shadow-blur: 16px; drop-shadow-offset-y: 8px; drop-shadow-color: WidgetStyle.menu-shadow;
+        scroll := ScrollView {
+            x: 4px; y: 4px; width: parent.width - 8px; height: parent.height - 8px;
+            content-width: self.width;
+            content-height: root.model.length * root.row-height;
+            horizontal-scrollbar-policy: always-off;
+            for value[index] in root.model: Rectangle {
+                x: 0px; y: index * root.row-height;
+                width: scroll.visible-width; height: root.row-height;
+                property <bool> allowed: root.allowed.length == 0 || root.allowed[index];
+                accessible-role: list-item;
+                accessible-label: value;
+                accessible-enabled: self.allowed;
+                accessible-item-selectable: true;
+                accessible-item-selected: index == root.current-index;
+                accessible-item-index: index;
+                accessible-action-default => { root.pick(index); }
+                Rectangle {
+                    x: 3px; y: 2px;
+                    width: parent.width - 6px; height: parent.height - 4px;
+                    border-radius: 4px;
+                    background: touch.pressed ? WidgetStyle.subtle-pressed
+                        : index == root.current-index || touch.has-hover ? WidgetStyle.subtle : transparent;
+                    Text {
+                        x: 16px; width: parent.width - 32px; height: parent.height;
+                        text: value; overflow: elide; vertical-alignment: center;
+                        horizontal-alignment: left;
+                        color: touch.has-hover ? WidgetStyle.secondary : WidgetStyle.foreground;
+                        opacity: root.allowed.length == 0 || root.allowed[index] ? 1 : 0.45;
+                        accessible-role: none;
+                    }
+                    if index == root.current-index: Rectangle {
+                        x: 0px; y: (parent.height - 16px) / 2; width: 3px; height: 16px;
+                        border-radius: 2px; background: WidgetStyle.accent;
+                    }
+                }
+                touch := TouchArea { enabled: parent.allowed; clicked => { root.pick(index); } }
+            }
+        }
+    }
+}
+
+export component ComboBox inherits Rectangle {
+    in property <[string]> model;
+    in property <bool> enabled: true;
+    in-out property <int> current-index: 0;
+    out property <string> current-value: root.model[root.current-index];
+    out property <bool> has-focus: action.has-focus || root.popup-focused;
+    property <bool> popup-focused;
+    callback selected(string);
+    // Fires each time the list is about to appear, for a model that is
+    // cheaper to rebuild on demand than to keep up to date.
+    callback opened();
+    forward-focus: action;
+    accessible-role: combobox;
+    accessible-enabled: root.enabled;
+    accessible-expandable: true;
+    accessible-expanded: root.popup-focused;
+    accessible-value: root.current-value;
+    accessible-action-expand => { root.open(); }
+    min-width: 160px; min-height: max(32px, label.preferred-height);
+    horizontal-stretch: 1; vertical-stretch: 0;
+    border-radius: 3px; border-width: 1px;
+    border-color: !root.enabled || action.pressed ? WidgetStyle.border : WidgetStyle.control-border;
+    background: !root.enabled ? WidgetStyle.disabled : action.pressed ? WidgetStyle.disabled
+        : action.hovered ? WidgetStyle.hover : WidgetStyle.control;
+    changed model => {
+        root.current-index = root.current-index.clamp(0, max(0, root.model.length - 1));
+    }
+    changed enabled => { if !root.enabled { popup.close(); } }
+    function choose(index: int) {
+        if root.enabled && index >= 0 && index < root.model.length {
+            root.current-index = index;
+            root.selected(root.model[index]);
+        }
+    }
+    function open() {
+        if root.enabled && root.model.length > 0 {
+            root.opened();
+            popup.show();
+        }
+    }
+    label := Text {
+        x: 11px; width: max(0px, parent.width - 42px);
+        text: root.current-value;
+        color: !root.enabled ? WidgetStyle.disabled-text : action.pressed ? WidgetStyle.secondary : WidgetStyle.foreground;
+        horizontal-alignment: left; vertical-alignment: center; overflow: elide;
+        accessible-role: none;
+    }
+    Image {
+        x: parent.width - 23px; y: (parent.height - self.height) / 2 + 2px;
+        width: 12px; height: 12px;
+        source: @image-url("../../../assets/icons/chevron-down.svg");
+        colorize: root.enabled ? WidgetStyle.secondary : WidgetStyle.disabled-text;
+    }
+    if root.has-focus && root.enabled: WidgetFocus { border-radius: 3px; }
+    action := ActionArea {
+        enabled: root.enabled;
+        activated => { root.open(); }
+        key-pressed(e) => {
+            if e.text == Key.UpArrow || e.text == Key.DownArrow {
+                if e.modifiers.alt { root.open(); }
+                else { root.choose((root.current-index + (e.text == Key.UpArrow ? -1 : 1)).clamp(0, root.model.length - 1)); }
+                return accept;
+            }
+            if e.text == Key.Return || e.text == Key.Space || e.text == Key.F4 {
+                root.open(); return accept;
+            }
+            reject
+        }
+        // Unfocused selectors leave the wheel to their enclosing settings page.
+        scrolled(e) => {
+            if !action.has-focus || abs(e.delta-y) <= 2px { return reject; }
+            root.choose((root.current-index + (e.delta-y < 0px ? 1 : -1)).clamp(0, root.model.length - 1));
+            accept
+        }
+    }
+    popup := PopupWindow {
+        x: 0px; y: -4px;
+        width: root.width; height: choices.height;
+        close-policy: close-on-click-outside;
+        forward-focus: choices;
+        choices := ChoiceList {
+            enabled: root.enabled;
+            model: root.model; current-index <=> root.current-index;
+            focus-changed-event => {
+                root.popup-focused = self.has-focus;
+                if self.has-focus { self.reveal-current(); }
+            }
+            // Arrow keys preserve the standard selector's immediate selection.
+            select-on-navigation: true;
+            selected(index) => {
+                root.choose(index);
+                popup.close();
+            }
+            navigated(index) => { root.choose(index); }
+            dismissed => { popup.close(); }
+        }
+    }
+}

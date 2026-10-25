@@ -14,9 +14,10 @@
 //! are intentionally **simple and synchronous**: the bridge layer decides
 //! whether to push them onto a background thread (`std::thread`).
 
-// Windows copies via `CopyFileExW` → the read/write loop only exists elsewhere.
 #[cfg(not(windows))]
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(not(any(windows, target_os = "linux")))]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::Result;
@@ -398,6 +399,33 @@ fn loops_back(path: &Path) -> Error {
     ))
 }
 
+/// Copies a regular file while retaining its modification time. Windows'
+/// native copy already preserves it; other platforms restore it explicitly.
+fn copy_file_preserving_mtime(src: &Path, dst: &Path) -> Result<()> {
+    #[cfg(not(windows))]
+    let modified = std::fs::metadata(src)?.modified().ok();
+    std::fs::copy(src, dst)?;
+    #[cfg(not(windows))]
+    match std::fs::File::open(dst) {
+        Ok(file) => preserve_modified_time(&file, modified),
+        Err(error) => {
+            tracing::warn!(%error, "could not open copied file to preserve modification time")
+        }
+    }
+    Ok(())
+}
+
+/// Metadata restoration is best-effort: a filesystem that cannot represent
+/// the timestamp must not turn a complete copy into a failed content transfer.
+#[cfg(not(windows))]
+fn preserve_modified_time(file: &std::fs::File, modified: Option<std::time::SystemTime>) {
+    if let Some(modified) = modified
+        && let Err(error) = file.set_modified(modified)
+    {
+        tracing::warn!(%error, "could not preserve copied file modification time");
+    }
+}
+
 /// Recursive copy of `src` to `dst`. `dst` must not exist.
 /// For folders, recreates the tree; for files, `std::fs::copy`.
 pub fn copy_path(src: &Path, dst: &Path) -> Result<()> {
@@ -433,12 +461,12 @@ fn copy_path_inner(src: &Path, dst: &Path, entered: &mut Vec<DirMark>) -> Result
                 // Where it lands is checked on entry like any other directory.
                 return copy_path_inner(&std::fs::canonicalize(src)?, dst, entered);
             }
-            std::fs::copy(src, dst)?;
+            copy_file_preserving_mtime(src, dst)?;
             return Ok(());
         }
         #[cfg(not(any(unix, windows)))]
         {
-            std::fs::copy(src, dst)?;
+            copy_file_preserving_mtime(src, dst)?;
             return Ok(());
         }
     }
@@ -471,7 +499,7 @@ fn copy_path_inner(src: &Path, dst: &Path, entered: &mut Vec<DirMark>) -> Result
         }
         walk?;
     } else {
-        std::fs::copy(src, dst)?;
+        copy_file_preserving_mtime(src, dst)?;
     }
     Ok(())
 }
@@ -569,7 +597,7 @@ fn copy_tree_inner(
         }
         #[cfg(not(any(unix, windows)))]
         {
-            std::fs::copy(src, dst)?;
+            copy_file_preserving_mtime(src, dst)?;
         }
         return Ok(OpStatus::Done);
     }
@@ -621,12 +649,10 @@ fn copy_tree_inner(
     }
 }
 
-/// Copy chunk size: 4 MiB. Each chunk is a sequential read THEN write — on a
-/// NETWORK share, each call pays the SMB latency: at 256 KiB throughput
-/// plateaued well below Explorer's (which does large I/O). 4 MiB roughly
-/// matches `CopyFileEx`'s throughput while still allowing progress reporting
-/// and cancellation per chunk. Used on Linux and macOS; Windows relies on
-/// `CopyFileExW`, see below.
+/// Maximum bytes per transfer before checking cancellation and reporting
+/// progress again. Large chunks limit per-call overhead on network mounts.
+/// Linux can transfer them inside the kernel without allocating this buffer.
+/// Windows uses the native copy callback instead.
 #[cfg(not(windows))]
 const COPY_BUF_BYTES: usize = 4 * 1024 * 1024;
 
@@ -638,21 +664,33 @@ fn copy_file_progress(
     cancel: &dyn Fn() -> bool,
 ) -> Result<OpStatus> {
     let mut reader = std::fs::File::open(src)?;
+    let source_metadata = reader.metadata()?;
     let mut writer = std::fs::File::create(dst)?;
+    #[cfg(not(target_os = "linux"))]
     let mut buf = vec![0u8; COPY_BUF_BYTES];
     let outcome = loop {
         if cancel() {
             break Ok(OpStatus::Cancelled);
         }
-        let n = match reader.read(&mut buf) {
+        // Keep the concrete File and Take types visible to std::io::copy so
+        // Linux can use copy_file_range/sendfile and filesystem acceleration.
+        // The standard library falls back when an accelerated path is unavailable.
+        #[cfg(target_os = "linux")]
+        let transferred = std::io::copy(
+            &mut Read::by_ref(&mut reader).take(COPY_BUF_BYTES as u64),
+            &mut writer,
+        );
+        #[cfg(not(target_os = "linux"))]
+        let transferred = reader.read(&mut buf).and_then(|n| {
+            writer.write_all(&buf[..n])?;
+            Ok(n as u64)
+        });
+        let n = match transferred {
             Ok(0) => break Ok(OpStatus::Done),
             Ok(n) => n,
             Err(err) => break Err(Error::from(err)),
         };
-        if let Err(err) = writer.write_all(&buf[..n]) {
-            break Err(Error::from(err));
-        }
-        on_bytes(n as u64);
+        on_bytes(n);
     };
     // Anything but a clean end of file leaves a truncated destination, which
     // looks exactly like a complete copy. Since the walk now steps over a
@@ -664,10 +702,10 @@ fn copy_file_progress(
         let _ = std::fs::remove_file(dst);
         return outcome;
     }
-    // Best-effort: preserve permissions (Unix mode).
-    if let Ok(meta) = std::fs::metadata(src) {
-        let _ = std::fs::set_permissions(dst, meta.permissions());
-    }
+    // Restore the timestamp after the final write, before applying read-only
+    // permissions. Capture it before copying so the read cannot affect it.
+    preserve_modified_time(&writer, source_metadata.modified().ok());
+    let _ = std::fs::set_permissions(dst, source_metadata.permissions());
     Ok(OpStatus::Done)
 }
 
@@ -1070,7 +1108,82 @@ pub fn permanent_delete(path: &Path) -> Result<()> {
             std::fs::remove_file(path)?;
         }
     }
+    forget_trash_info(path);
     Ok(())
+}
+
+// ---------- FreeDesktop trash contents ----------
+//
+// A FreeDesktop trash is a directory holding `files/`, where each trashed item
+// lives under a unique name, and `info/`, where `<name>.trashinfo` records its
+// original location and deletion date. File managers list the trash from
+// `info/`, so an item and its record must leave together. The trash of the
+// home volume is `$XDG_DATA_HOME/Trash`; other volumes use `$topdir/.Trash/$uid`
+// or `$topdir/.Trash-$uid`. Favnyr can browse these directories like any other,
+// which is how an item already in the trash can be selected.
+
+/// Is `dir` the root of a FreeDesktop trash? Decided from its name, then from
+/// the presence of its `info` directory, so the disk is only touched for a
+/// directory that already carries a trash name.
+fn is_trash_root(dir: &Path) -> bool {
+    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let is_uid = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let named = name == "Trash"
+        || name.strip_prefix(".Trash-").is_some_and(is_uid)
+        || (is_uid(name)
+            && dir
+                .parent()
+                .and_then(|p| p.file_name())
+                .is_some_and(|p| p == ".Trash"));
+    named && dir.join("info").is_dir()
+}
+
+/// Root of the FreeDesktop trash whose `files` directory is `dir`, if any.
+fn trash_root_of_files_dir(dir: &Path) -> Option<&Path> {
+    if dir.file_name()? != "files" {
+        return None;
+    }
+    dir.parent().filter(|root| is_trash_root(root))
+}
+
+/// Is `path` stored in a FreeDesktop trash, as a trashed item or anywhere
+/// inside a trashed folder? Sending such a path to the trash again would only
+/// move it within the trash under a new record, so deletion there must be
+/// permanent. Lexical walk over the ancestors; see [`is_trash_root`] for the
+/// only disk access.
+pub fn is_in_trash(path: &Path) -> bool {
+    path.ancestors()
+        .skip(1)
+        .any(|dir| trash_root_of_files_dir(dir).is_some())
+}
+
+/// Record kept by the FreeDesktop trash for `path`, when `path` is a trashed
+/// item itself (directly in `files/`). Content inside a trashed folder has no
+/// record of its own.
+fn trash_info_path(path: &Path) -> Option<PathBuf> {
+    let root = trash_root_of_files_dir(path.parent()?)?;
+    let mut record = path.file_name()?.to_os_string();
+    record.push(".trashinfo");
+    Some(root.join("info").join(record))
+}
+
+/// Removes the trash record of an item that has just been deleted, so file
+/// managers no longer list it. A missing record is not an error. Any other
+/// failure is logged only: the item itself is already gone, which is what the
+/// caller asked for.
+fn forget_trash_info(path: &Path) {
+    let Some(record) = trash_info_path(path) else {
+        return;
+    };
+    match std::fs::remove_file(&record) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::warn!(error = %err, path = %record.display(), "trash record not removed");
+        }
+    }
 }
 
 /// Sends a file/folder to the trash — **cross-platform** via the `trash`
@@ -1089,6 +1202,12 @@ pub fn trash_with_disposition(path: &Path) -> Result<TrashDisposition> {
     // warning cannot be attached to the window from the operation thread.
     #[cfg(windows)]
     if crate::places::is_network_path(path) {
+        permanent_delete(path)?;
+        return Ok(TrashDisposition::PermanentlyDeleted);
+    }
+    // Already in a trash: trashing it again would only move it inside the
+    // trash under a new record. The GUI confirms permanent deletion first.
+    if is_in_trash(path) {
         permanent_delete(path)?;
         return Ok(TrashDisposition::PermanentlyDeleted);
     }
@@ -1340,6 +1459,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Builds `<root>/files/<name>` and its `<root>/info/<name>.trashinfo`.
+    fn trashed_item(root: &Path, name: &str, is_dir: bool) -> (PathBuf, PathBuf) {
+        std::fs::create_dir_all(root.join("files")).unwrap();
+        std::fs::create_dir_all(root.join("info")).unwrap();
+        let item = root.join("files").join(name);
+        if is_dir {
+            std::fs::create_dir_all(item.join("folder02")).unwrap();
+            std::fs::write(item.join("folder02").join("inner.txt"), b"x").unwrap();
+        } else {
+            std::fs::write(&item, b"x").unwrap();
+        }
+        let record = root.join("info").join(format!("{name}.trashinfo"));
+        std::fs::write(
+            &record,
+            "[Trash Info]\nPath=/folder00/item\nDeletionDate=2020-01-01T00:00:00\n",
+        )
+        .unwrap();
+        (item, record)
+    }
+
+    #[test]
+    fn trash_contents_are_recognized_by_layout() {
+        let base = tempdir();
+        let layouts = [
+            base.join("data").join("Trash"),
+            base.join("volume01").join(".Trash-1000"),
+            base.join("volume02").join(".Trash").join("1000"),
+        ];
+        for root in &layouts {
+            let (item, _) = trashed_item(root, "folder01", true);
+            assert!(is_in_trash(&item), "{}", item.display());
+            assert!(is_in_trash(&item.join("folder02").join("inner.txt")));
+            assert!(!is_in_trash(&root.join("files")), "the container itself");
+            assert!(!is_in_trash(root));
+        }
+        // Same names without the `info` directory, or with a different root
+        // name, are ordinary folders.
+        let plain = base.join("plain").join("Trash").join("files");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(!is_in_trash(&plain.join("my_file.txt")));
+        for name in [".Trash-", ".Trash-x1", "Bin"] {
+            let root = base.join("other").join(name);
+            let (item, _) = trashed_item(&root, "my_file.txt", false);
+            assert!(!is_in_trash(&item), "{}", item.display());
+        }
+        let (item, _) = trashed_item(&base.join("other").join("1000"), "my_file.txt", false);
+        assert!(
+            !is_in_trash(&item),
+            "a digit-only root needs a `.Trash` parent"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn deleting_a_trashed_item_removes_its_record() {
+        let base = tempdir();
+        let root = base.join("Trash");
+        let (file, file_record) = trashed_item(&root, "my_file.txt", false);
+        let (folder, folder_record) = trashed_item(&root, "folder01", true);
+        assert!(is_in_trash(&file) && is_in_trash(&folder));
+
+        // Content inside a trashed folder has no record: the folder keeps its own.
+        permanent_delete(&folder.join("folder02")).unwrap();
+        assert!(folder.exists() && folder_record.exists());
+
+        permanent_delete(&file).unwrap();
+        assert!(!file.exists() && !file_record.exists());
+
+        // Trashing an item that is already in a trash deletes it for good
+        // instead of moving it inside the trash again.
+        assert_eq!(
+            trash_with_disposition(&folder).unwrap(),
+            TrashDisposition::PermanentlyDeleted
+        );
+        assert!(!folder.exists() && !folder_record.exists());
+        assert_eq!(std::fs::read_dir(root.join("files")).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(root.join("info")).unwrap().count(), 0);
+
+        // A record already gone is not an error.
+        let (file, file_record) = trashed_item(&root, "my_file.txt", false);
+        std::fs::remove_file(&file_record).unwrap();
+        permanent_delete(&file).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn permanent_delete_removes_a_directory_symlink_without_touching_its_target() {
         // A folder symlink/junction must be deleted as a LINK: the link goes, the
@@ -1589,6 +1793,118 @@ mod tests {
     }
 
     #[test]
+    fn copying_files_preserves_modification_dates_in_both_copy_paths() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let root = tempdir();
+        let source = root.join("folder01");
+        std::fs::create_dir(&source).unwrap();
+        let file = source.join("my_file.txt");
+        std::fs::write(&file, b"data").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000_000))
+            .unwrap();
+        let expected = std::fs::metadata(&file).unwrap().modified().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        let plain = root.join("folder02");
+        copy_path(&source, &plain).unwrap();
+        let progress = root.join("folder03");
+        let mut bytes = 0;
+        let result = copy_tree_progress(
+            &source,
+            &progress,
+            &mut |count| bytes += count,
+            &mut |_, error| panic!("unexpected skipped file: {error}"),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(result, OpStatus::Done);
+        assert_eq!(bytes, 4);
+        for directory in [&plain, &progress] {
+            let copied = directory.join("my_file.txt");
+            assert_eq!(std::fs::read(&copied).unwrap(), b"data");
+            assert_eq!(
+                std::fs::metadata(&copied).unwrap().modified().unwrap(),
+                expected
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&copied).unwrap().permissions().mode(),
+                    std::fs::metadata(&file).unwrap().permissions().mode()
+                );
+            }
+            assert_eq!(
+                crate::fs::recursive_max_mtime(directory, 1),
+                Some(1_000_000_000)
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn folder_date_tracks_replacement_with_an_older_image() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let root = tempdir();
+        let source = root.join("folder01");
+        let target = root.join("folder02");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        for progress in [false, true] {
+            // Each pass starts empty, then replaces a recent text file with
+            // an older image. Directory dates must not prevent moving back.
+            assert_eq!(
+                crate::fs::recursive_max_mtime(&target, 1),
+                crate::fs::recursive_max_mtime(&target, 0)
+            );
+            for (name, timestamp) in [
+                ("my_file.txt", 1_200_000_000),
+                ("my_image.jpg", 1_000_000_000),
+                ("my_image.png", 1_100_000_000),
+            ] {
+                let file = source.join(name);
+                std::fs::write(&file, b"data").unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&file)
+                    .unwrap()
+                    .set_modified(UNIX_EPOCH + Duration::from_secs(timestamp))
+                    .unwrap();
+                let destination = target.join(name);
+                if progress {
+                    assert_eq!(
+                        copy_tree_progress(
+                            &file,
+                            &destination,
+                            &mut |_| {},
+                            &mut |_, error| panic!("unexpected skipped file: {error}"),
+                            &|| false,
+                        )
+                        .unwrap(),
+                        OpStatus::Done
+                    );
+                } else {
+                    copy_path(&file, &destination).unwrap();
+                }
+                assert_eq!(
+                    crate::fs::recursive_max_mtime(&target, 1),
+                    Some(timestamp as i64),
+                    "unexpected folder date after copying {name}"
+                );
+                std::fs::remove_file(destination).unwrap();
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn copy_tree_progress_reports_bytes() {
         let dir = tempdir();
         let src = dir.join("src");
@@ -1659,13 +1975,112 @@ mod tests {
     fn copy_tree_progress_cancels_and_cleans() {
         let dir = tempdir();
         let src = dir.join("big.bin");
-        write_file(&src, &[1u8; 1_000_000]); // > chunk size → cancellation mid-flight
+        write_file(&src, &[1u8; 1_000_000]);
         let dst = dir.join("big-copy.bin");
         // cancel() true right away → nothing is copied.
         let status = copy_tree_progress(&src, &dst, &mut |_| {}, &mut |_, _| {}, &|| true).unwrap();
         assert_eq!(status, OpStatus::Cancelled);
         assert!(!dst.exists(), "the partial file must be cleaned up");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn copy_progress_handles_chunk_boundaries_and_independent_files() {
+        let root = tempdir();
+        let source = root.join("my_file.bin");
+        let destination = root.join("my_copy.bin");
+        let data: Vec<u8> = (0..COPY_BUF_BYTES * 2 + 37)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        for size in [
+            0,
+            37,
+            COPY_BUF_BYTES - 1,
+            COPY_BUF_BYTES,
+            COPY_BUF_BYTES + 1,
+            data.len(),
+        ] {
+            write_file(&source, &data[..size]);
+            let mut deltas = Vec::new();
+            let status = copy_tree_progress(
+                &source,
+                &destination,
+                &mut |delta| deltas.push(delta),
+                &mut |_, error| panic!("unexpected skipped file: {error}"),
+                &|| false,
+            )
+            .unwrap();
+            assert_eq!(status, OpStatus::Done);
+            assert_eq!(deltas.iter().sum::<u64>(), size as u64);
+            assert!(deltas.iter().all(|&n| n > 0 && n <= COPY_BUF_BYTES as u64));
+            assert_eq!(deltas.len(), size.div_ceil(COPY_BUF_BYTES));
+            assert_eq!(std::fs::read(&destination).unwrap(), data[..size]);
+            if size > 0 {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&destination)
+                    .unwrap()
+                    .write_all(&[255])
+                    .unwrap();
+                assert_eq!(std::fs::read(&source).unwrap(), data[..size]);
+            }
+            std::fs::remove_file(&destination).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn copy_progress_cancellation_after_a_chunk_removes_partial_file() {
+        use std::cell::Cell;
+        let root = tempdir();
+        let source = root.join("my_file.bin");
+        let destination = root.join("my_copy.bin");
+        let data = vec![23; COPY_BUF_BYTES * 2 + 37];
+        write_file(&source, &data);
+        let cancel = Cell::new(false);
+        let mut transferred = 0;
+        let status = copy_tree_progress(
+            &source,
+            &destination,
+            &mut |delta| {
+                transferred += delta;
+                assert_eq!(std::fs::metadata(&destination).unwrap().len(), delta);
+                cancel.set(true);
+            },
+            &mut |_, error| panic!("unexpected skipped file: {error}"),
+            &|| cancel.get(),
+        )
+        .unwrap();
+        assert_eq!(status, OpStatus::Cancelled);
+        assert_eq!(transferred, COPY_BUF_BYTES as u64);
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(&source).unwrap(), data);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn copy_progress_read_error_removes_created_destination() {
+        let root = tempdir();
+        let source = root.join("folder01");
+        let destination = root.join("my_copy.bin");
+        std::fs::create_dir(&source).unwrap();
+        let mut transferred = 0;
+        // A directory can be opened on Linux, but reading its bytes fails
+        // after the destination has been created.
+        let result = copy_file_progress(
+            &source,
+            &destination,
+            &mut |delta| transferred += delta,
+            &|| false,
+        );
+        assert!(matches!(result, Err(Error::Io(_))));
+        assert_eq!(transferred, 0);
+        assert!(!destination.exists());
+        assert!(source.is_dir());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

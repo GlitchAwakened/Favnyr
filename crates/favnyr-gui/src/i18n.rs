@@ -155,6 +155,14 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_app_title(g("app_title"));
     strings.set_settings_language(g("settings_language"));
     strings.set_settings_theme(g("settings_theme"));
+    strings.set_settings_terminal(g("settings_terminal"));
+    strings.set_settings_appearance(g("settings_appearance"));
+    strings.set_theme_folder(g("theme_folder"));
+    strings.set_theme_reload(g("theme_reload"));
+    strings.set_edit_select_all(g("edit_select_all"));
+    strings.set_edit_clear(g("edit_clear"));
+    strings.set_edit_show_password(g("edit_show_password"));
+    strings.set_edit_hide_password(g("edit_hide_password"));
     strings.set_settings_ui_scale(g("settings_ui_scale"));
     strings.set_settings_optional_tools_title(g("settings_optional_tools_title"));
     strings.set_settings_optional_tools_hint(g("settings_optional_tools_hint"));
@@ -165,9 +173,6 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_settings_tool_ffmpeg_hint(g("settings_tool_ffmpeg_hint"));
     strings.set_settings_tool_poppler_hint(g("settings_tool_poppler_hint"));
     strings.set_settings_tool_seven_zip_hint(g("settings_tool_seven_zip_hint"));
-    strings.set_theme_auto(g("theme_auto"));
-    strings.set_theme_light(g("theme_light"));
-    strings.set_theme_dark(g("theme_dark"));
     strings.set_col_name(g("col_name"));
     strings.set_col_path(g("col_path"));
     strings.set_col_size(g("col_size"));
@@ -178,7 +183,6 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_ext_filter_label(g("ext_filter_label"));
     strings.set_search_subfolders(g("search_subfolders"));
     strings.set_search_reveal(g("search_reveal"));
-    strings.set_search_containing_folder(g("search_containing_folder"));
     strings.set_search_reveal_new_tab(g("search_reveal_new_tab"));
     strings.set_ext_filter_placeholder(g("ext_filter_placeholder"));
     strings.set_col_resolution(g("col_resolution"));
@@ -447,6 +451,8 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_ws_dirty_tooltip(g("ws_dirty_tooltip"));
     strings.set_ws_slot_assign(g("ws_slot_assign"));
     strings.set_ws_slot_none(g("ws_slot_none"));
+    strings.set_ws_theme_assign(g("ws_theme_assign"));
+    strings.set_ws_theme_none(g("ws_theme_none"));
     strings.set_ws_toast_slot_moved(g("ws_toast_slot_moved"));
     strings.set_ws_dirty_save_action(g("ws_dirty_save_action"));
     strings.set_sidebar_tooltip(g("sidebar_tooltip"));
@@ -474,6 +480,7 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_net_delete_title(g("net_delete_title"));
     strings.set_net_delete_body(g("net_delete_body"));
     strings.set_permanent_delete_body(g("permanent_delete_body"));
+    strings.set_trash_delete_body(g("trash_delete_body"));
     strings.set_net_delete_confirm(g("net_delete_confirm"));
     strings.set_open_many_title(g("open_many_title"));
     strings.set_open_many_confirm(g("open_many_confirm"));
@@ -556,22 +563,15 @@ pub fn language_labels() -> Vec<slint::SharedString> {
     Lang::all().iter().map(|l| l.native_name().into()).collect()
 }
 
-/// Theme picker labels (Auto / Light / Dark) in the given language.
-pub fn theme_labels(lang: Lang) -> Vec<slint::SharedString> {
+/// Tab bar position entries for the settings drop-down. Short forms, not the
+/// sentences the per-view menu uses: that menu names the tab bar because
+/// nothing above it does, whereas here the row is already titled with it, and
+/// a repeated subject only pushed the entries past the width of the list.
+pub fn tabbar_position_labels(lang: Lang) -> Vec<slint::SharedString> {
     vec![
-        tr(lang, "theme_auto").into(),
-        tr(lang, "theme_light").into(),
-        tr(lang, "theme_dark").into(),
-    ]
-}
-
-/// Tab bar position picker labels (top / left /
-/// right) — same text as the per-view menu.
-pub fn tabbar_labels(lang: Lang) -> Vec<slint::SharedString> {
-    vec![
-        tr(lang, "tabbar_top").into(),
-        tr(lang, "tabbar_left").into(),
-        tr(lang, "tabbar_right").into(),
+        tr(lang, "tabbar_pos_top").into(),
+        tr(lang, "tabbar_pos_left").into(),
+        tr(lang, "tabbar_pos_right").into(),
     ]
 }
 
@@ -968,6 +968,9 @@ mod tests {
                 "ws_dirty_save_new",
                 "settings_thumbnail_zoom_label",
                 "settings_thumbnail_zoom_hint",
+                "tabbar_pos_top",
+                "tabbar_pos_left",
+                "tabbar_pos_right",
                 "settings_letter_layout",
                 "settings_letter_layout_tip",
                 "settings_letter_layout_off",
@@ -1081,73 +1084,124 @@ mod tests {
     }
 
     #[test]
+    fn theme_messages_are_present_in_every_embedded_catalog() {
+        for &lang in Lang::all() {
+            let mut catalog = HashMap::new();
+            overlay(embedded(lang), &mut catalog);
+            for key in [
+                "settings_appearance",
+                "theme_nord",
+                "theme_catppuccin_mocha",
+                "theme_catppuccin_macchiato",
+                "theme_catppuccin_frappe",
+                "theme_tokyo_night",
+                "theme_atom",
+                "theme_fluvy",
+                "theme_everforest",
+                "theme_sonokai_atlantis",
+                "theme_rose_pine",
+                "theme_gruvbox_hard",
+                "theme_auto",
+                "theme_light",
+                "theme_dark",
+                "theme_folder",
+                "theme_reload",
+                "theme_unavailable_name",
+                "theme_unavailable",
+                "theme_invalid_files",
+                "theme_failed",
+                "theme_folder_failed",
+                "theme_workspace_override",
+                "ws_theme_assign",
+                "ws_theme_none",
+                "edit_select_all",
+                "edit_clear",
+                "edit_show_password",
+                "edit_hide_password",
+            ] {
+                assert!(
+                    catalog.get(key).is_some_and(|text| !text.is_empty()),
+                    "{lang:?}/{key}"
+                );
+            }
+            assert!(catalog["theme_invalid_files"].contains("{count}"));
+            // The sentence names both the workspace and the theme it imposes,
+            // which is the whole point: either one missing leaves it saying
+            // nothing the reader can act on.
+            assert!(catalog["theme_workspace_override"].contains("{name}"));
+            assert!(catalog["theme_workspace_override"].contains("{theme}"));
+        }
+    }
+
+    #[test]
     fn translated_properties_update_live_and_remain_local_to_each_window() {
-        // Debug builds can use large temporary stack frames during construction.
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn(|| {
-                struct TestPlatform;
-                impl slint::platform::Platform for TestPlatform {
-                    fn create_window_adapter(
-                        &self,
-                    ) -> Result<std::rc::Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError>
-                    {
-                        use slint::platform::software_renderer::{
-                            MinimalSoftwareWindow, RepaintBufferType,
-                        };
-                        Ok(MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer))
-                    }
-                }
-                slint::platform::set_platform(Box::new(TestPlatform)).unwrap();
-                let first = MainWindow::new().unwrap();
-                let second = MainWindow::new().unwrap();
-                // No layout assumed until the user names one.
-                assert_eq!(first.get_letter_layout_index(), 0);
-                let mut english = HashMap::new();
-                overlay(EMBED_EN, &mut english);
-                apply_catalog(&second, &english);
+        crate::test_support::run(|| {
+            let first = MainWindow::new().unwrap();
+            let second = MainWindow::new().unwrap();
+            // No layout assumed until the user names one.
+            assert_eq!(first.get_letter_layout_index(), 0);
+            let mut english = HashMap::new();
+            overlay(EMBED_EN, &mut english);
+            apply_catalog(&second, &english);
 
-                for &lang in Lang::all().iter().chain(std::iter::once(&Lang::En)) {
-                    let mut translated = english.clone();
-                    overlay(embedded(lang), &mut translated);
-                    apply_catalog(&first, &translated);
-                    let strings = first.global::<Strings>();
-                    for (actual, key) in [
-                        (strings.get_btn_cancel(), "btn_cancel"),
-                        (strings.get_settings_language(), "settings_language"),
-                        (strings.get_archive_create(), "archive_create"),
-                        (strings.get_exit_stay(), "exit_stay"),
-                        (strings.get_settings_letter_layout(), "settings_letter_layout"),
-                        (strings.get_settings_letter_layout_tip(), "settings_letter_layout_tip"),
-                        (strings.get_settings_letter_layout_off(), "settings_letter_layout_off"),
-                        (
-                            strings.get_settings_keyboard_ukrainian_standard(),
-                            "settings_keyboard_ukrainian_standard",
-                        ),
-                        (strings.get_settings_keyboard_russian_standard(), "settings_keyboard_russian_standard"),
-                    ] {
-                        assert_eq!(actual.as_str(), translated[key], "{lang:?}/{key}");
-                    }
-                    assert_eq!(
-                        second.global::<Strings>().get_btn_cancel().as_str(),
-                        english["btn_cancel"]
-                    );
+            for &lang in Lang::all().iter().chain(std::iter::once(&Lang::En)) {
+                let mut translated = english.clone();
+                overlay(embedded(lang), &mut translated);
+                apply_catalog(&first, &translated);
+                let strings = first.global::<Strings>();
+                for (actual, key) in [
+                    (strings.get_btn_cancel(), "btn_cancel"),
+                    (strings.get_settings_language(), "settings_language"),
+                    (strings.get_settings_appearance(), "settings_appearance"),
+                    (strings.get_theme_folder(), "theme_folder"),
+                    (strings.get_archive_create(), "archive_create"),
+                    (strings.get_exit_stay(), "exit_stay"),
+                    (
+                        strings.get_settings_letter_layout(),
+                        "settings_letter_layout",
+                    ),
+                    (
+                        strings.get_settings_letter_layout_tip(),
+                        "settings_letter_layout_tip",
+                    ),
+                    (
+                        strings.get_settings_letter_layout_off(),
+                        "settings_letter_layout_off",
+                    ),
+                    (
+                        strings.get_settings_keyboard_ukrainian_standard(),
+                        "settings_keyboard_ukrainian_standard",
+                    ),
+                    (
+                        strings.get_settings_keyboard_russian_standard(),
+                        "settings_keyboard_russian_standard",
+                    ),
+                ] {
+                    assert_eq!(actual.as_str(), translated[key], "{lang:?}/{key}");
                 }
+                assert_eq!(
+                    second.global::<Strings>().get_btn_cancel().as_str(),
+                    english["btn_cancel"]
+                );
+            }
 
-                // Exercise custom overrides through the same merge and UI bindings.
-                let mut custom = english.clone();
-                overlay("app_title = \"Custom title\"\nbtn_cancel = \"Custom action\"", &mut custom);
-                apply_catalog(&first, &custom);
-                assert_eq!(first.get_window_title(), "Custom title");
-                assert_eq!(first.global::<Strings>().get_btn_cancel(), "Custom action");
-                assert_eq!(second.get_window_title().as_str(), english["app_title"]);
-                apply_catalog(&first, &english);
-                assert_eq!(first.get_window_title().as_str(), english["app_title"]);
-                assert_eq!(first.global::<Strings>().get_btn_cancel().as_str(), english["btn_cancel"]);
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+            // Exercise custom overrides through the same merge and UI bindings.
+            let mut custom = english.clone();
+            overlay(
+                "app_title = \"Custom title\"\nbtn_cancel = \"Custom action\"",
+                &mut custom,
+            );
+            apply_catalog(&first, &custom);
+            assert_eq!(first.get_window_title(), "Custom title");
+            assert_eq!(first.global::<Strings>().get_btn_cancel(), "Custom action");
+            assert_eq!(second.get_window_title().as_str(), english["app_title"]);
+            apply_catalog(&first, &english);
+            assert_eq!(first.get_window_title().as_str(), english["app_title"]);
+            assert_eq!(
+                first.global::<Strings>().get_btn_cancel().as_str(),
+                english["btn_cancel"]
+            );
+        });
     }
 
     #[test]

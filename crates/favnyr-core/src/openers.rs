@@ -117,7 +117,7 @@ pub struct Opener {
     /// Pinning to the views' CONTEXT MENU: bitmask —
     /// 1 = right-click on a FILE, 2 = on a FOLDER, 4 = on the view's
     /// BACKGROUND (empty area; the command then targets the current folder).
-    /// 0 = absent (default). Enables entries like "Git Bash here" without a
+    /// 0 = absent (default). Enables entries like "open a shell here" without a
     /// shell extension.
     #[serde(default)]
     pub ctx_menu: u8,

@@ -1,0 +1,71 @@
+import { Palette } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+
+// Preserve the base theme's native finish independently of application surfaces.
+// Other built-in and personal palettes replace colors without changing geometry.
+export global WidgetStyle {
+    private property <bool> dark: Palette.background.to-hsv().value < 0.5;
+    out property <brush> foreground: Theme.custom-palette ? Theme.foreground : Palette.foreground;
+    out property <brush> secondary: Theme.custom-palette ? Theme.foreground.with-alpha(0.78)
+        : Palette.foreground.with-alpha(root.dark ? 0.7882353 : 0.6);
+    out property <brush> disabled-text: root.foreground.with-alpha(0.36862745);
+    out property <brush> control: Theme.custom-palette ? Theme.surface : Palette.control-background;
+    // Light panels are often tinted with the alternate background itself, so the
+    // hovered control steps past it toward the text color to stay visible.
+    out property <brush> hover: Theme.custom-palette
+        ? (root.dark ? Theme.alternate-background : Theme.alternate-background.mix(Theme.foreground, 0.92))
+        : root.dark ? #FFFFFF14 : #F9F9F980;
+    out property <brush> pressed: Theme.custom-palette ? Theme.alternate-background.with-alpha(0.8)
+        : root.dark ? #FFFFFF08 : #F9F9F94D;
+    out property <brush> disabled: Theme.custom-palette ? Theme.foreground.with-alpha(0.04)
+        : root.dark ? #FFFFFF0A : #F9F9F94D;
+    out property <brush> input-active: Theme.custom-palette ? Theme.surface
+        : root.dark ? #1E1E1EB3 : #FFFFFF;
+    out property <brush> accent: Theme.custom-palette ? Theme.accent-background : Palette.accent-background;
+    out property <brush> accent-foreground: Theme.custom-palette ? Theme.accent-foreground : Palette.accent-foreground;
+    out property <brush> accent-disabled: Theme.custom-palette ? Theme.foreground.with-alpha(0.16)
+        : root.dark ? #FFFFFF29 : #00000038;
+    out property <brush> accent-disabled-text: Theme.custom-palette ? Theme.foreground.with-alpha(0.53)
+        : root.dark ? #FFFFFF87 : #FFFFFF;
+    out property <brush> accent-pressed-text: root.accent-foreground.with-alpha(root.dark ? 0.5 : 0.7);
+    out property <color> selection: Theme.custom-palette ? Theme.accent-background : Palette.selection-background;
+    out property <color> selection-foreground: root.accent-foreground;
+    out property <brush> border: Theme.custom-palette ? Theme.border : Palette.border;
+    out property <brush> control-border: Theme.custom-palette ? Theme.border
+        : root.dark ? @linear-gradient(180deg, #FFFFFF17 0%, #00000012 8.33%)
+        : @linear-gradient(180deg, #0000000F 90.58%, #00000029 100%);
+    out property <brush> accent-border: Theme.custom-palette ? Theme.border
+        : root.dark ? @linear-gradient(180deg, #FFFFFF14 90.67%, #00000024 100%)
+        : @linear-gradient(180deg, #FFFFFF14 90.67%, #00000066 100%);
+    out property <brush> input-border: Theme.custom-palette ? Theme.border
+        : root.dark ? @linear-gradient(180deg, #FFFFFF14 99.98%, #FFFFFF8A 100%)
+        : @linear-gradient(180deg, #0000000F 99.99%, #00000073 100%);
+    out property <brush> focus-outer: Theme.custom-palette ? Theme.accent-background : Palette.foreground;
+    out property <brush> focus-inner: Theme.custom-palette ? Theme.background : root.dark ? #000000B3 : #FFFFFF;
+    out property <brush> menu: Theme.custom-palette ? Theme.surface : Palette.alternate-background;
+    out property <brush> menu-border: Theme.custom-palette ? Theme.border : root.dark ? #00000033 : #0000000F;
+    out property <color> menu-shadow: Theme.custom-palette ? Theme.shadow : root.dark ? #00000042 : #00000024;
+    out property <brush> subtle: Theme.custom-palette ? Theme.foreground.with-alpha(0.06)
+        : root.dark ? #FFFFFF0F : #0000000A;
+    out property <brush> subtle-pressed: Theme.custom-palette ? Theme.foreground.with-alpha(0.04)
+        : root.dark ? #FFFFFF0A : #00000005;
+    out property <brush> strong-border: root.foreground.with-alpha(0.6);
+    out property <brush> strong-disabled: Theme.custom-palette ? Theme.foreground.with-alpha(0.16)
+        : root.dark ? #FFFFFF29 : #00000038;
+    out property <brush> check-background: Theme.custom-palette ? Theme.background.with-alpha(0.1)
+        : root.dark ? #0000001A : #00000005;
+    out property <brush> check-hover: Theme.custom-palette ? Theme.foreground.with-alpha(0.04)
+        : root.dark ? #FFFFFF0A : #0000000F;
+    out property <brush> check-pressed: Theme.custom-palette ? Theme.foreground.with-alpha(0.07)
+        : root.dark ? #FFFFFF12 : #00000017;
+}
+
+export component WidgetFocus inherits Rectangle {
+    border-width: 2px;
+    border-color: WidgetStyle.focus-outer;
+    Rectangle {
+        x: 2px; y: 2px; width: parent.width - 4px; height: parent.height - 4px;
+        border-radius: max(0px, parent.border-radius - 2px);
+        border-width: 1px; border-color: WidgetStyle.focus-inner;
+    }
+}

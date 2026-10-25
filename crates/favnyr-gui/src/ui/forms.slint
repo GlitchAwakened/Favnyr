@@ -1,0 +1,339 @@
+// Rows and values the settings and properties panels are built from.
+
+import { CheckBox, ComboBox } from "widgets.slint";
+import { OwRecipe } from "types.slint";
+import { Theme, Tokens } from "theme.slint";
+import { EditTextInput } from "controls.slint";
+import { CommandIcon } from "menus.slint";
+
+// A ready-made-command chip in the "Open with" settings. Factored out so the
+// two wrapped rows share one definition; `activate` bubbles the click up with
+// the recipe's index into the bridge's table.
+// One ready-made command, as a full-width row.
+//
+// The width comes from the column, never from the text: a chip sized on its
+// own label pushed the row past the panel in ALL five languages, and the
+// scrollbar appeared. The label elides instead, which turns the available
+// width into a guarantee rather than an estimate — a longer translation can no
+// longer widen anything.
+export component OwRecipeButton inherits Rectangle {
+    in property <OwRecipe> recipe;
+    callback activate();
+    height: 24px;
+    horizontal-stretch: 1;
+    min-width: 0px;
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: rcp-ta.has-hover ? Theme.accent-background : transparent;
+    background: rcp-ta.has-hover
+        ? Theme.accent-background.with-alpha(0.18)
+        : Theme.foreground.with-alpha(0.07);
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 5px;
+        CommandIcon {
+            kind: root.recipe.icon-kind;
+            width: 15px;
+        }
+        Text {
+            text: root.recipe.label;
+            font-size: 11px;
+            color: Theme.foreground.with-alpha(0.85);
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+    }
+    rcp-ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.activate(); }
+    }
+}
+
+export component SettingsToggleRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> hint;
+    in-out property <bool> checked;
+    callback toggled(bool);
+    spacing: 12px;
+
+    VerticalLayout {
+        horizontal-stretch: 1;
+        spacing: 3px;
+        Text {
+            text: root.label;
+            font-size: 13px;
+            font-weight: 600;
+            color: Theme.foreground;
+            wrap: word-wrap;
+        }
+        Text {
+            text: root.hint;
+            font-size: 11px;
+            color: Theme.foreground.with-alpha(0.55);
+            wrap: word-wrap;
+        }
+    }
+    CheckBox {
+        checked <=> root.checked;
+        toggled => { root.toggled(self.checked); }
+    }
+}
+
+// Inline action sitting at the right end of a settings row. Used where the
+// action belongs to the row it labels rather than to the panel as a whole; the
+// shared `Button` stays the shape for the footers of modal dialogs.
+export component SettingsRowButton inherits Rectangle {
+    callback clicked();
+    in property <string> text;
+    in property <bool> enabled: true;
+
+    // Sized on the label: the floor keeps a short one from shrinking into a
+    // cramped chip, and the text drives the rest so a longer translation is
+    // never clipped.
+    out property <length> natural-w: max(64px, label.preferred-width + 20px);
+    min-width: root.natural-w;
+    preferred-width: root.natural-w;
+    height: 22px;
+    vertical-stretch: 0;
+    horizontal-stretch: 0;
+    border-radius: 4px;
+    background: root.enabled && touch.has-hover
+        ? Theme.accent-background.with-alpha(0.15)
+        : transparent;
+    border-width: 1px;
+    border-color: root.enabled && touch.has-hover
+        ? Theme.accent-background
+        : Theme.border;
+    // Disabled reads as "not offered right now", not as a second style: the
+    // whole chip fades rather than each of its colours being restated.
+    opacity: root.enabled ? 1.0 : 0.45;
+
+    label := Text {
+        text: root.text;
+        font-size: 11px;
+        color: Theme.foreground;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+/// One tab of the properties panel.
+export component PropTab inherits Rectangle {
+    callback clicked();
+    in property <string> label;
+    in property <bool> selected: false;
+
+    height: 30px;
+    width: tab-text.preferred-width + 26px;
+    border-radius: 6px;
+    background: root.selected
+        ? Theme.accent-background.with-alpha(0.14)
+        : (tab-touch.has-hover ? Theme.alternate-background : transparent);
+    tab-text := Text {
+        text: root.label;
+        x: (parent.width - self.width) / 2;
+        height: parent.height;
+        vertical-alignment: center;
+        font-size: 12.5px;
+        font-weight: root.selected ? 700 : 500;
+        color: root.selected ? Theme.accent-background : Theme.foreground.with-alpha(0.75);
+    }
+    tab-touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+/// One class of users and what it may do.
+export component PropAccessRow inherits HorizontalLayout {
+    callback chosen(int);
+    in property <string> label;
+    in property <[string]> choices;
+    in property <int> index;
+
+    spacing: 12px;
+    Text {
+        width: 128px;
+        text: root.label;
+        font-size: 12px;
+        color: Theme.foreground.with-alpha(0.6);
+        vertical-alignment: center;
+    }
+    combo := ComboBox {
+        horizontal-stretch: 1;
+        model: root.choices;
+        current-index: root.index;
+        selected(_) => { root.chosen(combo.current-index); }
+    }
+}
+
+/// A value of the properties panel: shown, never edited, and selectable so it
+/// can be copied out. Single line on purpose: every fact here is one line,
+/// and a wrapping field cannot report a reliable height to this layout, since
+/// the layout asks for that height before any width is known.
+export component PropValue inherits EditTextInput {
+    read-only: true;
+    single-line: true;
+    font-size: 13px;
+    color: Theme.foreground;
+    vertical-alignment: center;
+    selection-background-color: Theme.accent-background.with-alpha(0.5);
+    selection-foreground-color: Theme.foreground;
+}
+
+/// The figures the two digest columns must agree on.
+///
+/// The labels and the scrolling values are laid out separately, so they have
+/// to be told the same row height and the same gap, or they drift apart and a
+/// name ends up beside the wrong digest.
+export global PropDigest {
+    out property <length> row: 22px;
+    out property <length> gap: 6px;
+    /// Room for the horizontal scrollbar under the last row.
+    out property <length> bar: 14px;
+}
+
+/// A value placed in a row of the properties panel.
+///
+/// The field is wrapped in a clipping box on purpose. A selectable field is a
+/// `TextInput`, and a `TextInput` reports the full width of its text to the
+/// layout: a 128-character digest or a deep path would otherwise decide how
+/// wide the whole tab is, dragging every stretching control out with it. The
+/// box asks for nothing, takes what the row leaves, and cuts what overflows.
+/// The text stays selectable, so a value wider than the panel is still
+/// obtained with Ctrl+A then Ctrl+C.
+export component PropValueBox inherits Rectangle {
+    in property <string> text;
+    in property <length> text-size: 13px;
+    /// Digests read far better aligned; names and dates do not.
+    in property <bool> monospace: false;
+
+    clip: true;
+    horizontal-stretch: 1;
+    PropValue {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        text: root.text;
+        font-size: root.text-size;
+        font-family: root.monospace ? "monospace" : "";
+    }
+}
+
+// Row made of a label, a selectable monospace path, and a button
+// that opens the folder in the system's file manager.
+export component PathRow inherits VerticalLayout {
+    callback open-clicked();
+    in property <string> label;
+    in property <string> value;
+    in property <string> open-text;
+    spacing: 4px;
+
+    // Row header — fixed-height parent Rectangle to allow absolute
+    // vertical centering of the buttons (a HorizontalLayout without an
+    // explicit height pushed them toward the top).
+    Rectangle {
+        height: 22px;
+        Text {
+            x: 0;
+            y: (parent.height - self.height) / 2;
+            text: root.label;
+            font-size: 10px;
+            font-weight: 600;
+            color: Theme.foreground.with-alpha(0.55);
+            letter-spacing: 0.3px;
+        }
+        SettingsRowButton {
+            // Placed by hand rather than by a layout, so the natural width is
+            // applied here: a `Rectangle` with no explicit width fills its
+            // parent, and the chip would span the whole row.
+            width: self.natural-w;
+            x: parent.width - self.width;
+            y: (parent.height - self.height) / 2;
+            text: root.open-text;
+            clicked => { root.open-clicked(); }
+        }
+    }
+    // Selectable and read-only: a path is there to be copied out. It wraps,
+    // because a path can run wider than the card.
+    EditTextInput {
+        text: root.value;
+        read-only: true;
+        font-size: 12px;
+        font-family: "monospace";
+        color: Theme.foreground;
+        single-line: false;
+        wrap: word-wrap;
+        selection-background-color: Theme.accent-background.with-alpha(0.5);
+        selection-foreground-color: Theme.foreground;
+    }
+}
+
+// One optional command-line tool and the feature it unlocks.
+export component OptionalToolRow inherits Rectangle {
+    in property <string> name;
+    in property <string> hint;
+    in property <bool> found;
+    in property <string> version;
+    in property <string> available-label;
+    in property <string> missing-label;
+
+    height: 48px;
+    border-radius: 6px;
+    background: Theme.background;
+    border-width: 1px;
+    border-color: Tokens.hairline;
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 10px;
+        Image {
+            width: 15px;
+            height: 15px;
+            y: (parent.height - self.height) / 2;
+            source: root.found
+                ? @image-url("../../assets/icons/check.svg")
+                : @image-url("../../assets/icons/alert-triangle.svg");
+            colorize: root.found ? Tokens.success : Tokens.warning;
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            spacing: 2px;
+            Text {
+                text: root.name + (root.version == "" ? "" : " " + root.version);
+                font-size: 12px;
+                font-weight: 600;
+                color: Theme.foreground;
+            }
+            Text {
+                text: root.hint;
+                font-size: 10px;
+                color: Theme.foreground.with-alpha(0.55);
+                overflow: elide;
+            }
+        }
+        Rectangle {
+            y: (parent.height - self.height) / 2;
+            height: 22px;
+            border-radius: 11px;
+            background: (root.found ? Tokens.success : Tokens.warning).with-alpha(0.15);
+            HorizontalLayout {
+                padding-left: 9px;
+                padding-right: 9px;
+                Text {
+                    text: root.found ? root.available-label : root.missing-label;
+                    font-size: 11px;
+                    font-weight: 600;
+                    color: root.found ? Tokens.success : Tokens.warning;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

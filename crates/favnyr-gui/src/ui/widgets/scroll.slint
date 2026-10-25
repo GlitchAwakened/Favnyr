@@ -1,0 +1,148 @@
+import { WidgetStyle } from "style.slint";
+
+component ScrollHandle inherits Rectangle {
+    in property <bool> horizontal;
+    in property <length> extent;
+    in property <length> page;
+    in property <bool> enabled: true;
+    in-out property <length> offset;
+    callback scrolled();
+    property <length> length: max(0px, root.horizontal ? root.width : root.height);
+    property <length> inset: min(16px, root.length / 2);
+    property <length> track-length: root.length - 2 * root.inset;
+    property <length> limit: max(0px, root.extent - root.page);
+    property <length> thumb-length: min(root.track-length, max(16px, root.track-length * root.page / max(1px, root.extent)));
+    property <length> travel: max(0px, root.track-length - root.thumb-length);
+    property <length> thumb-position: root.inset + (root.limit > 0px ? -root.offset.clamp(-root.limit, 0px) * root.travel / root.limit : 0px);
+    property <length> drag-start;
+    property <length> drag-offset;
+    property <length> drag-limit;
+    property <bool> start-hovered;
+    property <bool> end-hovered;
+    property <bool> hovered: root.start-hovered || root.end-hovered;
+    property <length> thickness: touch.has-hover || root.hovered ? 6px : 2px;
+    background: touch.has-hover || root.hovered ? WidgetStyle.menu : transparent;
+    border-width: 1px; border-radius: 7px; clip: true;
+    animate thickness { duration: 150ms; easing: ease-out; }
+    accessible-role: slider;
+    accessible-enabled: root.enabled && root.limit > 0px;
+    accessible-value: -root.offset / 1px;
+    accessible-value-minimum: 0;
+    accessible-value-maximum: root.limit / 1px;
+    accessible-action-increment => { root.scroll-to(root.offset - root.page * 0.8); }
+    accessible-action-decrement => { root.scroll-to(root.offset + root.page * 0.8); }
+    accessible-action-set-value(v) => { root.scroll-to(-v.to-float() * 1px); }
+    function scroll-to(offset: length) {
+        if root.enabled {
+            root.offset = offset.clamp(-root.limit, 0px);
+            root.scrolled();
+        }
+    }
+    Rectangle {
+        x: root.horizontal ? root.thumb-position : parent.width - 4px - root.thickness;
+        y: root.horizontal ? parent.height - 4px - root.thickness : root.thumb-position;
+        width: root.horizontal ? root.thumb-length : root.thickness;
+        height: root.horizontal ? root.thickness : root.thumb-length;
+        border-radius: root.thickness / 2;
+        background: WidgetStyle.border;
+    }
+    touch := TouchArea {
+        enabled: root.enabled && root.limit > 0px;
+        pointer-event(e) => {
+            if e.button == PointerEventButton.left && e.kind == PointerEventKind.down {
+                let p = root.horizontal ? self.mouse-x : self.mouse-y;
+                root.drag-start = p;
+                root.drag-offset = root.offset;
+                root.drag-limit = root.limit;
+            }
+        }
+        moved => {
+            if self.pressed && root.travel > 0px {
+                if root.drag-limit != root.limit {
+                    root.drag-limit = root.limit;
+                    root.drag-start = root.horizontal ? self.mouse-x : self.mouse-y;
+                    root.drag-offset = root.offset;
+                }
+                let delta = (root.horizontal ? self.mouse-x : self.mouse-y) - root.drag-start;
+                root.scroll-to(root.drag-offset - delta * root.limit / root.travel);
+            }
+        }
+        scroll-event(e) => {
+            let delta = root.horizontal ? e.delta-x : e.delta-y;
+            if delta == 0px { return reject; }
+            root.scroll-to(root.offset + delta);
+            accept
+        }
+    }
+    for direction[index] in [1, -1]: Rectangle {
+        visible: root.inset > 0px;
+        // Keep the arrow's hit target independent of its small visual glyph.
+        x: root.horizontal ? (index == 0 ? 0px : root.width - self.width) : 0px;
+        y: root.horizontal ? 0px : (index == 0 ? 0px : root.height - self.height);
+        width: root.horizontal ? root.inset : root.width;
+        height: root.horizontal ? root.height : root.inset;
+        Image {
+            x: root.horizontal ? (index == 0 ? 4px : parent.width - self.width - 4px) : (parent.width - self.width) / 2;
+            y: root.horizontal ? (parent.height - self.height) / 2 : (index == 0 ? 4px : parent.height - self.height - 4px);
+            width: root.horizontal ? 6px : 8px; height: root.horizontal ? 8px : 6px;
+            opacity: touch.has-hover || root.hovered ? 1 : 0;
+            source: root.horizontal
+                ? (direction == 1 ? @image-url("../../../assets/icons/chevron-left.svg") : @image-url("../../../assets/icons/chevron-right.svg"))
+                : (direction == 1 ? @image-url("../../../assets/icons/chevron-up.svg") : @image-url("../../../assets/icons/chevron-down.svg"));
+            colorize: step.has-hover ? WidgetStyle.secondary : WidgetStyle.border;
+        }
+        step := TouchArea {
+            enabled: root.enabled && root.limit > 0px;
+            changed has-hover => {
+                if index == 0 { root.start-hovered = self.has-hover; }
+                else { root.end-hovered = self.has-hover; }
+            }
+            clicked => { root.scroll-to(root.offset + direction * 10px); }
+        }
+    }
+}
+
+export component ScrollView {
+    in property <bool> enabled: true;
+    in-out property <length> content-x <=> viewport.content-x;
+    in-out property <length> content-y <=> viewport.content-y;
+    in-out property <length> content-width <=> viewport.content-width;
+    in-out property <length> content-height <=> viewport.content-height;
+    out property <length> visible-width: viewport.width;
+    out property <length> visible-height: viewport.height;
+    in property <bool> mouse-drag-pan-enabled: false;
+    in property <ScrollBarPolicy> horizontal-scrollbar-policy: as-needed;
+    in property <ScrollBarPolicy> vertical-scrollbar-policy: as-needed;
+    callback scrolled();
+    min-width: 50px; min-height: 50px;
+    preferred-width: 100%; preferred-height: 100%;
+    horizontal-stretch: 1; vertical-stretch: 1;
+    // Flickable owns gestures, clipping, content measurement and wheel propagation.
+    viewport := Flickable {
+        width: root.width; height: root.height;
+        interactive: root.enabled;
+        mouse-drag-pan-enabled: root.mouse-drag-pan-enabled;
+        flicked => { root.scrolled(); }
+        @children
+    }
+    vertical := ScrollHandle {
+        horizontal: false; enabled: root.enabled;
+        x: parent.width - self.width; y: 0px; width: 14px;
+        height: max(0px, parent.height - (horizontal.visible ? 14px : 0px));
+        visible: root.vertical-scrollbar-policy == ScrollBarPolicy.always-on
+            || (root.vertical-scrollbar-policy == ScrollBarPolicy.as-needed && root.content-height > root.height);
+        extent: root.content-height; page: root.height;
+        offset <=> root.content-y;
+        scrolled => { root.scrolled(); }
+    }
+    horizontal := ScrollHandle {
+        horizontal: true; enabled: root.enabled;
+        x: 0px; y: parent.height - self.height; height: 14px;
+        width: max(0px, parent.width - (vertical.visible ? 14px : 0px));
+        visible: root.horizontal-scrollbar-policy == ScrollBarPolicy.always-on
+            || (root.horizontal-scrollbar-policy == ScrollBarPolicy.as-needed && root.content-width > root.width);
+        extent: root.content-width; page: root.width;
+        offset <=> root.content-x;
+        scrolled => { root.scrolled(); }
+    }
+}

@@ -38,7 +38,12 @@ mod i18n;
 mod linportable;
 mod openwith;
 mod shellmenu;
+#[cfg(test)]
+mod test_support;
+mod theme;
 mod transfer;
+#[cfg(test)]
+mod widget_tests;
 #[cfg(windows)]
 mod winddrag;
 mod winmsg;

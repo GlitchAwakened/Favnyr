@@ -348,6 +348,99 @@ pub fn net_connect_prompt(resource: &str) -> bool {
     }
 }
 
+/// Folders this machine shares on the network, as absolute paths. Local reads
+/// only, no network access:
+///   - **Windows**: the SMB shares persisted by the server service in the
+///     registry, readable without elevation. Automatic administrative shares
+///     (`C$`, `ADMIN$`…) are not persisted there and are not reported;
+///   - **Linux**: Samba user shares, the files that desktop sharing dialogs
+///     write in the default usershare directory. That directory is only
+///     readable by the members of its group, so anyone else gets nothing.
+pub fn local_shared_folders() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        windrives::local_shared_folders()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        const USERSHARE_DIR: &str = "/var/lib/samba/usershares";
+        let Ok(dir) = std::fs::read_dir(USERSHARE_DIR) else {
+            return Vec::new();
+        };
+        dir.flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .filter_map(|text| usershare_path(&text))
+            .collect()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        Vec::new()
+    }
+}
+
+/// Folder of one share persisted by the Windows server service, from the
+/// `Key=Value` lines of its registry value. Only disk shares count: printers
+/// and devices share no folder. The low byte of `Type` is the share type,
+/// 0 being a disk; the high bits only flag special or temporary shares.
+#[cfg(any(windows, test))]
+fn lanman_share_path<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<PathBuf> {
+    let mut path = None;
+    let mut disk = true;
+    for line in lines {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.eq_ignore_ascii_case("Path") && !value.is_empty() {
+            path = Some(PathBuf::from(value));
+        } else if key.eq_ignore_ascii_case("Type") {
+            disk = value.trim().parse::<u32>().is_ok_and(|ty| ty & 0xFF == 0);
+        }
+    }
+    path.filter(|_| disk)
+}
+
+/// Folder of one Samba user share, from the `key=value` lines of its file.
+#[cfg(any(target_os = "linux", test))]
+fn usershare_path(text: &str) -> Option<PathBuf> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("path="))
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Is `dir` the directory where GVFS exposes its mounts?
+#[cfg(target_os = "linux")]
+pub(crate) fn is_gvfs_root(dir: &Path) -> bool {
+    dir == gvfs_root().as_path()
+}
+
+/// Does a GVFS mount name denote a folder reached over the network? Phones,
+/// cameras and other attached devices are mounted there too and are excluded.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn is_remote_gvfs_mount(name: &str) -> bool {
+    const REMOTE_BACKENDS: &[&str] = &[
+        "smb-share",
+        "nfs",
+        "sftp",
+        "ftp",
+        "ftps",
+        "dav",
+        "davs",
+        "afp-volume",
+    ];
+    name.split_once(':')
+        .is_some_and(|(backend, _)| REMOTE_BACKENDS.contains(&backend))
+}
+
+/// Is the mount point `path` a filesystem mounted from another machine? The
+/// GVFS directory is excluded: it is the container of those mounts, each of
+/// them recognized by [`is_remote_gvfs_mount`].
+#[cfg(target_os = "linux")]
+pub(crate) fn is_remote_mount(path: &Path) -> bool {
+    !is_gvfs_root(path) && is_network_path(path)
+}
+
 /// Buses whose devices can be unplugged while the machine is running.
 #[cfg(target_os = "linux")]
 const HOTPLUG_BUSES: &[&str] = &["/usb", "/mmc", "/firewire", "/pcmcia"];
@@ -715,11 +808,21 @@ mod windrives {
         super::NetShares::Ok(shares)
     }
 
-    // Enumeration of WSL distributions via the registry (advapi32, system DLL).
+    // Registry reads (advapi32, system DLL): WSL distributions and local shares.
     type Hkey = isize;
     #[link(name = "advapi32")]
     unsafe extern "system" {
         fn RegOpenKeyExW(hkey: Hkey, sub: *const u16, opts: u32, sam: u32, out: *mut Hkey) -> i32;
+        fn RegEnumValueW(
+            hkey: Hkey,
+            index: u32,
+            name: *mut u16,
+            name_len: *mut u32,
+            reserved: *mut u32,
+            ty: *mut u32,
+            data: *mut u8,
+            data_len: *mut u32,
+        ) -> i32;
         fn RegEnumKeyExW(
             hkey: Hkey,
             index: u32,
@@ -742,7 +845,9 @@ mod windrives {
     }
     // `((HKEY)(LONG)0x80000001)` sign-extended to pointer size.
     const HKEY_CURRENT_USER: Hkey = 0x8000_0001u32 as i32 as Hkey;
+    const HKEY_LOCAL_MACHINE: Hkey = 0x8000_0002u32 as i32 as Hkey;
     const KEY_READ: u32 = 0x2_0019;
+    const REG_MULTI_SZ: u32 = 7;
 
     // Drive types relevant to the user (UNKNOWN=0 and NO_ROOT_DIR=1 are
     // excluded).
@@ -994,6 +1099,66 @@ mod windrives {
         out
     }
 
+    /// Local folders exposed as Windows SMB shares.
+    ///
+    /// Windows stores their configuration under the historical `LanmanServer`
+    /// service name. Each share is one `REG_MULTI_SZ` registry value containing
+    /// `Key=Value` lines, including its local path (see `lanman_share_path`).
+    pub fn local_shared_folders() -> Vec<PathBuf> {
+        let sub = wide(r"SYSTEM\CurrentControlSet\Services\LanmanServer\Shares");
+        let mut key: Hkey = 0;
+        if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub.as_ptr(), 0, KEY_READ, &mut key) } != 0 {
+            return Vec::new(); // server service not installed
+        }
+        let mut out = Vec::new();
+        // Share names are limited to 80 characters by the server service.
+        let mut name = [0u16; 256];
+        let mut data = vec![0u16; 1024];
+        let mut index = 0u32;
+        loop {
+            let mut name_len = name.len() as u32;
+            let mut data_len = (data.len() * 2) as u32; // bytes
+            let mut ty = 0u32;
+            let rc = unsafe {
+                RegEnumValueW(
+                    key,
+                    index,
+                    name.as_mut_ptr(),
+                    &mut name_len,
+                    std::ptr::null_mut(),
+                    &mut ty,
+                    data.as_mut_ptr() as *mut u8,
+                    &mut data_len,
+                )
+            };
+            if rc as u32 == ERROR_MORE_DATA {
+                // Either buffer may be the short one. Only the data buffer
+                // can grow; a value whose name does not fit is skipped.
+                let needed = (data_len as usize).div_ceil(2);
+                if needed > data.len() {
+                    data.resize(needed, 0);
+                } else {
+                    index += 1;
+                }
+                continue;
+            }
+            if rc != 0 {
+                break; // ERROR_NO_MORE_ITEMS
+            }
+            index += 1;
+            if ty != REG_MULTI_SZ {
+                continue;
+            }
+            let units = (data_len as usize / 2).min(data.len());
+            let text = String::from_utf16_lossy(&data[..units]);
+            if let Some(path) = super::lanman_share_path(text.split('\0')) {
+                out.push(path);
+            }
+        }
+        unsafe { RegCloseKey(key) };
+        out
+    }
+
     /// Reads a `REG_SZ` (string) value. `None` if absent / different type.
     fn reg_read_sz(hkey: Hkey, value: &str) -> Option<String> {
         let vw = wide(value);
@@ -1164,7 +1329,7 @@ fn is_removable_mount(mount: &Path) -> bool {
     s.starts_with("/run/media/") || s.starts_with("/media/")
 }
 
-/// Shares mounted by **GVFS** (GNOME/Nautilus) under
+/// Shares mounted by **GVFS** (GNOME's virtual file system) under
 /// `/run/user/<uid>/gvfs/<backend>:<params>` — SMB, SFTP, MTP, DAV… They do
 /// NOT show up as "disk" mounts (a single FUSE mount point), so the folder
 /// is listed instead.
@@ -1776,5 +1941,56 @@ mod tests {
         ));
         assert!(is_user_facing_mount(Path::new("/"), "ext4"));
         assert!(is_user_facing_mount(Path::new("/run/media/u/USB"), "vfat"));
+    }
+
+    #[test]
+    fn lanman_shares_keep_disk_folders_only() {
+        let disk = [
+            "CSCFlags=0",
+            "MaxUses=4294967295",
+            r"Path=C:\folder01",
+            "Permissions=0",
+            "ShareName=share01",
+            "Type=0",
+            "",
+        ];
+        assert_eq!(lanman_share_path(disk), Some(PathBuf::from(r"C:\folder01")));
+        // A temporary disk share keeps type 0 in its low byte.
+        assert_eq!(
+            lanman_share_path([r"Path=C:\folder02", "Type=1073741824"]),
+            Some(PathBuf::from(r"C:\folder02"))
+        );
+        assert_eq!(
+            lanman_share_path([r"Path=C:\folder03"]),
+            Some(PathBuf::from(r"C:\folder03"))
+        );
+        assert_eq!(lanman_share_path(["Path=", "Type=0"]), None);
+        assert_eq!(lanman_share_path(["ShareName=printer01", "Type=1"]), None);
+        assert_eq!(lanman_share_path([r"Path=C:\folder04", "Type=1"]), None);
+        assert_eq!(lanman_share_path([r"Path=C:\folder05", "Type=x"]), None);
+    }
+
+    #[test]
+    fn usershare_files_name_their_folder() {
+        let file = "#VERSION 2\npath=/home/user01/folder01\ncomment=\n\
+                    usershare_acl=S-1-1-0:R,\nguest_ok=n\nsharename=share01\n";
+        assert_eq!(
+            usershare_path(file),
+            Some(PathBuf::from("/home/user01/folder01"))
+        );
+        assert_eq!(usershare_path("#VERSION 2\npath=\n"), None);
+        assert_eq!(usershare_path("sharename=share01\n"), None);
+    }
+
+    #[test]
+    fn only_network_gvfs_backends_are_remote() {
+        assert!(is_remote_gvfs_mount(
+            "smb-share:server=device01,share=share01"
+        ));
+        assert!(is_remote_gvfs_mount("sftp:host=device01,user=user01"));
+        assert!(is_remote_gvfs_mount("davs:host=device01,ssl=true"));
+        assert!(!is_remote_gvfs_mount("mtp:host=device01"));
+        assert!(!is_remote_gvfs_mount("gphoto2:host=device01"));
+        assert!(!is_remote_gvfs_mount("smb-share"));
     }
 }

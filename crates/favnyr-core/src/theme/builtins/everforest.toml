@@ -1,0 +1,169 @@
+# Everforest light and dark palettes, adapted to application semantic roles.
+# Colors come from the Everforest palette, arranged as in a community note-taking
+# theme built on it. Both upstream license notices are embedded with the palette
+# for redistribution.
+#
+# MIT License
+#
+# Copyright (c) 2019 sainnhe
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# MIT License
+#
+# Copyright (c) 2021 mrglitchbyte
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+schema_version = 1
+
+# Light: content on bg, side bars and headers on bg2, bg0 behind them, neutral
+# hover on bg3 rather than bg4, which leaves body text below a readable
+# contrast, and separators on bg5. The aqua accent carries dark text, since
+# the upstream light ink does not reach a readable contrast on it.
+#
+# The neutral surfaces are desaturated to about 40% of the upstream tint. Every
+# one of them carried a 23 to 26 point yellow cast, which read as a film laid
+# over the whole window rather than as warm paper. Compression is done at
+# constant luminance, so the text contrasts are the ones measured before it.
+[light.opacity]
+hidden = 0.58
+age = 0.16
+
+[light.colors]
+background = "#EEEDE4"
+surface = "#F9F6EF"
+toolbar = "#F0EFE6"
+alternate_background = "#EBEAE1"
+foreground = "#5C6A72"
+border = "#DCDBD3"
+accent_background = "#6EC398"
+accent_foreground = "#2F383E"
+danger = "#F85552"
+success = "#899C40"
+warning = "#BF983D"
+extension = "#5A93A2"
+track = "#E2E1D9"
+disk_normal = "#A4AD9E"
+toast_success = "#F0F1D2"
+toast_info = "#E9F0E9"
+toast_danger = "#FBE3DA"
+tooltip_background = "#5C6A72"
+tooltip_foreground = "#F9F6EF"
+shadow = "#000000"
+modal_overlay = "#5C6A7273"
+file_application = "#899C40"
+file_archive = "#F57D26"
+file_audio = "#B87B9D"
+file_document = "#5A93A2"
+file_image = "#F85552"
+file_video = "#569D79"
+file_registry = "#879686"
+folder_default = "#BF983D"
+folder_red = "#F85552"
+folder_green = "#899C40"
+folder_teal = "#569D79"
+folder_blue = "#5A93A2"
+folder_violet = "#B87B9D"
+folder_pink = "#E092BE"
+folder_slate = "#879686"
+age_hour = "#F85552"
+age_hours = "#F57D26"
+age_day = "#BF983D"
+age_week = "#899C40"
+age_month = "#569D79"
+age_year = "#5A93A2"
+age_older = "#879686"
+
+# Dark: content on bg, lighter side bars and headers on bg2, bg0 behind them,
+# neutral hover on bg4 and separators on bg5. Colored fills carry the bg0 ink.
+#
+# Two desaturations, also at constant luminance. The surfaces lose part of
+# their cool tint, and the body text loses most of its warm one: a 41 point
+# beige over cold grey-green surfaces was the real source of the muddiness,
+# more than the surfaces themselves. Green remains where it means something,
+# in the accent and in the palette's own colours.
+[dark.opacity]
+hidden = 0.55
+age = 0.20
+
+[dark.colors]
+background = "#24282A"
+surface = "#32373B"
+toolbar = "#3B4144"
+alternate_background = "#4E5458"
+foreground = "#CEC6B7"
+border = "#555B5F"
+accent_background = "#569D79"
+accent_foreground = "#24282A"
+danger = "#E67E80"
+danger_foreground = "#24282A"
+success = "#A7C080"
+warning = "#DBBC7F"
+extension = "#7FBBB3"
+toast_success = "#404D44"
+toast_info = "#394F5A"
+toast_danger = "#4E3E43"
+tooltip_background = "#24282A"
+tooltip_foreground = "#CEC6B7"
+shadow = "#000000"
+modal_overlay = "#24282A99"
+file_application = "#A7C080"
+file_archive = "#E69875"
+file_audio = "#D699B6"
+file_document = "#7FBBB3"
+file_image = "#E67E80"
+file_video = "#83C092"
+file_registry = "#9AA79D"
+# Pink is the midpoint between the palette's red and purple, which upstream
+# shares between both roles.
+folder_default = "#DBBC7F"
+folder_red = "#E67E80"
+folder_green = "#A7C080"
+folder_teal = "#83C092"
+folder_blue = "#7FBBB3"
+folder_violet = "#D699B6"
+folder_pink = "#DE8B9B"
+folder_slate = "#9AA79D"
+folder_red_foreground = "#24282A"
+folder_green_foreground = "#24282A"
+folder_teal_foreground = "#24282A"
+folder_blue_foreground = "#24282A"
+folder_violet_foreground = "#24282A"
+folder_pink_foreground = "#24282A"
+folder_slate_foreground = "#24282A"
+age_hour = "#E67E80"
+age_hours = "#E69875"
+age_day = "#DBBC7F"
+age_week = "#A7C080"
+age_month = "#83C092"
+age_year = "#7FBBB3"
+age_older = "#7F897D"

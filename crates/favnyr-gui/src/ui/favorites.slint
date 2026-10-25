@@ -1,0 +1,484 @@
+// Favorites panel shown in the sidebar, with its tree rows.
+
+import { ScrollView } from "widgets.slint";
+import { FavNode } from "types.slint";
+import { Strings } from "strings.slint";
+import { Dismiss } from "globals.slint";
+import { Theme, Tokens } from "theme.slint";
+import { DragEdgeScroller } from "controls.slint";
+import { SidebarSectionHeader } from "sidebar.slint";
+
+// A row of the favorites tree: container or favorite, indented by
+// depth. PURELY visual on the chevron side (left click expands a
+// container / opens a favorite, handled by the parent via `activate`).
+component FavRow inherits Rectangle {
+    in property <FavNode> node;
+    in property <bool> selected;
+    in property <int> row-index;                // position in the visible list
+    in property <bool> drag-active;             // a reorder drag is in progress
+    in property <bool> location-drag-active: false;
+    in property <bool> reorder-feedback-visible: true;
+    in property <int> drag-target-index;        // current target row (-1 = none)
+    in property <int> drag-zone;                // 0 before · 1 inside · 2 after
+    // Target of a tab or file drag: this container is hovered and the
+    // target dropped here will be saved as a favorite. Same "drop-into" rendering as
+    // the internal reorder drag.
+    in property <bool> drop-hover: false;
+    callback activate();
+    callback middle-clicked();
+    callback right-clicked(length, length);
+    // Drag: (source row-index, absolute cursor y, top y of THIS row). The bridge
+    // computes the target/zone in f32 (reliable) and performs the move on drop.
+    callback drag-move(int, length, length, length);
+    callback drag-drop(int, length, length, length);
+
+    height: 30px;
+    border-radius: Tokens.radius-row;
+    // Indentation capped at 5 levels (beyond that, it degrades without aligning).
+    property <length> indent: 8px + min(root.node.depth, 5) * 14px;
+    // "Drop INTO this container" highlight: internal (reorder) drag
+    // OR a tab/file drag — same rendering.
+    property <bool> drop-into: (root.drag-active && root.reorder-feedback-visible
+        && root.drag-target-index == root.row-index && root.drag-zone == 1
+        && root.node.is-container) || root.drop-hover;
+    // A file favorite shows the file's own icon when the system provided one,
+    // and a document glyph otherwise. Either way it reads as a file rather than
+    // as a place to navigate to, which is the difference that matters once both
+    // live in the same tree. Its own icon already carries its colours, so it is
+    // never tinted.
+    property <bool> file-favorite: !root.node.is-container && !root.node.is-dir
+        && root.node.available;
+    property <bool> own-icon: root.file-favorite && root.node.icon.width > 0;
+    property <length> ds-y;
+    property <length> row-top;
+    property <bool> dragging: false;
+    // See the reorderable sections: a drag cut from outside takes this row's
+    // own state with it, so it stops looking carried.
+    changed drag-active => {
+        if (!root.drag-active && !root.location-drag-active) { root.dragging = false; }
+    }
+    changed location-drag-active => {
+        if (!root.drag-active && !root.location-drag-active) { root.dragging = false; }
+    }
+
+    opacity: root.dragging ? 0.4 : 1.0;
+    background: root.drop-into
+        ? Theme.accent-background.with-alpha(0.18)
+        : (root.selected
+            ? Theme.accent-background.with-alpha(0.20)
+            : (touch.has-hover ? Theme.alternate-background : transparent));
+    border-width: (root.selected || root.drop-into) ? 1px : 0px;
+    border-color: Theme.accent-background.with-alpha(0.45);
+
+    // Insertion bar (reorder before / after).
+    if root.drag-active && root.reorder-feedback-visible
+            && root.drag-target-index == root.row-index && root.drag-zone == 0 : Rectangle {
+        y: 0;
+        height: 2px;
+        x: root.indent;
+        width: parent.width - root.indent - 8px;
+        background: Theme.accent-background;
+        border-radius: 1px;
+    }
+    if root.drag-active && root.reorder-feedback-visible
+            && root.drag-target-index == root.row-index && root.drag-zone == 2 : Rectangle {
+        y: parent.height - 2px;
+        height: 2px;
+        x: root.indent;
+        width: parent.width - root.indent - 8px;
+        background: Theme.accent-background;
+        border-radius: 1px;
+    }
+
+    // Root TouchArea: the visual content is declared afterward and clicks on
+    // empty areas fall through here. Renaming uses a modal popup.
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        pointer-event(ev) => {
+            // LEFT click on a favorite closes menus; right-click (favorite
+            // menu) does not bump → it can teleport the menu.
+            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) { Dismiss.serial += 1; }
+            if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down) {
+                root.ds-y = self.absolute-position.y + self.mouse-y;
+                root.row-top = self.absolute-position.y;
+                root.dragging = false;
+            }
+            if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.up) {
+                if (root.dragging) {
+                    // CURRENT top of the row (auto-corrects if the list moved
+                    // during the drag, e.g. auto-expand of a hovered container).
+                    root.drag-drop(root.row-index,
+                        self.absolute-position.x + self.mouse-x,
+                        self.absolute-position.y + self.mouse-y,
+                        self.absolute-position.y);
+                    root.dragging = false;
+                } else {
+                    root.activate();
+                }
+            }
+            if (ev.button == PointerEventButton.right && ev.kind == PointerEventKind.down) {
+                root.right-clicked(
+                    self.absolute-position.x + self.mouse-x,
+                    self.absolute-position.y + self.mouse-y);
+            }
+            if (ev.button == PointerEventButton.middle && ev.kind == PointerEventKind.down) {
+                root.middle-clicked();
+            }
+        }
+        moved => {
+            if (self.pressed) {
+                if (!root.dragging
+                        && abs(self.absolute-position.y + self.mouse-y - root.ds-y) > 6px) {
+                    root.dragging = true;
+                }
+                if (root.dragging) {
+                    root.drag-move(root.row-index,
+                        self.absolute-position.x + self.mouse-x,
+                        self.absolute-position.y + self.mouse-y,
+                        self.absolute-position.y);
+                }
+            }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: root.indent;
+        padding-right: 8px;
+        spacing: 4px;
+        alignment: start;
+        // Chevron slot (16px) — shown only for a non-empty container.
+        Rectangle {
+            width: 16px;
+            height: parent.height;
+            if root.node.is-container && root.node.has-children : Image {
+                width: 12px;
+                height: 12px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                source: root.node.expanded
+                    ? @image-url("../../assets/icons/chevron-down.svg")
+                    : @image-url("../../assets/icons/chevron-right.svg");
+                colorize: Theme.foreground.with-alpha(touch.has-hover ? 0.7 : 0.45);
+            }
+        }
+        // Icon slot (16px): folder (container, accent if expanded) / bookmark (favorite).
+        Rectangle {
+            width: 16px;
+            height: parent.height;
+            Image {
+                width: 16px;
+                height: 16px;
+                x: 0;
+                y: (parent.height - self.height) / 2;
+                image-fit: contain;
+                source: root.own-icon
+                    ? root.node.icon
+                    : root.node.is-container
+                    ? @image-url("../../assets/icons/folder.svg")
+                    : root.file-favorite
+                    ? @image-url("../../assets/icons/document.svg")
+                    : @image-url("../../assets/icons/bookmark.svg");
+                colorize: root.own-icon
+                    ? Colors.transparent
+                    : root.node.is-container
+                    ? (root.node.expanded ? Theme.accent-background : Theme.foreground.with-alpha(0.7))
+                    : !root.node.available ? Tokens.danger.with-alpha(0.8)
+                    : root.node.folder-slot > 0 ? Tokens.folder-color(root.node.folder-slot)
+                    : Theme.foreground.with-alpha(0.65);
+            }
+        }
+        // Node label, renamed via a modal popup.
+        Rectangle {
+            horizontal-stretch: 1;
+            Text {
+                text: root.node.label;
+                font-size: 12px;
+                font-weight: root.node.is-container ? 600 : 400;
+                color: (root.node.is-container || root.node.available)
+                    ? (root.node.folder-slot > 0 ? Tokens.folder-color(root.node.folder-slot) : Theme.foreground)
+                    : Theme.foreground.with-alpha(0.4);
+                vertical-alignment: center;
+                overflow: elide;
+                width: parent.width;
+            }
+        }
+    }
+}
+
+// "Favorites" panel: header (title + actions) + scrollable flattened tree.
+export component FavPanel inherits Rectangle {
+    in property <[FavNode]> nodes;
+    in property <string> selected-id;
+    in property <bool> drag-active;
+    in property <int> drag-target-index;
+    in property <int> drag-zone;
+    in property <int> section-code: 2;
+    in property <bool> reorder-drag-active: false;
+    in property <int> reorder-drag-source: -1;
+    in property <bool> location-drag-active: false;
+    callback section-drag-started(int, length, length);
+    callback section-drag-moved(int, length, length);
+    callback section-drag-dropped(int, length, length);
+    // Target of a tab or file drag over a favorites folder.
+    // ABSOLUTE (window-relative) cursor position, propagated by MainWindow based on
+    // the ONGOING drag (tab OR file — mutually exclusive). Used to know
+    // which favorites folder is hovered, to drop the target there.
+    in property <bool> tab-drag-active: false;
+    in property <length> tab-drag-abs-x: 0px;
+    in property <length> tab-drag-abs-y: 0px;
+    in property <bool> file-drag-active: false;
+    in property <length> file-drag-abs-x: 0px;
+    in property <length> file-drag-abs-y: 0px;
+    // Is a drag (tab OR file) in progress? + its current position.
+    property <bool> drag-on: root.tab-drag-active || root.file-drag-active;
+    property <length> drag-ax: root.tab-drag-active ? root.tab-drag-abs-x : root.file-drag-abs-x;
+    property <length> drag-ay: root.tab-drag-active ? root.tab-drag-abs-y : root.file-drag-abs-y;
+    // Absolute cursor Y captured continuously during an INTERNAL reorder drag
+    // (a file/tab drag carries its own `drag-ay`). Feeds the edge auto-scroll so
+    // an off-screen target row can be reached without releasing the drag.
+    property <length> reorder-cursor-x;
+    property <length> reorder-cursor-y;
+    // Internal reorder feedback belongs to the visible favorites frame only.
+    // Keep the logical target alive outside it so releasing over a tab gap can
+    // still turn a favorite into a tab, without flashing a clamped reorder bar.
+    property <bool> reorder-in-x:
+        !(root.drag-active && root.shown && !root.section-collapsed) ? false
+        : (root.reorder-cursor-x >= fav-scroll.absolute-position.x
+            && root.reorder-cursor-x <= fav-scroll.absolute-position.x + fav-scroll.width);
+    property <bool> reorder-in-frame:
+        !root.reorder-in-x ? false
+        : (root.reorder-cursor-y >= fav-scroll.absolute-position.y
+            && root.reorder-cursor-y <= fav-scroll.absolute-position.y + fav-scroll.height);
+    // Exposes the exact reorder commit area so the global drag indicator uses
+    // the same target decision as the release handler.
+    out property <bool> reorder-hover-panel: root.reorder-in-frame;
+    out property <length> reorder-drag-abs-x: root.reorder-cursor-x;
+    out property <length> reorder-drag-abs-y: root.reorder-cursor-y;
+    // Index of the row hovered by the drag (uniform pitch 30 + 1px = 31px), or
+    // -1. CRITICAL (→): every `absolute-position` read is CONFINED
+    // to the "drag active" branch of the ternary → never evaluated outside a drag (the
+    // ternary only evaluates the taken branch). We read the UNSCROLLED frame of the
+    // ScrollView (`fav-scroll.absolute-position`, like the PanelComponent's
+    // `list-area`) + its `content-y` — NEVER the absolute-position of the
+    // scrolled content, which used to trigger "Recursion detected". Truncation to
+    // `int` = floor for a gap ≥ 0 (guarded by the threshold).
+    /// Is the side column on screen at all?
+    ///
+    /// GEOMETRY CANNOT ANSWER THIS, and that is the whole point of the flag.
+    /// The column is always instantiated so that the drop target stays
+    /// referenceable, and collapsing it sets its width to zero — but the grid
+    /// inside keeps the minimum width of its sections and simply OVERFLOWS the
+    /// zero-width parent, while `visible: false` hides the drawing without
+    /// touching the layout. The tree therefore keeps, off screen, exactly the
+    /// frame it would have when open, and a containment test on that frame
+    /// answers yes for a drag that can reach nothing.
+    ///
+    /// Defaulted to false on purpose: an instantiation that forgot to wire it
+    /// would make drops inoperative, which gets reported, rather than silently
+    /// reopening a target the user cannot see.
+    in property <bool> shown: false;
+    /// Is the drag cursor within the tree's X span, the column being on screen?
+    property <bool> drag-in-x:
+        !(root.drag-on && root.shown) ? false
+        : (root.drag-ax >= fav-scroll.absolute-position.x
+            && root.drag-ax <= fav-scroll.absolute-position.x + fav-scroll.width);
+    /// … and within its Y span as well, so the cursor is really over the tree.
+    property <bool> drag-in-frame:
+        !root.drag-in-x ? false
+        : (root.drag-ay >= fav-scroll.absolute-position.y
+            && root.drag-ay <= fav-scroll.absolute-position.y + fav-scroll.height);
+    property <int> hover-row:
+        !root.drag-in-frame ? -1
+        : (root.drag-ay
+                >= fav-scroll.absolute-position.y + fav-scroll.content-y + 6px)
+            ? (root.drag-ay - fav-scroll.absolute-position.y - fav-scroll.content-y - 6px) / 31px
+            : -1;
+    // Id of the hovered CONTAINER (only containers accept a drop), or "".
+    // Read by MainWindow (pull-based) on drop → drop target (robust even on a
+    // cross-instance drop whose async hover lags behind).
+    out property <string> hover-container:
+        (root.hover-row >= 0 && root.hover-row < root.nodes.length
+            && root.nodes[root.hover-row].is-container)
+        ? root.nodes[root.hover-row].id
+        : "";
+    // Is the cursor OVER the favorites area (scroll) during a
+    // drag? Used as a fallback: a drop outside a container ("no favorites" area,
+    // or dead zone when there are only root-level favorites) adds AT THE ROOT.
+    out property <bool> hover-panel: root.drag-in-frame;
+    // Id of the hovered container if it is COLLAPSED and NOT EMPTY → candidate for
+    // auto-expansion during a tab/file drag, like the internal reorder
+    // drag. "" otherwise.
+    out property <string> hover-collapsed-container:
+        (root.hover-row >= 0 && root.hover-row < root.nodes.length
+            && root.nodes[root.hover-row].is-container
+            && root.nodes[root.hover-row].has-children
+            && !root.nodes[root.hover-row].expanded)
+        ? root.nodes[root.hover-row].id
+        : "";
+    // The whole SECTION is collapsed and a drag hovers its (only visible)
+    // header → candidate for auto-expanding the section, so the target can be
+    // reached. Anchored to the HEADER element itself (always laid out, fixed
+    // 30px) rather than the component root, whose height depends on the grid's
+    // stretch/max-height juggling and proved unreliable while collapsed. Absolute
+    // read confined to a live drag (like `hover-panel`).
+    out property <bool> hover-collapsed-section:
+        root.section-collapsed && root.drag-on && root.shown
+        && root.drag-ax >= sec-header.absolute-position.x
+        && root.drag-ax <= sec-header.absolute-position.x + sec-header.width
+        && root.drag-ay >= sec-header.absolute-position.y
+        && root.drag-ay <= sec-header.absolute-position.y + sec-header.height;
+    callback row-activate(string);
+    callback row-middle(string);
+    // id, container, dir, launchable file, slot, label, x, y
+    callback row-context(string, bool, bool, bool, int, string, length, length);
+    callback row-drag-move(int, length, length, length); // row, abs-x, cur-y, row-top
+    callback row-drag-drop(int, length, length, length, bool); // final bool: in visible tree
+    callback new-container();
+    callback collapse-all();
+    callback expand-all();
+    in property <bool> can-collapse;                       // >=1 expanded container
+    // Collapse of the Favorites SECTION: hides the tree (the header stays). State
+    // carried by MainWindow (which also adjusts this panel's vertical-stretch).
+    in property <bool> section-collapsed: false;
+    callback toggle-section();
+    background: Theme.toolbar;
+    opacity: root.reorder-drag-active && root.reorder-drag-source == root.section-code ? 0.55 : 1.0;
+    VerticalLayout {
+        padding: 0px;
+        spacing: 0px;
+        sec-header := SidebarSectionHeader {
+            section-code: root.section-code;
+            label: Strings.fav-title;
+            collapsed: root.section-collapsed;
+            favorite-actions: true;
+            can-collapse: root.can-collapse;
+            new-container-tooltip: Strings.fav-new-container;
+            collapse-tooltip: root.can-collapse
+                ? Strings.fav-collapse-all
+                : Strings.fav-expand-all;
+            reorder-drag-active: root.reorder-drag-active;
+            toggled => { root.toggle-section(); }
+            new-container => { root.new-container(); }
+            collapse-all => {
+                if (root.can-collapse) { root.collapse-all(); } else { root.expand-all(); }
+            }
+            drag-started(section, x, y) => { root.section-drag-started(section, x, y); }
+            drag-moved(section, x, y) => { root.section-drag-moved(section, x, y); }
+            drag-dropped(section, x, y) => { root.section-drag-dropped(section, x, y); }
+        }
+        // List or empty state, always instantiated for the drag's hit-test. When
+        // the section is collapsed, it becomes invisible with zero height
+        // rather than using a conditional element.
+        fav-scroll := ScrollView {
+            vertical-stretch: 1;
+            visible: !root.section-collapsed;
+            // `min-height: 0` neutralizes the ScrollView's minimum height so that
+            // FavPanel can shrink down to just its header when collapsed.
+            min-height: 0px;
+            max-height: root.section-collapsed ? 0px : 100000px;
+            // The content height, stated rather than inferred. `content-rect`
+            // is a plain Rectangle pinned to the visible height, so nothing
+            // would tell the view its rows go further down: the tree simply got
+            // clipped at the bottom edge, with no scrollbar and no way to
+            // reach the last favourites. Same approach as the file list, and
+            // the same geometry the hit-test below already assumes: row 30px +
+            // 1px gap = 31, list padding 11, empty state 132.
+            content-height: max(
+                self.height,
+                root.nodes.length == 0 ? 132px : 11px + root.nodes.length * 31px);
+            // Container filled to AT LEAST the visible height → the "dead"
+            // area below the list stays clickable (left click = closes menus).
+            content-rect := Rectangle {
+                min-height: parent.visible-height;
+                // Background TouchArea (declared BEFORE the rows → behind): a
+                // left click on empty space closes menus. The New folder,
+                // Expand all, and Collapse all actions live in the header.
+                TouchArea {
+                    width: parent.width;
+                    height: parent.height;
+                    pointer-event(ev) => {
+                        if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                            Dismiss.serial += 1;
+                        }
+                    }
+                }
+            VerticalLayout {
+                padding: 6px;
+                spacing: 1px;
+                if root.nodes.length == 0 : Rectangle {
+                    height: 120px;
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 8px;
+                        Image {
+                            source: @image-url("../../assets/icons/bookmark.svg");
+                            width: 28px;
+                            height: 28px;
+                            colorize: Theme.foreground.with-alpha(0.25);
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: Strings.fav-empty;
+                            font-size: 11px;
+                            color: Theme.foreground.with-alpha(0.45);
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+                for n[i] in root.nodes : FavRow {
+                    node: n;
+                    selected: n.id == root.selected-id;
+                    row-index: i;
+                    drag-active: root.drag-active;
+                    location-drag-active: root.location-drag-active;
+                    reorder-feedback-visible: root.reorder-in-frame;
+                    drag-target-index: root.drag-target-index;
+                    drag-zone: root.drag-zone;
+                    // Highlighted if THIS container is the row targeted by a drag
+                    // (tab OR file).
+                    drop-hover: root.drag-on && i == root.hover-row && n.is-container;
+                    activate => { root.row-activate(n.id); }
+                    middle-clicked => { root.row-middle(n.id); }
+                    right-clicked(x, y) => {
+                        root.row-context(n.id, n.is-container, n.is-dir,
+                            !n.is-container && !n.is-dir && n.available,
+                            n.folder-slot, n.label, x, y);
+                    }
+                    drag-move(ri, cx, cy, rt) => {
+                        root.reorder-cursor-x = cx;
+                        root.reorder-cursor-y = cy;
+                        root.row-drag-move(ri, cx, cy, rt);
+                    }
+                    drag-drop(ri, cx, cy, rt) => {
+                        root.reorder-cursor-x = cx;
+                        root.reorder-cursor-y = cy;
+                        root.row-drag-drop(ri, cx, cy, rt, root.reorder-in-frame);
+                    }
+                }
+            }
+            }   // closes content-rect
+        }
+    }
+
+    // Edge auto-scroll while a drag hovers the tree: an internal reorder (its
+    // cursor Y flows through `reorder-cursor-y`) or a tab/file drag (`drag-ay`,
+    // gated to the tree's X span so a drag over the file view never scrolls it).
+    // The pastille (`hover-row`) is reactive to `content-y`, so it follows the
+    // scroll onto the newly revealed containers. Frame reads target the ScrollView
+    // itself (unscrolled), the same safe read as `hover-row`.
+    DragEdgeScroller {
+        // Never while collapsed: the tree has no height to scroll, and driving
+        // its `content-y` would leave it scrolled past the content (empty on
+        // re-expand). The component guards this too, belt and suspenders.
+        active: !root.section-collapsed
+            && ((root.drag-active && root.reorder-in-x) || root.drag-in-x);
+        cursor-y: root.drag-active ? root.reorder-cursor-y : root.drag-ay;
+        frame-y: fav-scroll.absolute-position.y;
+        frame-h: fav-scroll.height;
+        min-vy: fav-scroll.content-height > fav-scroll.height
+            ? -(fav-scroll.content-height - fav-scroll.height)
+            : 0px;
+        content-y <=> fav-scroll.content-y;
+    }
+}
