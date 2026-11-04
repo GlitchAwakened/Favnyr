@@ -38,6 +38,8 @@ Favnyr runs with ordinary user permissions. It installs no service and no backgr
 
 **Views.** Split the window horizontally or vertically, up to 32 views. Each keeps its own tabs, history, sorting and columns.
 
+**Tab groups.** Organize tabs with a name and an optional color. Tab groups can be expanded or collapsed.
+
 **Workspaces.** A workspace is a saved set of views and tabs. Keep one per project and restore the whole arrangement in one click, or assign it a number to load it with a keyboard shortcut. Settings provide separate save policies for the Workspaces panel and numbered shortcuts (CTRL+1, CTRl+2...). A workspace can have its own theme, independently of the global theme.
 
 **Favorites.** Shared across every workspace, so your usual places do not depend on which layout is open.
@@ -58,11 +60,16 @@ So if 7-Zip is installed (7zz, 7z or 7za), Favnyr compresses and extracts withou
 
 **List and grid.** The display menu selects the arrangement and whether to show icons or thumbnails. Each tab remembers its layout and grid size; Ctrl+wheel adjusts the size. The grid keeps selection, file drops, folder annotations and manual ordering. In manual order, drop before or after a tile to reposition the selection, including across rows. Drop in the centre of a folder to target that folder. Settings provide defaults for new tabs, text size and spacing on both grid axes.
 
-**Filtering.** Start typing to narrow a folder by name, or open the extension filter for something stricter.
+**Search.** Start typing to narrow a folder by name, or press Ctrl+F for the search bar, which can extend the search to subfolders.
 
 **Recursive folder size and date.** Off by default. Turn either on and choose a depth from 1 to 16: Favnyr then shows the real size and latest modification date of a folder's contents, computed in the background. Both metrics share a single directory walk, so enabling the two costs one pass, not two.
 
 **Files and folders.** Copy, move, link, rename, create, trash and delete, with progress reported. Several operations can run at once. Multi-selection, drag and drop between views and to other applications, and reopening closed tabs. Folders can be given a color, any item (file/folder) a short note, and both follow it when it is renamed or moved within Favnyr.
+
+**Batch rename.** Select several files or folders, then choose **Batch rename…**
+from the context menu, or use the Rename shortcut (F2 by default). Preview a
+common name, text replacement, prefixes and suffixes, numbering, letter case,
+or an optional extension change.
 
 **Properties.** A built-in panel for when no desktop file manager offers one: type, location, sizes and dates, Unix permissions and ownership, and MD5, SHA-1, SHA-256 and SHA-512 checksums computed on request. Every value is selectable.
 
@@ -97,16 +104,26 @@ Videos (`.mp4`, `.mkv`, `.mov`, `.avi`, `.webm`, `.wmv`, `.flv`, `.m4v`, `.mpg`,
 
 A few things that are easy to miss.
 
-- **Type to filter.** Any printable character typed in a view filters its
-  entries by name as you go.
+- **Search a view.**
+  - **Option 1:** press **Ctrl+F** *(the default)* to open the search bar. Tick
+    <kbd>Search subfolders</kbd> in it to include child folders.
+  - **Option 2:** type directly in the active view to search as you go. Careful with
+    **Japanese** and **Chinese**, the first character comes out wrong this
+    way, so prefer Option 1.
 - **Ctrl+wheel resizes the entries**, and past a size threshold they switch to
   thumbnails.
 - **Shift+wheel scrolls a view horizontally** when its columns overflow.
-- **Tab / Shift+Tab select the next / previous view**, wrapping at either end.
+- **Tab / Shift+Tab select the next / previous view in visual reading order**.
   Both shortcuts can be changed in Settings.
 - **The wheel over a tab bar switches tabs**, forwards and back, wrapping around
-  at the ends. It works the same on a vertical tab bar, and a horizontal
-  trackpad swipe counts too.
+  at the ends.
+- **Hide the tab bar** from its position menu, or choose **Hidden** in the
+  default tab bar setting for new views. **Ctrl+Shift+B** toggles the active
+  view's bar. The workspace remembers this
+  choice. **Ctrl+Tab / Ctrl+Shift+Tab** still navigate hidden tabs.
+- **Ctrl+click selects tabs or whole groups; Shift+click selects a range.**
+  A selected group includes every child, including hidden tabs.
+- **Create a tab group :** Right-click a selected tab and choose **Group tabs**.
 - **The wheel still scrolls during a drag.** It scrolls whichever view sits
   under the cursor, so a folder further down the list can be reached without
   releasing the drag.

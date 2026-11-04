@@ -1,6 +1,7 @@
 //! Shared bounded image decoding and RGBA thumbnail resizing.
 
 use super::Thumbnail;
+use image::metadata::Orientation;
 
 /// Most pixels an image may declare before its thumbnail is refused.
 ///
@@ -32,24 +33,45 @@ fn decode_limits() -> image::Limits {
 ///
 /// The dimensions come from the header, so an oversized image is turned away
 /// before a single pixel is allocated for it.
-pub(super) fn decode_bounded<R: std::io::BufRead + std::io::Seek>(
+pub(super) fn from_reader<R: std::io::BufRead + std::io::Seek>(
     reader: image::ImageReader<R>,
-) -> Option<image::DynamicImage> {
-    decode_bounded_pixels(reader, MAX_DECODE_PIXELS)
+    max_px: u32,
+) -> Option<Thumbnail> {
+    from_reader_bounded(reader, max_px, MAX_DECODE_PIXELS)
 }
 
-fn decode_bounded_pixels<R: std::io::BufRead + std::io::Seek>(
+fn from_reader_bounded<R: std::io::BufRead + std::io::Seek>(
     mut reader: image::ImageReader<R>,
+    max_px: u32,
     max_pixels: u64,
-) -> Option<image::DynamicImage> {
+) -> Option<Thumbnail> {
     use image::ImageDecoder;
     reader.limits(decode_limits());
-    let decoder = reader.into_decoder().ok()?;
+    let mut decoder = reader.into_decoder().ok()?;
     let (width, height) = decoder.dimensions();
     if u64::from(width) * u64::from(height) > max_pixels {
         return None;
     }
-    image::DynamicImage::from_decoder(decoder).ok()
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    Some(downscale_oriented(
+        image::DynamicImage::from_decoder(decoder).ok()?,
+        max_px,
+        orientation,
+    ))
+}
+
+/// Display dimensions include mirrored quarter-turn orientations as well.
+pub(super) fn oriented_dimensions(
+    (width, height): (u32, u32),
+    orientation: Orientation,
+) -> (u32, u32) {
+    match orientation {
+        Orientation::Rotate90
+        | Orientation::Rotate270
+        | Orientation::Rotate90FlipH
+        | Orientation::Rotate270FlipH => (height, width),
+        _ => (width, height),
+    }
 }
 
 /// Decodes ENCODED image bytes (PNG/BMP/JPEG…) into a thumbnail bounded to
@@ -67,17 +89,26 @@ pub(super) fn from_encoded_bounded(
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
-    Some(downscale(
-        decode_bounded_pixels(reader, max_pixels)?,
-        max_px,
-    ))
+    from_reader_bounded(reader, max_px, max_pixels)
 }
 
 /// Shrinks `img` to fit within `max_px × max_px` (aspect preserved) and produces
 /// RGBA8. `DynamicImage::thumbnail` is fast (suited to generating many
 /// thumbnails).
 pub(super) fn downscale(img: image::DynamicImage, max_px: u32) -> Thumbnail {
-    let small = img.thumbnail(max_px, max_px).to_rgba8();
+    downscale_oriented(img, max_px, Orientation::NoTransforms)
+}
+
+fn downscale_oriented(
+    img: image::DynamicImage,
+    max_px: u32,
+    orientation: Orientation,
+) -> Thumbnail {
+    // A square bound is invariant under rotation. Transform the reduced image
+    // to avoid allocating a second full-resolution camera image for quarter turns.
+    let mut small = img.thumbnail(max_px, max_px);
+    small.apply_orientation(orientation);
+    let small = small.to_rgba8();
     Thumbnail {
         width: small.width(),
         height: small.height(),

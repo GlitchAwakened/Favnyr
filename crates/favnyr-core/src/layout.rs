@@ -112,6 +112,51 @@ pub struct Layout {
     pub splitters: Vec<SplitterGeom>,
 }
 
+impl Layout {
+    /// The adjacent view in top-to-bottom, left-to-right reading order.
+    /// Both directions wrap over the same order, independently of leaf indices.
+    /// Empty and single-view layouts, or an absent current view, have no target.
+    pub fn adjacent_view(&self, current: usize, previous: bool) -> Option<usize> {
+        if self.views.len() < 2 {
+            return None;
+        }
+        let mut ordered: Vec<_> = self.views.iter().collect();
+        ordered.sort_by(|a, b| {
+            a.rect
+                .y
+                .total_cmp(&b.rect.y)
+                .then_with(|| a.rect.x.total_cmp(&b.rect.x))
+                .then_with(|| a.view.cmp(&b.view))
+        });
+        let top = ordered[0].rect.y;
+        let bottom = ordered
+            .iter()
+            .fold(top, |bottom, view| bottom.max(view.rect.y + view.rect.h));
+        let tolerance = (bottom - top) * RATIO_EPSILON;
+        let mut start = 0;
+        while start < ordered.len() {
+            let row_top = ordered[start].rect.y;
+            let mut end = start + 1;
+            // Anchor every row to its first top edge. Pairwise approximate
+            // comparisons are not transitive and cannot define a sort order.
+            while end < ordered.len() && ordered[end].rect.y - row_top <= tolerance {
+                end += 1;
+            }
+            ordered[start..end].sort_by(|a, b| {
+                a.rect
+                    .x
+                    .total_cmp(&b.rect.x)
+                    .then_with(|| a.rect.y.total_cmp(&b.rect.y))
+                    .then_with(|| a.view.cmp(&b.view))
+            });
+            start = end;
+        }
+        let position = ordered.iter().position(|view| view.view == current)?;
+        let step = if previous { ordered.len() - 1 } else { 1 };
+        Some(ordered[(position + step) % ordered.len()].view)
+    }
+}
+
 impl LayoutNode {
     /// Builds a default tree from a flat list of panels and their
     /// `stretch`: a left-leaning **chain of `Row` splits**, with all panels
@@ -696,6 +741,142 @@ mod tests {
             .find(|s| s.path == path)
             .expect("separator at that path")
             .area
+    }
+
+    fn staggered_views() -> LayoutNode {
+        split(
+            SplitDir::Column,
+            0.5,
+            split(
+                SplitDir::Row,
+                0.5,
+                split(SplitDir::Column, 0.5, leaf(4), leaf(1)),
+                leaf(3),
+            ),
+            split(SplitDir::Row, 0.5, leaf(0), leaf(2)),
+        )
+    }
+
+    #[test]
+    fn view_navigation_reads_top_edges_independently_of_tree_structure() {
+        let by_rows = staggered_views();
+        let by_columns = split(
+            SplitDir::Row,
+            0.5,
+            split(
+                SplitDir::Column,
+                0.5,
+                split(SplitDir::Column, 0.5, leaf(4), leaf(1)),
+                leaf(0),
+            ),
+            split(SplitDir::Column, 0.5, leaf(3), leaf(2)),
+        );
+        assert_ne!(by_rows.leaf_indices(), by_columns.leaf_indices());
+        for tree in [by_rows, by_columns] {
+            let mut geometry = tree.compute(area(), 0.0);
+            let before = geometry.clone();
+            assert_view_cycle(&geometry, &[4, 3, 1, 0, 2]);
+            assert_eq!(geometry, before);
+            geometry.views.reverse();
+            assert_view_cycle(&geometry, &[4, 3, 1, 0, 2]);
+        }
+    }
+
+    fn assert_view_cycle(layout: &Layout, expected: &[usize]) {
+        for (position, &current) in expected.iter().enumerate() {
+            assert_eq!(
+                layout.adjacent_view(current, false),
+                Some(expected[(position + 1) % expected.len()])
+            );
+            assert_eq!(
+                layout.adjacent_view(current, true),
+                Some(expected[(position + expected.len() - 1) % expected.len()])
+            );
+        }
+    }
+
+    #[test]
+    fn view_navigation_handles_rows_columns_and_unavailable_targets() {
+        let horizontal = LayoutNode::row_chain(&[1.0, 2.0, 1.0]);
+        assert_view_cycle(&horizontal.compute(area(), 8.0), &[0, 1, 2]);
+        let vertical = split(
+            SplitDir::Column,
+            0.3,
+            leaf(2),
+            split(SplitDir::Column, 0.5, leaf(0), leaf(1)),
+        );
+        assert_view_cycle(&vertical.compute(area(), 8.0), &[2, 0, 1]);
+        let grid = split(
+            SplitDir::Column,
+            0.5,
+            split(SplitDir::Row, 0.5, leaf(3), leaf(1)),
+            split(SplitDir::Row, 0.5, leaf(2), leaf(0)),
+        );
+        assert_view_cycle(&grid.compute(area(), 8.0), &[3, 1, 2, 0]);
+        for previous in [false, true] {
+            assert_eq!(Layout::default().adjacent_view(0, previous), None);
+            assert_eq!(
+                leaf(0).compute(area(), 0.0).adjacent_view(0, previous),
+                None
+            );
+            assert_eq!(
+                horizontal.compute(area(), 0.0).adjacent_view(9, previous),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn view_navigation_groups_rounding_without_chaining_nearby_rows() {
+        let geometry = Layout {
+            views: [
+                (0, 0.5, 0.2),
+                (1, 0.0, 0.20007),
+                (2, 0.25, 0.20014),
+                (3, 0.0, 0.8),
+            ]
+            .into_iter()
+            .map(|(view, x, y)| ViewGeom {
+                view,
+                rect: Rect {
+                    x,
+                    y,
+                    w: 0.2,
+                    h: 0.2,
+                },
+            })
+            .collect(),
+            splitters: Vec::new(),
+        };
+        assert_view_cycle(&geometry, &[1, 0, 2, 3]);
+        let mut transformed = geometry.clone();
+        for view in &mut transformed.views {
+            view.rect.x = 300.0 + view.rect.x * 1000.0;
+            view.rect.y = 500.0 + view.rect.y * 600.0;
+            view.rect.w *= 1000.0;
+            view.rect.h *= 600.0;
+        }
+        assert_view_cycle(&transformed, &[1, 0, 2, 3]);
+    }
+
+    #[test]
+    fn view_navigation_follows_swaps_moves_splits_closures_and_resizes() {
+        let original = staggered_views();
+        let mut tree = original.clone();
+        assert!(tree.swap_views(4, 2));
+        assert_view_cycle(&tree.compute(area(), 0.0), &[2, 3, 1, 0, 4]);
+        let mut tree = original.clone();
+        assert!(tree.move_view_beside(1, 3, SplitDir::Column, true));
+        assert_view_cycle(&tree.compute(area(), 0.0), &[4, 1, 3, 0, 2]);
+        let mut tree = original.clone();
+        assert!(tree.split_leaf(4, SplitDir::Row, 5, 0.5, true));
+        assert_view_cycle(&tree.compute(area(), 0.0), &[5, 4, 3, 1, 0, 2]);
+        let mut tree = original.clone();
+        assert!(tree.remove_view(3));
+        assert_view_cycle(&tree.compute(area(), 0.0), &[3, 1, 0, 2]);
+        let mut tree = original;
+        assert!(tree.set_ratio(&[], 0.6, 0.08));
+        assert_view_cycle(&tree.compute(area(), 0.0), &[4, 3, 1, 0, 2]);
     }
 
     #[test]

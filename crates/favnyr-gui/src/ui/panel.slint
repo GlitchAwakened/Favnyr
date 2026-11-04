@@ -1,12 +1,12 @@
 // A complete view panel and the splitter that separates two panels.
 
-import { FileDropArea, ItemGrid, ItemNameTip, ItemRect, PanelView } from "types.slint";
+import { FileDropArea, ItemGrid, ItemNameTip, ItemRect, PanelView, TabBarState, TabDropGap } from "types.slint";
 import { Strings } from "strings.slint";
 import { Dismiss, Note, TextMetrics, Tip, WindowFocus } from "globals.slint";
 import { Theme, Tokens } from "theme.slint";
 import { DragEdgeScroller, EditTextInput, NavIconButton } from "controls.slint";
-import { ColumnHeader, FileItemView, FilterBar } from "file_list.slint";
-import { TabItem, TabScrollButton, VTabBar } from "tabs.slint";
+import { ColumnHeader, FileItemView, FilterBar, ViewStatusMessage } from "file_list.slint";
+import { TabBarEntry, TabScrollButton, VTabBar } from "tabs.slint";
 
 // Vertical splitter component between two side-by-side panels. Horizontal drag
 // → emits the cumulative delta since the start of the drag. The bridge converts it
@@ -17,6 +17,7 @@ import { TabItem, TabScrollButton, VTabBar } from "tabs.slint";
 // since it's an absolute, not incremental, computation).
 export component PanelSplitterAbs inherits Rectangle {
     in property <bool> vertical;
+    callback press-started();
     callback dragged(/* abs_x */ length, /* abs_y */ length);
     /// Double-click: even out the views this separator governs.
     callback equalize();
@@ -58,6 +59,7 @@ export component PanelSplitterAbs inherits Rectangle {
             // Grabbing a splitter closes the context menu.
             if (ev.kind == PointerEventKind.down) {
                 Dismiss.serial += 1;
+                if (ev.button == PointerEventButton.left) { root.press-started(); }
                 root.press-x = self.absolute-position.x + self.mouse-x;
                 root.press-y = self.absolute-position.y + self.mouse-y;
                 root.resized = false;
@@ -93,6 +95,21 @@ export component PanelComponent inherits Rectangle {
     max-width: 99999px;
 
     in property <PanelView> view;
+    in property <TabBarState> tab-state;
+    property <bool> group-page: root.tab-state.group-page;
+    property <int> focus-tab-index: root.group-page ? root.tab-state.group-index : root.tab-state.active;
+    changed group-page => {
+        root.cancel-address-edit();
+        root.rb-active = false;
+        root.mid-scroll-active = false;
+        root.hovered-idx = -1;
+        sel-touch.cancel-rename-candidate();
+        root.report-rows-viewport();
+    }
+    callback group-toggle(string);
+    callback group-clicked(string, int);
+    callback group-context(string, length, length);
+    pure callback tab-gap(length) -> TabDropGap;
     // Footer text ("N selected / M items") DECOUPLED from
     // `view`: the selection count changes on every rubber-band step;
     // if it lived in `PanelView`, updating it would rewrite the whole struct
@@ -132,6 +149,15 @@ export component PanelComponent inherits Rectangle {
     // type-ahead filter — current text (shown if view is active) + reset.
     in property <string> filter-text: "";
     in property <bool> filter-take-keyboard: false;
+    /// Keeps the bar on an empty filter, for the active view only, so its
+    /// field can hold the keyboard before anything is typed.
+    in property <bool> filter-forced: false;
+    /// A filter hides part of the listing, so a manual-order drag could only
+    /// permute what is on screen while the rest of the stored order stays put.
+    /// The gesture is withdrawn for as long as one is on, rather than acting on
+    /// a subset the user cannot see.
+    property <bool> filter-on: (root.active && root.filter-text != "")
+        || root.view.ext-filter-on;
     /// A filter field has taken the keyboard.
     callback filter-focused();
     /// The whole filter, as the bar now holds it.
@@ -209,9 +235,10 @@ export component PanelComponent inherits Rectangle {
     /// Shared by both entry points: creates the field and fills it. What
     /// happens to the caret afterwards is the caller's choice.
     function open-address-editor() {
-        root.activate();
-        root.close-ctx-menu();
-        root.url-edit-text = root.view.current-path;
+        if (root.group-page) { root.click-off-tabs(); return; }
+        let path: string = root.view.current-path;
+        root.click-off-tabs();
+        root.url-edit-text = path;
         root.path-edit-mode = true;
     }
     /// Opens the path with the whole of it selected, so the next keystroke
@@ -418,7 +445,8 @@ export component PanelComponent inherits Rectangle {
         && (root.view.rows[root.drag-hover-row].is-dir
             || root.view.rows[root.drag-hover-row].drop-runnable);
     property <int> manual-drop-gap-candidate:
-        !root.view.manual-order || !root.file-drag-internal || !root.file-drag-over
+        !root.view.manual-order || root.filter-on
+            || !root.file-drag-internal || !root.file-drag-over
             || root.drag-y-in-body < 0px
             || root.fd-x-in-list < Tokens.gutter
             || root.fd-x-in-list > root.content-right
@@ -462,8 +490,16 @@ export component PanelComponent inherits Rectangle {
         return min(nx, 1 - nx) < min(ny, 1 - ny)
             ? (nx < 0.5 ? 2 : 3) : (ny < 0.5 ? 4 : 5);
     }
-    out property <int> drag-zone: !root.drag-over ? 0
-        : root.panel-drop-zone(root.dl-x, root.dl-y);
+    in property <bool> tab-drop-center-only;
+    in property <int> tab-drop-query;
+    callback tab-drop-resolved(int, int, int, string);
+    changed tab-drop-query => {
+        if (root.tab-drop-query > 0 && root.drag-active && root.drag-over && !root.overlay-open) {
+            root.tab-drop-resolved(root.tab-drop-query, root.drag-zone, root.current-gap.index, root.current-gap.group-id);
+        }
+    }
+    property <int> raw-drag-zone: !root.drag-over ? 0 : root.tab-drop-center-only ? 1 : root.panel-drop-zone(root.dl-x, root.dl-y);
+    out property <int> drag-zone: root.raw-drag-zone > 1 && !root.drag-panel-split-edges ? 0 : root.raw-drag-zone;
     // A center view drop already uses the paired swap outline.
     property <int> drop-preview-zone: root.view-drag-over
         ? (root.view-drag-zone > 1 ? root.view-drag-zone : 0)
@@ -479,7 +515,7 @@ export component PanelComponent inherits Rectangle {
     property <length> tabs-row-x: root.absolute-position.x + 13px;
 
     // Vertical tab bar -----
-    // THIS panel's bar position: 0 top · 1 left · 2 right.
+    // This panel's bar position: 0 top, 1 left, 2 right, 3 hidden.
     property <int> tab-mode: root.view.tab-bar-mode;
     // USER width of the bar (0 = automatic). Initialized from the model,
     // mutated locally by the grip (LIVE resize), reported to the bridge at the
@@ -505,7 +541,7 @@ export component PanelComponent inherits Rectangle {
     // gate: gap claiming, insertion preview, split drop's "center"
     // zone — regardless of mode (top band OR side column).
     function in-tab-bar(px: length, py: length) -> bool {
-        return root.tab-mode == 0 ? py < root.body-top
+        return root.tab-mode == 3 ? false : root.tab-mode == 0 ? py < root.body-top
             : (root.tab-mode == 1 ? px <= 7px + root.vbar-w + 4px
                 : px >= root.width - 7px - root.vbar-w - 4px);
     }
@@ -535,6 +571,8 @@ export component PanelComponent inherits Rectangle {
     // reveals "tab by tab" rather than an arbitrary jump. `idx<0` = no chevron
     // in the `forward` direction; `idx>=0` = reveal tab `idx`.
     callback scroll-target(int, bool, length, length) -> length;
+    // A collapsed group contributes its header as one wheel destination.
+    callback tab-step(bool) -> int;
     function tabs-scroll-left() {
         tabs-flick.content-x =
             root.scroll-target(-1, false, tabs-flick.content-x, root.tabs-view-w);
@@ -561,7 +599,7 @@ export component PanelComponent inherits Rectangle {
                         root.pending-reveal-idx, true, tabs-flick.content-x, root.tabs-view-w);
                 } else if (root.tab-mode == 1) {
                     vbar-left.reveal(root.pending-reveal-idx);
-                } else {
+                } else if (root.tab-mode == 2) {
                     vbar-right.reveal(root.pending-reveal-idx);
                 }
                 root.pending-reveal-idx = -1;
@@ -572,20 +610,24 @@ export component PanelComponent inherits Rectangle {
     // wheel, Ctrl+Tab, creation, closing, cross-instance receipt, or
     // orientation change. Only the index and mode values are
     // observed, to react only to an actual change.
-    property <int> active-tab-watch: root.view.active-tab-idx;
+    property <int> active-tab-watch: root.focus-tab-index;
     changed active-tab-watch => {
-        root.pending-reveal-idx = root.view.active-tab-idx;
+        root.pending-reveal-idx = root.focus-tab-index;
         reveal-timer.running = true;
     }
     property <int> tab-mode-watch: root.view.tab-bar-mode;
+    property <int> tab-shape-watch: root.tab-state.revision;
+    changed tab-shape-watch => {
+        root.pending-reveal-idx = root.focus-tab-index;
+        reveal-timer.running = true;
+    }
     changed tab-mode-watch => {
-        root.pending-reveal-idx = root.view.active-tab-idx;
+        root.pending-reveal-idx = root.focus-tab-index;
         reveal-timer.running = true;
     }
     // Tab bar auto-scroll during a REORDER DRAG when
     // the cursor nears an edge (bar overflowing) → allows dropping
-    // behind a tab that stayed off-screen. `reorder-cur` follows `content-x`
-    // → the drop gap recomputes itself as scrolling progresses.
+    // behind an off-screen tab. The shared gap follows the content offset.
     property <length> strip-cursor-x: root.drag-abs-x - root.tabs-row-x;
     Timer {
         interval: 16ms;
@@ -601,36 +643,113 @@ export component PanelComponent inherits Rectangle {
             }
         }
     }
+    // Apply the click before retrying an already active unavailable view: the
+    // retry republishes the panel and can replace the gesture's source item.
+    function tab-pointer-click(index: int, modifiers: int) {
+        root.tab-navigation-request(index, modifiers, false);
+    }
+
+    function tab-navigation-request(index: int, modifiers: int, from-wheel: bool) {
+        root.request-focus();
+        let retry-current: bool = root.active && modifiers == 0
+            && index == root.tab-state.active && root.view.unavailable;
+        if (!root.active && modifiers == 0) { root.reset-tab-selection(); }
+        if (!root.active) { root.activate(); }
+        if (from-wheel) { root.tab-wheel-selected(index); }
+        else { root.tab-clicked(index, modifiers); }
+        if (retry-current) { root.activate(); }
+    }
+
+    function tab-context-request(index: int, x: length, y: length) {
+        root.request-focus();
+        if (!root.active) { root.activate(); }
+        root.tab-context(index, x, y);
+    }
+
+    function group-toggle-request(id: string) {
+        root.reset-tab-selection();
+        if (!root.active) { root.activate(); }
+        // Folding a group picks the group, not a batch of tabs, so it releases
+        // a multi-tab selection like any other click that is not on a tab.
+        root.group-toggle(id);
+    }
+
+    function group-pointer-selection(id: string, modifiers: int) {
+        root.request-focus();
+        if (!root.active) { root.activate(); }
+        root.group-clicked(id, modifiers);
+    }
+
+    function group-context-request(id: string, x: length, y: length) {
+        if (!root.active) { root.activate(); }
+        root.group-context(id, x, y);
+    }
+
+    function tab-new-request() {
+        root.request-focus();
+        root.reset-tab-selection();
+        root.close-ctx-menu();
+        if (!root.active) { root.activate(); }
+        root.tab-new();
+    }
+
+    function tab-close-request(index: int) {
+        root.request-focus();
+        root.reset-tab-selection();
+        if (!root.active) { root.activate(); }
+        root.tab-closed(index);
+    }
+
+    // A left click that lands on a panel control instead of a tab: an empty
+    // stretch of the tab bar, a toolbar button, a filter, a row, or a column
+    // header. It takes the panel, closes any context menu, and
+    // releases a multi-tab selection, since it picks something other than that
+    // selection, exactly as a click on a single tab releases it. Modifiers are
+    // not tested: in the listing they build the file selection, which is a
+    // different selection from the one being released here.
+    function click-off-tabs() {
+        root.request-focus();
+        root.leave-tab-selection();
+    }
+    // Everything above except the keyboard, for something that has just taken
+    // it legitimately. A filter field needs to keep it to show its caret and
+    // to receive what is typed next, so handing the keyboard back to the list
+    // from its own focus callback would undo the focus it was just given.
+    function leave-tab-selection() {
+        // The reset names this panel, so it can precede a recovery or a view
+        // switch without targeting whichever panel happened to be active.
+        root.reset-tab-selection();
+        root.activate();
+        root.close-ctx-menu();
+    }
+
     // Wheel over the tab bar = next/previous tab (circular wrap)
     // THEN scroll-into-view (deferred) of the new tab.
+    // The bridge treats a collapsed group as one destination and activation
+    // preserves its folded state, displaying a group page without a child.
     function tab-wheel(fwd: bool) {
-        if (root.view.tabs.length == 0) { return; }
-        let ni: int = fwd
-            ? (root.view.active-tab-idx >= root.view.tabs.length - 1 ? 0 : root.view.active-tab-idx + 1)
-            : (root.view.active-tab-idx <= 0 ? root.view.tabs.length - 1 : root.view.active-tab-idx - 1);
-        root.activate();
-        root.tab-clicked(ni);
+        if (root.tab-state.count == 0) { return; }
+        let ni: int = root.tab-step(fwd);
+        root.tab-navigation-request(ni, 0, true);
         root.pending-reveal-idx = ni;
         reveal-timer.running = true;
     }
-    /// Tab reordering: gaps are claimed BY the TabItems
-    /// from 100% PLAIN geometries (width/offset provided by the bridge
-    /// in the `TabInfo` model) — no layout observation, no cycle. The
-    /// claimed gap is stored here (local preview) AND reported to MainWindow
-    /// (`tab-gap-claimed`) for cross-view drop (TARGET panel's gap).
-    property <int> tab-drop-idx: -1;
-    property <length> tab-drop-x;
-    /// Emitted (synchronously) on every gap claim — MainWindow stores
-    /// (gap, panel) for cross-view drop.
-    callback tab-gap-claimed(int);
+    // Resolve one cursor position per bar, using the same projection as Rust drops.
+    property <TabDropGap> current-gap: root.drag-active && root.drag-over && root.drag-in-bar
+        ? root.tab-gap(root.tab-mode == 0
+            ? root.drag-abs-x - root.tabs-row-x - tabs-flick.content-x
+            : root.drag-abs-y - root.vtabs-col-y
+                - (root.tab-mode == 1 ? vbar-left.vp-y : vbar-right.vp-y))
+        : { index: -1, position: 0px };
+    property <int> tab-drop-idx: root.current-gap.index;
+    property <length> tab-drop-x: root.current-gap.position;
+    callback tab-gap-claimed(int, string, string);
     callback tab-gap-cleared();
-    function report-tab-drop(i: int, x: length) {
-        root.tab-drop-idx = i;
-        root.tab-drop-x = x;
-        root.tab-gap-claimed(i);
+    changed current-gap => {
+        if (root.current-gap.index >= 0) {
+            root.tab-gap-claimed(root.current-gap.index, root.current-gap.group-id, root.current-gap.group-name);
+        }
     }
-    // New drag → starts over from an undefined gap (avoids a leftover from the previous drag).
-    changed drag-active => { if (root.drag-active) { root.tab-drop-idx = -1; } }
     /// Drop preview line index. `-1` = no drag, or cursor outside
     /// **THIS panel's bar** (gate `drag-in-bar`: top band OR side
     /// column depending on mode — prevents neighboring views from displaying it).
@@ -661,21 +780,23 @@ export component PanelComponent inherits Rectangle {
     callback right-clicked(int, length, length);
     callback select-all();
     callback deselect-all();
+    // Drops a multi-tab selection. A click that lands on nothing picks no tab,
+    // so it releases the selection exactly as clicking a single tab does.
+    callback reset-tab-selection();
     callback rubber-band-begin(int /*mode: 0 replace, 1 add, 2 subtract*/);
     callback rubber-band-update(length, length, length, length);
     callback tab-new();
-    callback tab-clicked(int);
+    callback tab-clicked(int, int);
+    callback tab-wheel-selected(int);
     callback tab-closed(int);
     callback tab-context(int, length, length);   // tab right-click
     callback tab-bar-context(length, length);    // right-click on the bar's dead zone
-    /// Tab drag completed: (src_idx, target_intra_idx, abs_x, abs_y).
-    /// `target_intra_idx` is computed locally in Slint (insertion position
-    /// BEFORE removal), or `-1` if the mouse left the tab zone
-    /// (the bridge will then try a cross-view target via `abs_x`).
+    /// Local release: source entry, preview gap and absolute pointer position.
+    /// The window captures the claimed destination before ending the gesture.
     callback tab-drag-completed(int, int, length, length);
-    /// Drag progress: (src_idx, abs_x, abs_y). Used by the bridge for
-    /// possible global decisions (no preview here — handled in Slint).
-    callback tab-drag-progress(int, length, length);
+    /// Drag progress: logical source tab, optional group, absolute x and y.
+    callback tab-drag-progress(int, string, length, length);
+    in property <int> tab-drag-count: 1;
     callback request-focus();
     /// Emitted when the user submits a path typed in the URL bar.
     callback navigate-to(string);
@@ -768,31 +889,67 @@ export component PanelComponent inherits Rectangle {
         }
         let show-name = root.view.grid-mode && root.grid-name-tooltip-enabled;
         let show-path = root.view.search-recursive && root.search-path-tooltip-enabled;
-        if (!show-name && !show-path) {
+        let item = root.view.rows[root.hovered-idx];
+        if (!show-name && !show-path && !item.content-remote) {
             return { text: "", x: 0px, y: 0px };
         }
         let cell = root.item-rect(root.hovered-idx);
+        let x = sel-touch.mouse-x - cell.left;
+        let y = sel-touch.mouse-y - rows-scroll.content-y - cell.top;
+        if (item.content-remote) {
+            let content-height = root.view.grid-mode ? cell.height
+                : max(1px, cell.height - root.view-item-spacing * 1px);
+            let enlarged = root.view.grid-mode
+                || Tokens.row-enlarged(root.view.preview-mode, content-height);
+            let icon-size = root.view.grid-mode ? max(1px, cell.width - 16px)
+                : Tokens.row-icon-size(root.view.preview-mode, content-height);
+            let icon-slot = Tokens.row-icon-slot(root.view.preview-mode,
+                content-height, root.col-name-width);
+            let emblem-size = enlarged ? clamp(icon-size * 0.22, 12px, 20px)
+                : clamp(icon-size * 0.45, 9px, 22px);
+            let emblem-dx = enlarged ? 0px : (icon-slot - icon-size) / 2;
+            let emblem-dy = enlarged ? 0px
+                : max(0px, (content-height - icon-size) / 2 - 3px);
+            let visual-width = root.view.grid-mode ? max(1px, cell.width - 8px)
+                : icon-slot;
+            let badge = Tokens.cloud-emblem-rect(visual-width,
+                root.view.grid-mode ? visual-width : content-height,
+                icon-size, emblem-size, emblem-dx, emblem-dy,
+                root.view.preview-mode && item.thumbnail.width > 0);
+            let badge-left = (root.view.grid-mode ? 4px : Tokens.gutter-content)
+                + badge.left;
+            let badge-top = (root.view.grid-mode ? 4px
+                : root.view-item-spacing * 0.5px) + badge.top;
+            if (x >= badge-left && x < badge-left + badge.width
+                    && y >= badge-top && y < badge-top + badge.height) {
+                return { text: Strings.cloud-content-remote-tip,
+                    x: rows-scroll.absolute-position.x + cell.left + badge-left,
+                    y: rows-scroll.absolute-position.y + rows-scroll.content-y
+                        + cell.top + badge-top + badge.height + 4px };
+            }
+        }
+        if (!show-name && !show-path) {
+            return { text: "", x: 0px, y: 0px };
+        }
         let name-start = Tokens.gutter-content + Tokens.row-icon-slot(root.view.preview-mode,
             max(1px, cell.height - root.view-item-spacing * 1px), root.col-name-width) + 8px;
         let caption = root.view.grid-mode ? Tokens.grid-caption-rect(cell.width, cell.height)
             : { left: name-start, top: 0px,
                 width: max(0px, Tokens.gutter-content + root.col-name-width - name-start),
                 height: max(1px, cell.height - root.view-item-spacing * 1px) };
-        let x = sel-touch.mouse-x - cell.left;
-        let y = sel-touch.mouse-y - rows-scroll.content-y - cell.top;
         if (x < caption.left || x >= caption.left + caption.width
                 || y < caption.top || y >= caption.top + caption.height) {
             return { text: "", x: 0px, y: 0px };
         }
-        let item = root.view.rows[root.hovered-idx];
         // One line per reason to be here. The path says where a result lives,
         // which the row does not show; the name is added only where its own
         // setting asks for it, a grid caption being the one place that elides
         // it. Repeating a name the pointer is already resting on taught the
         // reader nothing.
-        return { text: show-path
+        let detail = show-path
                 ? (show-name ? item.name + "\n" + item.path : item.path)
-                : item.name,
+                : (show-name ? item.name : "");
+        return { text: detail,
             x: rows-scroll.absolute-position.x + cell.left + caption.left,
             y: rows-scroll.absolute-position.y + rows-scroll.content-y
                 + cell.top + caption.top + caption.height + 4px };
@@ -846,7 +1003,7 @@ export component PanelComponent inherits Rectangle {
     callback keyboard-context-row() -> int;
     property <int> menu-key-watch: root.menu-key-serial;
     changed menu-key-watch => {
-        if (root.active) {
+        if (root.active && !root.group-page) {
             // Top-left of the entries area: where a menu opens when nothing is
             // targeted, and the fallback when the target cannot be pointed at.
             let fx: length = rows-scroll.absolute-position.x + Tokens.gutter;
@@ -910,7 +1067,7 @@ export component PanelComponent inherits Rectangle {
     // (B) Dragging the last tab = the view is about to be ABSORBED via merge. This
     // is an ALLOWED, non-destructive action (the tab migrates) → definitely NOT red:
     // treated as a neutral "dissolution" (grey veil + faded content).
-    property <bool> will-merge: root.is-drag-source && root.view.tabs.length <= 1;
+    property <bool> will-merge: root.is-drag-source && root.tab-state.count <= root.tab-drag-count;
     // The absorption register: this view is about to stop existing HERE — its
     // last tab carried into another view, or the whole view carried out of the
     // window. The same word for the same meaning, content faded included,
@@ -933,7 +1090,7 @@ export component PanelComponent inherits Rectangle {
         if (!root.zoom-adjusting) {
             root.zoom-adjusting = true;
             let top = root.rows-viewport-changed(max(0px, -rows-scroll.content-y),
-                rows-scroll.height, root.item-grid);
+                root.group-page ? 0px : rows-scroll.height, root.item-grid);
             rows-scroll.content-y = clamp(-top, root.rb-min-vy, 0px);
             root.zoom-adjusting = false;
         }
@@ -984,6 +1141,13 @@ export component PanelComponent inherits Rectangle {
         root.report-rows-viewport();
         root.update-pointer-hover();
     }
+    // Optional native previews can enlarge compact rows after decoding. Restore
+    // their scroll anchor once, then reconcile the shared geometry and hover.
+    changed rows-content-height => {
+        root.report-rows-viewport();
+        root.update-drag-hover-row();
+        root.update-pointer-hover();
+    }
     changed viewport-reset-watch => {
         rows-scroll.content-y = 0px;
         root.report-rows-viewport();
@@ -1000,7 +1164,7 @@ export component PanelComponent inherits Rectangle {
     // Row index under `(x, y)`, respecting the left (gutter) AND right
     // (beyond the columns) dead zones. `-1` = dead zone / outside the list.
     function item-index-at(x: length, y: length) -> int {
-        (x < Tokens.gutter || x > root.content-right || y < 0px) ? -1
+        (root.group-page || root.view.unavailable || x < Tokens.gutter || x > root.content-right || y < 0px) ? -1
             : root.item-at-content-point(x, y - rows-scroll.content-y, root.item-grid);
     }
 
@@ -1062,7 +1226,7 @@ export component PanelComponent inherits Rectangle {
     // keep their clicks; only clicks on empty area land here. Slint
     // dispatches to the topmost TouchArea under the pointer.
     activate-bg := TouchArea {
-        clicked => { root.activate(); root.close-ctx-menu(); }
+        clicked => { root.click-off-tabs(); }
     }
 
     // Wrapper that CLIPS the content — rectangular, WITHOUT border-radius → clip
@@ -1090,7 +1254,7 @@ export component PanelComponent inherits Rectangle {
             visible: root.tab-mode == 1;
             on-left: true;
             tabs: root.view.tabs;
-            active-tab-idx: root.view.active-tab-idx;
+            active-tab-idx: root.tab-state.active;
             overlay-open: root.overlay-open;
             tab-drag-active: root.drag-active;
             new-tab-tooltip: Strings.tab-new-tooltip;
@@ -1099,23 +1263,24 @@ export component PanelComponent inherits Rectangle {
                 && root.drag-over && root.drag-in-bar;
             // Drag cursor in the list's CONTENT position (plain values only:
             // fixed origin `vtabs-col-y` + viewport reported by the bar).
-            reorder-cur: root.drag-abs-y - root.vtabs-col-y - self.vp-y;
             cursor-in-bar-y: root.drag-abs-y - root.vtabs-col-y;
             preview-idx: root.tab-mode == 1 ? root.drag-preview-idx : -1;
             preview-pos: root.tab-drop-x;
-            claim-drop(g, gy) => { root.report-tab-drop(g, gy); }
-            tab-clicked(i) => { root.activate(); root.tab-clicked(i); }
-            tab-closed(i) => { root.activate(); root.tab-closed(i); }
-            tab-context(i, x, y) => { root.activate(); root.tab-context(i, x, y); }
+            group-toggle(id) => { root.group-toggle-request(id); }
+            group-clicked(id, m) => { root.group-pointer-selection(id, m); }
+            group-context(id, x, y) => { root.group-context-request(id, x, y); }
+            tab-clicked(i, modifiers) => { root.tab-pointer-click(i, modifiers); }
+            tab-closed(i) => { root.tab-close-request(i); }
+            tab-context(i, x, y) => { root.tab-context-request(i, x, y); }
             // NO `activate()` during the drag (would rebuild the model →
             // lost grab; activation on drop, bridge side) — strip parity.
-            tab-drag-progress(i, ax, ay) => { root.tab-drag-progress(i, ax, ay); }
+            tab-drag-progress(i, group, ax, ay) => { root.tab-drag-progress(i, group, ax, ay); }
             tab-drag-completed(i, ax, ay) => {
                 root.tab-drag-completed(i, root.drag-preview-idx, ax, ay);
             }
-            tab-new => { root.activate(); root.close-ctx-menu(); root.tab-new(); }
-            bar-clicked => { root.activate(); root.close-ctx-menu(); }
-            bar-context(x, y) => { root.activate(); root.tab-bar-context(x, y); }
+            tab-new => { root.tab-new-request(); }
+            bar-clicked => { root.click-off-tabs(); }
+            bar-context(x, y) => { if (!root.active) { root.activate(); } root.tab-bar-context(x, y); }
             wheel(fwd) => { root.tab-wheel(fwd); }
             scrolled(vy) => { root.tabs-scrolled(vy); }
             scroll-target(ti, fwd, vp, vw) => {
@@ -1156,8 +1321,8 @@ export component PanelComponent inherits Rectangle {
         // Wrapped in a horizontal layout containing:
         //  - a horizontally scrollable Flickable (tabs + "+" button)
         // (The "split" and "x close panel" tokens live in the
-        // nav bar — same location in all THREE bar modes.)
-        // COLLAPSED (height 0, invisible) when the tab bar is VERTICAL:
+        // nav bar, same location in all bar modes.)
+        // Collapsed when the tab bar is vertical or hidden:
         // the element stays in the tree — its ids (tabs-flick…) are referenced
         // by the panel's properties/Timers (an `if` would break them).
         HorizontalLayout {
@@ -1180,14 +1345,14 @@ export component PanelComponent inherits Rectangle {
                 // Since this TouchArea consumes clicks, it activates the
                 // panel itself.
                 tabs-wheel := TouchArea {
-                    clicked => { root.activate(); root.close-ctx-menu(); }
+                    clicked => { root.click-off-tabs(); }
                     // Double-click in the EMPTY area of the tab bar → new tab
                     // (like the "+" button), browser convention.
-                    double-clicked => { root.activate(); root.close-ctx-menu(); root.tab-new(); }
+                    double-clicked => { root.tab-new-request(); }
                     pointer-event(ev) => {
                         if (ev.kind == PointerEventKind.down
                                 && ev.button == PointerEventButton.right) {
-                            root.activate();
+                            if (!root.active) { root.activate(); }
                             root.tab-bar-context(
                                 self.absolute-position.x + self.mouse-x,
                                 self.absolute-position.y + self.mouse-y);
@@ -1232,44 +1397,19 @@ export component PanelComponent inherits Rectangle {
                     tabs-row := HorizontalLayout {
                         spacing: 2px;
                         alignment: start;
-                        // Tabs with 100% PLAIN geometry: width/offset
-                        // come from the MODEL (bridge). Gap claiming is
-                        // computed INSIDE TabItem on these plain values (ColumnHeader pattern).
-                        for tab[idx] in root.view.tabs : TabItem {
-                            title: tab.title;
-                            folder-slot: tab.folder-slot;
-                            // Path tooltip: opt-in — empty = disabled.
-                            tip-path: root.tab-tooltip-enabled ? tab.path : "";
-                            active: idx == root.view.active-tab-idx;
-                            tab-width: tab.width;
-                            tab-offset: tab.offset;
-                            tab-index: idx;
-                            tab-count: root.view.tabs.length;
+                        for tab in root.view.tabs : TabBarEntry {
+                            entry: tab;
+                            active-index: root.tab-state.active;
+                            show-tooltip: root.tab-tooltip-enabled;
                             tab-drag-active: root.drag-active;
-                            // Mode gate: the collapsed strip (vertical bar
-                            // active) must NEVER claim a
-                            // gap — its TabItems always exist in the tree.
-                            reorder-active: root.tab-mode == 0 && root.drag-active
-                                && root.drag-over && root.drag-in-bar;
-                            // Cursor in tabs-row's CONTENT coordinates: visible
-                            // position (`drag-abs-x - tabs-row-x`) MINUS the scroll
-                            // (`content-x` ≤ 0). Without this term, a scrolled bar
-                            // (half-tabs) would claim the wrong drop gap. The
-                            // preview (inside the Flickable) is already content-relative →
-                            // consistent. Plain read of `content-x` → safe.
-                            reorder-cur: root.drag-abs-x - root.tabs-row-x - tabs-flick.content-x;
-                            claim-drop(g, gx) => { root.report-tab-drop(g, gx); }
-                            clicked => { root.activate(); root.tab-clicked(idx); }
-                            close-clicked => { root.activate(); root.tab-closed(idx); }
-                            right-clicked(x, y) => { root.activate(); root.tab-context(idx, x, y); }
-                            // NO `root.activate()` during the drag (would rebuild
-                            // the model → lost grab; activation on drop, bridge side).
-                            drag-progress(d, abs-x, abs-y) => {
-                                root.tab-drag-progress(idx, abs-x, abs-y);
-                            }
-                            drag-completed(d, abs-x, abs-y) => {
-                                root.tab-drag-completed(idx, root.drag-preview-idx, abs-x, abs-y);
-                            }
+                            clicked(i, m) => { root.tab-pointer-click(i, m); }
+                            closed(i) => { root.tab-close-request(i); }
+                            context(i, x, y) => { root.tab-context-request(i, x, y); }
+                            drag-progress(i, group, x, y) => { root.tab-drag-progress(i, group, x, y); }
+                            drag-completed(i, x, y) => { root.tab-drag-completed(i, root.drag-preview-idx, x, y); }
+                            group-toggle(id) => { root.group-toggle-request(id); }
+                            group-clicked(id, m) => { root.group-pointer-selection(id, m); }
+                            group-context(id, x, y) => { root.group-context-request(id, x, y); }
                         }
                         // The "+" button belongs to the fixed right-hand cluster and
                         // stays visible even when the tabs overflow.
@@ -1323,7 +1463,7 @@ export component PanelComponent inherits Rectangle {
                     // tabs underneath. Declared before the chevrons, it leaves
                     // them clickable on top.
                     TouchArea {
-                        clicked => { root.activate(); root.close-ctx-menu(); }
+                        clicked => { root.click-off-tabs(); }
                         scroll-event(ev) => {
                             if (root.overlay-open) { return accept; }
                             if (ev.delta-y < 0 || ev.delta-x < 0) { root.tab-wheel(true); return accept; }
@@ -1340,13 +1480,13 @@ export component PanelComponent inherits Rectangle {
                             icon: @image-url("../../assets/icons/chevron-left.svg");
                             tooltip-text: Strings.tab-scroll-left;
                             enabled: root.can-scroll-left;
-                            clicked => { root.activate(); root.close-ctx-menu(); root.tabs-scroll-left(); }
+                            clicked => { root.click-off-tabs(); root.tabs-scroll-left(); }
                         }
                         TabScrollButton {
                             icon: @image-url("../../assets/icons/chevron-right.svg");
                             tooltip-text: Strings.tab-scroll-right;
                             enabled: root.can-scroll-right;
-                            clicked => { root.activate(); root.close-ctx-menu(); root.tabs-scroll-right(); }
+                            clicked => { root.click-off-tabs(); root.tabs-scroll-right(); }
                         }
                     }
                 }
@@ -1372,7 +1512,7 @@ export component PanelComponent inherits Rectangle {
                 }
                 new-touch := TouchArea {
                     mouse-cursor: pointer;
-                    clicked => { root.activate(); root.close-ctx-menu(); root.tab-new(); }
+                    clicked => { root.tab-new-request(); }
                     changed has-hover => {
                         if (self.has-hover && Strings.tab-new-tooltip != "") {
                             Tip.text = Strings.tab-new-tooltip;
@@ -1418,32 +1558,34 @@ export component PanelComponent inherits Rectangle {
             NavIconButton {
                 x: 0px;
                 y: 0px;
-                enabled: root.view.can-go-back;
+                enabled: !root.group-page && root.view.can-go-back;
                 icon: @image-url("../../assets/icons/chevron-left.svg");
                 tooltip-text: Strings.nav-prev;
-                clicked => { root.cancel-address-edit(); root.activate(); root.go-back(); }
+                clicked => { root.cancel-address-edit(); root.click-off-tabs(); root.go-back(); }
             }
             NavIconButton {
                 x: mod(1, nav-bar.tool-columns) * 36px;
                 y: floor(1 / nav-bar.tool-columns) * 32px;
-                enabled: root.view.can-go-forward;
+                enabled: !root.group-page && root.view.can-go-forward;
                 icon: @image-url("../../assets/icons/chevron-right.svg");
                 tooltip-text: Strings.nav-next;
-                clicked => { root.cancel-address-edit(); root.activate(); root.go-forward(); }
+                clicked => { root.cancel-address-edit(); root.click-off-tabs(); root.go-forward(); }
             }
             NavIconButton {
                 x: mod(2, nav-bar.tool-columns) * 36px;
                 y: floor(2 / nav-bar.tool-columns) * 32px;
                 icon: @image-url("../../assets/icons/arrow-up.svg");
                 tooltip-text: Strings.nav-parent;
-                clicked => { root.cancel-address-edit(); root.activate(); root.go-parent(); }
+                enabled: !root.group-page;
+                clicked => { root.cancel-address-edit(); root.click-off-tabs(); root.go-parent(); }
             }
             NavIconButton {
                 x: mod(3, nav-bar.tool-columns) * 36px;
                 y: floor(3 / nav-bar.tool-columns) * 32px;
                 icon: @image-url("../../assets/icons/refresh.svg");
                 tooltip-text: Strings.nav-refresh;
-                clicked => { root.cancel-address-edit(); root.activate(); root.refresh(); }
+                enabled: !root.group-page;
+                clicked => { root.cancel-address-edit(); root.click-off-tabs(); root.refresh(); }
             }
             // Arrangement and preview options share a compact display menu.
             NavIconButton {
@@ -1453,10 +1595,11 @@ export component PanelComponent inherits Rectangle {
                     ? @image-url("../../assets/icons/grid.svg")
                     : @image-url("../../assets/icons/list.svg");
                 tooltip-text: Strings.view-mode-tooltip;
+                enabled: !root.group-page;
                 dismiss-bump: false;
                 clicked-at(mx, my) => {
                     root.cancel-address-edit();
-                    root.activate();
+                    root.click-off-tabs();
                     root.open-display-menu(mx, my);
                 }
             }
@@ -1469,7 +1612,8 @@ export component PanelComponent inherits Rectangle {
                     ? @image-url("../../assets/icons/eye.svg")
                     : @image-url("../../assets/icons/eye-off.svg");
                 tooltip-text: Strings.show-hidden-tooltip;
-                clicked => { root.cancel-address-edit(); root.activate(); root.toggle-show-hidden(); }
+                enabled: !root.group-page;
+                clicked => { root.cancel-address-edit(); root.click-off-tabs(); root.toggle-show-hidden(); }
             }
             // Tab bar position: 3-option dropdown menu
             // (top / left / right). The icon reflects the current state via a
@@ -1489,6 +1633,7 @@ export component PanelComponent inherits Rectangle {
                 // same reference frame as the pointer event.
                 clicked-at(mx, my) => {
                     root.cancel-address-edit();
+                    root.reset-tab-selection();
                     root.close-ctx-menu();
                     root.open-tabbar-menu(mx, my);
                     root.activate();
@@ -1523,7 +1668,16 @@ export component PanelComponent inherits Rectangle {
                 clip: true;
 
                 // --- DISPLAY mode: breadcrumbs ---
-                if !root.path-edit-mode : TouchArea {
+                if root.group-page : TouchArea {
+                    clicked => { root.click-off-tabs(); }
+                    Text {
+                        x: 8px; y: 0px; width: max(0px, parent.width - 16px); height: parent.height;
+                        text: root.tab-state.group-name; font-size: 12px;
+                        color: Theme.foreground.with-alpha(0.65); overflow: elide;
+                        horizontal-alignment: left; vertical-alignment: center;
+                    }
+                }
+                if !root.path-edit-mode && !root.group-page : TouchArea {
                     // Click on the empty area (not on a segment) → edit mode.
                     clicked => {
                         root.edit-address();
@@ -1620,9 +1774,9 @@ export component PanelComponent inherits Rectangle {
                                     }
                                     crumb-touch := TouchArea {
                                         clicked => {
-                                            root.activate();
-                                            root.close-ctx-menu();
-                                            root.navigate-to(crumb.path);
+                                            let path: string = crumb.path;
+                                            root.click-off-tabs();
+                                            root.navigate-to(path);
                                         }
                                         pointer-event(ev) => {
                                             if (ev.kind == PointerEventKind.down
@@ -1756,14 +1910,18 @@ export component PanelComponent inherits Rectangle {
                             // open (right-click → menu): we must stay in edit mode
                             // so "Paste" fills the field.
                             changed has-focus => {
-                                if (!self.has-focus && !root.url-menu-open) {
+                                if (self.has-focus) {
+                                    root.reset-tab-selection();
+                                } else if (!root.url-menu-open) {
                                     root.path-edit-mode = false;
                                 }
                             }
                             accepted => {
+                                let path: string = self.text;
                                 root.path-edit-mode = false;
+                                root.reset-tab-selection();
                                 root.activate();
-                                root.navigate-to(self.text);
+                                root.navigate-to(path);
                                 root.request-focus();
                             }
                             key-pressed(event) => {
@@ -1803,10 +1961,12 @@ export component PanelComponent inherits Rectangle {
                         validate-touch := TouchArea {
                             mouse-cursor: pointer;
                             clicked => {
+                                let path: string = url-input.text;
                                 root.path-edit-mode = false;
+                                root.reset-tab-selection();
                                 root.activate();
                                 root.close-ctx-menu();
-                                root.navigate-to(url-input.text);
+                                root.navigate-to(path);
                                 root.request-focus();
                             }
                         }
@@ -1888,6 +2048,7 @@ export component PanelComponent inherits Rectangle {
                         if (ev.button == PointerEventButton.left
                                 && ev.kind == PointerEventKind.down) {
                             root.cancel-address-edit();
+                            root.reset-tab-selection();
                             root.vd-x = self.absolute-position.x + self.mouse-x;
                             root.vd-y = self.absolute-position.y + self.mouse-y;
                             root.view-dragging = false;
@@ -1961,6 +2122,7 @@ export component PanelComponent inherits Rectangle {
                         root.open-split-menu(
                             self.absolute-position.x,
                             self.absolute-position.y + self.height);
+                        root.reset-tab-selection();
                         root.activate();
                     }
                 }
@@ -1988,7 +2150,7 @@ export component PanelComponent inherits Rectangle {
                     // close on click). `changed` because has-hover is not a
                     // direct binding usable from the root.
                     changed has-hover => { root.close-hover = self.has-hover; }
-                    clicked => { root.cancel-address-edit(); root.close-ctx-menu(); root.close-panel(); }
+                    clicked => { root.cancel-address-edit(); root.close-ctx-menu(); root.reset-tab-selection(); root.close-panel(); }
                 }
             }
             }
@@ -2000,7 +2162,7 @@ export component PanelComponent inherits Rectangle {
         // By-NAME type-ahead filter: magnifying glass + the field, shown as soon
         // as text is entered. Emptying the field closes it, and so does Escape
         // (see key-scope).
-        if (root.view.search-recursive || (root.active && root.filter-text != "")) && !root.view.ext-filter-on && !root.view.manual-order : FilterBar {
+        if !root.group-page && (root.view.search-recursive || (root.active && (root.filter-text != "" || root.filter-forced))) && !root.view.ext-filter-on : FilterBar {
             icon: @image-url("../../assets/icons/search.svg");
             text: root.view.search-recursive ? root.view.search-query : root.filter-text;
             editable: root.active;
@@ -2010,13 +2172,13 @@ export component PanelComponent inherits Rectangle {
             scope-label: Strings.search-subfolders;
             edited(value) => { root.filter-set(value); }
             app-key(ev) => { return root.filter-key(ev); }
-            focused => { root.activate(); root.close-ctx-menu(); root.filter-focused(); }
-            toggle-scope => { root.activate(); root.close-ctx-menu(); root.search-scope-toggle(); }
+            focused => { root.leave-tab-selection(); root.filter-focused(); }
+            toggle-scope => { root.click-off-tabs(); root.search-scope-toggle(); }
         }
         // By-EXTENSION filter: funnel + the field (hint "jpg, png" if empty).
         // Activated from the columns menu. Its "x" turns the mode off, which
         // emptying the field does not, so this bar keeps one.
-        if root.view.ext-filter-on && !root.view.manual-order : FilterBar {
+        if !root.group-page && root.view.ext-filter-on : FilterBar {
             icon: @image-url("../../assets/icons/filter.svg");
             text: root.view.ext-filter;
             hint: Strings.ext-filter-placeholder;
@@ -2025,8 +2187,8 @@ export component PanelComponent inherits Rectangle {
             take-keyboard: root.filter-take-keyboard;
             edited(value) => { root.filter-set(value); }
             app-key(ev) => { return root.filter-key(ev); }
-            focused => { root.activate(); root.close-ctx-menu(); root.filter-focused(); }
-            close => { root.ext-filter-toggle(); }
+            focused => { root.leave-tab-selection(); root.filter-focused(); }
+            close => { root.click-off-tabs(); root.ext-filter-toggle(); }
         }
 
         // ===== Flickable wrapper: headers + list scroll TOGETHER horizontally =====
@@ -2046,14 +2208,14 @@ export component PanelComponent inherits Rectangle {
                 root.view.content-width + Tokens.gutter-content + 8px;
             // A 6px threshold absorbs residual rounding and spacing to
             // avoid a scrollbar almost as wide as the viewport.
-            property <bool> needs-hscroll: !root.view.grid-mode && total-col-w > self.width + 6px;
+            property <bool> needs-hscroll: !root.group-page && !root.view.grid-mode && total-col-w > self.width + 6px;
 
             flickable := Flickable {
                 x: 0;
                 y: 0;
                 width: parent.width;
                 height: parent.height - (parent.needs-hscroll ? 10px : 0px);
-                content-width: root.view.grid-mode ? self.width : max(self.width, parent.total-col-w);
+                content-width: root.group-page || root.view.grid-mode ? self.width : max(self.width, parent.total-col-w);
                 content-height: self.height;
                 // `interactive: false`: otherwise the Flickable captures the
                 // drags and the rubber-band no longer receives anything. Horizontal
@@ -2070,7 +2232,8 @@ export component PanelComponent inherits Rectangle {
                     // a flat header topping a thin hairline.
                     Rectangle {
                         background: transparent;
-                        height: root.header-height;
+                        visible: !root.group-page;
+                        height: root.group-page ? 0px : root.header-height;
                         clip: root.view.grid-mode;
                         // Thin hairline separating header / list.
                         Rectangle {
@@ -2121,8 +2284,9 @@ export component PanelComponent inherits Rectangle {
                                     asc: root.view.sort-asc;
                                     resizable: false;
                                     reorderable: false;
+                                    interaction-start => { root.reset-tab-selection(); }
                                     clicked => {
-                                        root.activate();
+                                        root.click-off-tabs();
                                         if (!root.view.manual-order) { root.sort-clicked(root.view.sort-column); }
                                     }
                                     right-clicked(mx, my) => { root.activate(); root.open-columns-menu(mx, my); }
@@ -2133,7 +2297,7 @@ export component PanelComponent inherits Rectangle {
                                 tooltip-text: Strings.view-sort-tooltip;
                                 enabled: !root.view.manual-order;
                                 dismiss-bump: false;
-                                clicked-at(mx, my) => { root.activate(); root.open-sort-menu(mx, my); }
+                                clicked-at(mx, my) => { root.click-off-tabs(); root.open-sort-menu(mx, my); }
                             }
                         }
                         if !root.view.grid-mode : HorizontalLayout {
@@ -2160,8 +2324,9 @@ export component PanelComponent inherits Rectangle {
                                 col-drag-active: root.col-drag-active;
                                 col-drag-new-center: root.col-drag-center + root.col-drag-delta;
                                 col-drop-idx: root.col-drop-idx;
+                                interaction-start => { root.reset-tab-selection(); }
                                 clicked => {
-                                    root.activate();
+                                    root.click-off-tabs();
                                     if (!root.view.manual-order) { root.sort-clicked(col.id); }
                                 }
                                 resized(w) => { root.set-col-width(col.id, w); }
@@ -2206,6 +2371,7 @@ export component PanelComponent inherits Rectangle {
             // sub-model bounded to the viewport + overscan: virtualization is
             // preserved without ever approximating the geometry.
             rows-scroll := Flickable {
+                visible: !root.group-page;
                 width: parent.width;
                 height: parent.height;
                 content-width: self.width;
@@ -2241,6 +2407,7 @@ export component PanelComponent inherits Rectangle {
                     created: entry.created;
                     is-dir: entry.is-dir;
                     is-symlink: entry.is-symlink;
+                    content-remote: entry.content-remote;
                     is-share: entry.is-share;
                     folder-slot: entry.folder-slot;
                     comment: entry.comment;
@@ -2308,57 +2475,20 @@ export component PanelComponent inherits Rectangle {
             // drive not started, missing mount). We KEEP the tab + this message
             // PERSISTENT; it disappears on its own once the folder becomes
             // accessible again (automatic recheck, see `recheck-unavailable`).
-            if root.view.unavailable : Rectangle {
+            if root.group-page || root.view.unavailable : ViewStatusMessage {
                 x: 0;
                 y: 0;
                 width: parent.width;
                 height: parent.height;
-                background: Theme.background;
-                // LEFT-ALIGNED block — on a narrow/cramped view, a
-                // centered warning can "fall" outside the visible area or get
-                // clipped; anchored on the left, it always stays legible. Centered
-                // vertically only.
-                VerticalLayout {
-                    alignment: center;              // centers the block VERTICALLY
-                    spacing: 7px;
-                    padding-left: 22px;
-                    padding-right: 22px;
-                    padding-top: 24px;
-                    padding-bottom: 24px;
-                    // Icon wrapped in a LEFT-aligned HorizontalLayout: a
-                    // fixed-size Image is NOT stretched by the VerticalLayout.
-                    HorizontalLayout {
-                        alignment: start;
-                        Image {
-                            source: @image-url("../../assets/icons/network.svg");
-                            width: 24px;
-                            height: 24px;
-                            colorize: Tokens.danger;
-                        }
-                    }
-                    Text {
-                        text: Strings.tab-unavailable;
-                        font-size: 14px;
-                        font-weight: 700;
-                        color: Theme.foreground;
-                        horizontal-alignment: left;
-                        wrap: word-wrap;
-                    }
-                    Text {
-                        text: root.view.current-path;
-                        font-size: 12px;
-                        color: Theme.foreground.with-alpha(0.65);
-                        horizontal-alignment: left;
-                        overflow: elide;
-                    }
-                    Text {
-                        text: Strings.tab-unavailable-hint;
-                        font-size: 11px;
-                        color: Theme.foreground.with-alpha(0.5);
-                        horizontal-alignment: left;
-                        wrap: word-wrap;
-                    }
-                }
+                icon: root.group-page ? @image-url("../../assets/icons/tabs-top.svg") : @image-url("../../assets/icons/network.svg");
+                icon-color: root.group-page ? Theme.accent-background : Tokens.danger;
+                heading: root.group-page
+                    ? (root.tab-state.group-collapsed ? Strings.tab-group-closed-title : Strings.tab-group-open-title)
+                    : Strings.tab-unavailable;
+                detail: root.group-page ? root.tab-state.group-name : root.view.current-path;
+                hint: root.group-page
+                    ? (root.tab-state.group-collapsed ? Strings.tab-group-closed-hint : Strings.tab-group-open-hint)
+                    : Strings.tab-unavailable-hint;
             }
 
             // SINGLE, STABLE TouchArea above the viewport: handles hover,
@@ -2374,7 +2504,7 @@ export component PanelComponent inherits Rectangle {
                 // aligned. `gutter-strip` covers the inset outside the clip.
                 x: 0;
                 y: 0;
-                width: rows-scroll.content-height > rows-scroll.height
+                width: !root.group-page && rows-scroll.content-height > rows-scroll.height
                     ? parent.width - 14px
                     : parent.width;
                 height: parent.height;
@@ -2438,7 +2568,7 @@ export component PanelComponent inherits Rectangle {
                 // Folder/tab change, overlay, active panel, keystroke, or
                 // click in the chrome: all invalidate the candidate's context.
                 property <string> dir-watch: root.view.current-path;
-                property <int> tab-watch: root.view.active-tab-idx;
+                property <int> tab-watch: root.tab-state.active;
                 property <int> dismiss-serial: Dismiss.serial;
                 // The click that brings the window back to the front is what
                 // the window manager asked for, not a second click on an entry.
@@ -2519,6 +2649,7 @@ export component PanelComponent inherits Rectangle {
                     // The row under a stationary pointer changes during a scroll:
                     // a deferred rename must never target the old entry.
                     self.cancel-rename-candidate();
+                    if (root.group-page) { return accept; }
                     // During a FILE DRAG: the wheel ALWAYS SCROLLS the
                     // hovered view (never zooms, even with Ctrl+drag) → reach an
                     // off-screen folder without releasing the drag. This branch
@@ -2574,6 +2705,7 @@ export component PanelComponent inherits Rectangle {
                 }
 
                 moved => {
+                    if (root.group-page) { return; }
                     // Externalized drag (native OLE): we ignore any movement
                     // until the next press — otherwise `self.pressed` staying true
                     // (release consumed by the modal loop) would restart a
@@ -2673,6 +2805,15 @@ export component PanelComponent inherits Rectangle {
 
                 pointer-event(ev) => {
                     root.pointer-modifiers(ev.modifiers.control, ev.modifiers.shift);
+                    if (root.group-page) {
+                        if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                            root.click-off-tabs();
+                        }
+                        if (ev.kind == PointerEventKind.up && ev.button == PointerEventButton.left) {
+                            root.request-focus();
+                        }
+                        return;
+                    }
                     // Any new interaction cancels a previous candidate.
                     // The current left click may arm a new one on up.
                     if (ev.kind == PointerEventKind.down) {
@@ -2704,10 +2845,11 @@ export component PanelComponent inherits Rectangle {
                         // Captured BEFORE `close-ctx-menu()` to distinguish a real
                         // second click from a click meant to dismiss the menu.
                         self.down-overlay-was-open = root.overlay-open;
-                        root.activate();
-                        // A left click closes the context menu (and still goes on
-                        // to select the row on release).
-                        root.close-ctx-menu();
+                        // Takes the panel and closes the context menu; the row
+                        // itself is still selected on release. A press in the
+                        // listing picks a row rather than a batch of tabs, so it
+                        // also releases a tab selection.
+                        root.click-off-tabs();
                         self.down-x = self.mouse-x;
                         self.down-y = self.mouse-y;
                         self.dragging = false;
@@ -2801,7 +2943,7 @@ export component PanelComponent inherits Rectangle {
                                     self.rename-candidate-idx = idx;
                                     self.rename-candidate-dir = root.view.current-path;
                                     self.rename-candidate-name = root.view.rows[idx].name;
-                                    self.rename-candidate-tab = root.view.active-tab-idx;
+                                    self.rename-candidate-tab = root.tab-state.active;
                                     self.rename-candidate-activation = self.activation-generation;
                                     self.rename-pending = true;
                                 }
@@ -2845,6 +2987,7 @@ export component PanelComponent inherits Rectangle {
                 }
 
                 double-clicked => {
+                    if (root.group-page) { return; }
                     // An entry opens on a double-click only when the second click
                     // was a plain click. A gesture that dragged is a selection
                     // rectangle: two of them drawn quickly across the same row are
@@ -2912,7 +3055,7 @@ export component PanelComponent inherits Rectangle {
                             && root.active && !root.overlay-open && !root.file-drag-active
                             && idx >= 0 && idx < root.view.rows.length
                             && root.view.current-path == sel-touch.rename-candidate-dir
-                            && root.view.active-tab-idx == sel-touch.rename-candidate-tab
+                            && root.tab-state.active == sel-touch.rename-candidate-tab
                             && root.hovered-idx == idx
                             && root.view.rows[idx].selected
                             && root.view.rows[idx].name == sel-touch.rename-candidate-name) {
@@ -3050,6 +3193,7 @@ export component PanelComponent inherits Rectangle {
                         pointer-event(ev) => {
                             if (ev.button == PointerEventButton.left
                                     && ev.kind == PointerEventKind.down) {
+                                root.reset-tab-selection();
                                 root.close-ctx-menu();
                                 parent.drag-start-x = self.absolute-position.x + self.mouse-x;
                                 parent.drag-start-content-x = flickable.content-x;
@@ -3072,7 +3216,7 @@ export component PanelComponent inherits Rectangle {
             // even when the columns overflow horizontally. Same
             // style/logic as the
             // custom horizontal scrollbar.
-            if root.rb-min-vy < 0px : vscrollbar := Rectangle {
+            if !root.group-page && root.rb-min-vy < 0px : vscrollbar := Rectangle {
                 x: parent.width - 7px;
                 // Below the header band, whatever its height: in manual order
                 // it carries a pill above the column titles and is taller.
@@ -3106,6 +3250,7 @@ export component PanelComponent inherits Rectangle {
                         pointer-event(ev) => {
                             if (ev.button == PointerEventButton.left
                                     && ev.kind == PointerEventKind.down) {
+                                root.reset-tab-selection();
                                 root.close-ctx-menu();
                                 parent.drag-start-y = self.absolute-position.y + self.mouse-y;
                                 parent.drag-start-content-y = rows-scroll.content-y;
@@ -3132,7 +3277,7 @@ export component PanelComponent inherits Rectangle {
             alignment: start;
             height: 18px;
             Text {
-                text: root.footer-text;
+                text: root.group-page ? "" : root.footer-text;
                 font-size: 11px;
                 color: Theme.foreground.with-alpha(0.6);
             }
@@ -3144,28 +3289,29 @@ export component PanelComponent inherits Rectangle {
             visible: root.tab-mode == 2;
             on-left: false;
             tabs: root.view.tabs;
-            active-tab-idx: root.view.active-tab-idx;
+            active-tab-idx: root.tab-state.active;
             overlay-open: root.overlay-open;
             tab-drag-active: root.drag-active;
             new-tab-tooltip: Strings.tab-new-tooltip;
             show-tooltip: root.tab-tooltip-enabled;
             reorder-here: root.tab-mode == 2 && root.drag-active
                 && root.drag-over && root.drag-in-bar;
-            reorder-cur: root.drag-abs-y - root.vtabs-col-y - self.vp-y;
             cursor-in-bar-y: root.drag-abs-y - root.vtabs-col-y;
             preview-idx: root.tab-mode == 2 ? root.drag-preview-idx : -1;
             preview-pos: root.tab-drop-x;
-            claim-drop(g, gy) => { root.report-tab-drop(g, gy); }
-            tab-clicked(i) => { root.activate(); root.tab-clicked(i); }
-            tab-closed(i) => { root.activate(); root.tab-closed(i); }
-            tab-context(i, x, y) => { root.activate(); root.tab-context(i, x, y); }
-            tab-drag-progress(i, ax, ay) => { root.tab-drag-progress(i, ax, ay); }
+            group-toggle(id) => { root.group-toggle-request(id); }
+            group-clicked(id, m) => { root.group-pointer-selection(id, m); }
+            group-context(id, x, y) => { root.group-context-request(id, x, y); }
+            tab-clicked(i, modifiers) => { root.tab-pointer-click(i, modifiers); }
+            tab-closed(i) => { root.tab-close-request(i); }
+            tab-context(i, x, y) => { root.tab-context-request(i, x, y); }
+            tab-drag-progress(i, group, ax, ay) => { root.tab-drag-progress(i, group, ax, ay); }
             tab-drag-completed(i, ax, ay) => {
                 root.tab-drag-completed(i, root.drag-preview-idx, ax, ay);
             }
-            tab-new => { root.activate(); root.close-ctx-menu(); root.tab-new(); }
-            bar-clicked => { root.activate(); root.close-ctx-menu(); }
-            bar-context(x, y) => { root.activate(); root.tab-bar-context(x, y); }
+            tab-new => { root.tab-new-request(); }
+            bar-clicked => { root.click-off-tabs(); }
+            bar-context(x, y) => { if (!root.active) { root.activate(); } root.tab-bar-context(x, y); }
             wheel(fwd) => { root.tab-wheel(fwd); }
             scrolled(vy) => { root.tabs-scrolled(vy); }
             scroll-target(ti, fwd, vp, vw) => {
@@ -3214,10 +3360,18 @@ export component PanelComponent inherits Rectangle {
         property <bool> taken-by-double: false;
 
         pointer-event(ev) => {
+            if (root.group-page) {
+                if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                    root.click-off-tabs();
+                }
+                if (ev.kind == PointerEventKind.up && ev.button == PointerEventButton.left) {
+                    root.request-focus();
+                }
+                return;
+            }
             if (ev.kind == PointerEventKind.down
                     && ev.button == PointerEventButton.left) {
-                root.activate();
-                root.close-ctx-menu();
+                root.click-off-tabs();
                 self.down-x = self.mouse-x - root.list-inset-x;
                 self.down-y = self.mouse-y;
                 self.down-ctrl = ev.modifiers.control;
@@ -3243,6 +3397,7 @@ export component PanelComponent inherits Rectangle {
         // here selects everything too. The large blank area below the last
         // row is excluded on both sides (see `sel-touch`).
         double-clicked => {
+            if (root.group-page) { return; }
             if (self.dragging) {
                 return;
             }
@@ -3252,6 +3407,7 @@ export component PanelComponent inherits Rectangle {
         }
 
         moved => {
+            if (root.group-page) { return; }
             if (self.pressed) {
                 if (!self.dragging
                         && (abs(self.mouse-x - root.list-inset-x - self.down-x) > 4px

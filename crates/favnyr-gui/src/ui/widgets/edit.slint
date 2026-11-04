@@ -18,6 +18,7 @@ export component LineEdit inherits Rectangle {
     in property <bool> font-italic <=> input.font-italic;
     in property <TextHorizontalAlignment> horizontal-alignment: left;
     out property <bool> has-focus: input.has-focus;
+    out property <bool> composing: input.preedit-text != "";
     callback edited(string);
     callback accepted(string);
     callback key-pressed(KeyEvent) -> EventResult;

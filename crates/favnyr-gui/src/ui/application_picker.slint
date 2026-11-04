@@ -1,0 +1,242 @@
+import { Button, CheckBox, ScrollView } from "widgets.slint";
+import { DeferredLineEditFocus, SearchField } from "controls.slint";
+import { OpenerItem } from "types.slint";
+import { Strings } from "strings.slint";
+import { Theme } from "theme.slint";
+
+// Selection remains provisional until Run or Enter confirms it.
+export component ApplicationPicker inherits FocusScope {
+    in property <[OpenerItem]> entries;
+    in property <int> selected-index: -1;
+    in property <bool> busy: false;
+    in property <bool> platform-linux: false;
+    in-out property <string> search-text;
+    in-out property <bool> set-default;
+    in-out property <bool> show-other-apps;
+    callback selected(string);
+    callback search-edited(string);
+    callback scope-changed(bool);
+    callback run();
+    callback browse();
+    callback cancelled();
+    property <bool> runnable: !root.busy && root.selected-index >= 0
+        && root.selected-index < root.entries.length && root.entries[root.selected-index].available;
+    property <length> scroll-limit: max(0px, apps.content-height - apps.visible-height);
+    changed scroll-limit => { root.reveal-selection(); }
+
+    function choose(index: int) {
+        if !root.busy && index >= 0 && index < root.entries.length && root.entries[index].available {
+            root.selected(root.entries[index].id);
+        }
+    }
+    function reveal-selection() {
+        apps.content-y = apps.content-y.clamp(-root.scroll-limit, 0px);
+        if root.selected-index >= 0 && root.selected-index < root.entries.length {
+            let top = 6px + root.selected-index * 31px;
+            if top < -apps.content-y { apps.content-y = -top; }
+            else if top + 30px > -apps.content-y + apps.visible-height {
+                apps.content-y = apps.visible-height - top - 30px;
+            }
+        }
+    }
+    changed selected-index => { root.reveal-selection(); }
+    changed entries => { root.reveal-selection(); }
+    function focus-start() {
+        if root.platform-linux { scope-choice.focus(); }
+        else { search.focus(); }
+    }
+    function focus-end() {
+        if root.runnable { run-button.focus(); }
+        else { cancel-button.focus(); }
+    }
+    function handle-key(event: KeyEvent) -> bool {
+        // IME candidate selection and modified editing keys belong to the input.
+        if (search.has-focus && search.composing) || event.modifiers.control
+            || event.modifiers.alt || event.modifiers.meta { return false; }
+        // Keep keyboard focus inside the modal, including when Run is disabled.
+        if event.text == Key.Tab || event.text == Key.Backtab {
+            if root.busy { return true; }
+            if event.text == Key.Backtab || event.modifiers.shift {
+                if scope-choice.has-focus { root.focus-end(); }
+                else if search.has-focus {
+                    if root.platform-linux { scope-choice.focus(); }
+                    else { root.focus-end(); }
+                }
+                else if default-choice.has-focus { search.focus(); }
+                else if browse-button.has-focus { default-choice.focus(); }
+                else if cancel-button.has-focus { browse-button.focus(); }
+                else if run-button.has-focus { cancel-button.focus(); }
+                else { search.focus(); }
+            } else {
+                if scope-choice.has-focus { search.focus(); }
+                else if search.has-focus { default-choice.focus(); }
+                else if default-choice.has-focus { browse-button.focus(); }
+                else if browse-button.has-focus { cancel-button.focus(); }
+                else if cancel-button.has-focus && root.runnable { run-button.focus(); }
+                else if cancel-button.has-focus || run-button.has-focus { root.focus-start(); }
+                else { default-choice.focus(); }
+            }
+            return true;
+        }
+        if event.modifiers.shift { return false; }
+        if event.text == Key.Escape {
+            if !root.busy { root.cancelled(); }
+            return true;
+        }
+        if event.text == Key.UpArrow || event.text == Key.DownArrow {
+            let next = root.selected-index < 0
+                ? (event.text == Key.DownArrow ? 0 : root.entries.length - 1)
+                : (root.selected-index + (event.text == Key.DownArrow ? 1 : -1)).clamp(0, root.entries.length - 1);
+            root.choose(next);
+            return true;
+        }
+        if event.text == Key.Return {
+            if root.runnable { root.run(); }
+            return true;
+        }
+        return false;
+    }
+    key-pressed(event) => { root.handle-key(event) ? accept : reject }
+    DeferredLineEditFocus {
+        armed: true;
+        apply-focus => { search.focus(); }
+    }
+    Rectangle {
+        background: Theme.background;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 24px;
+        drop-shadow-color: Theme.shadow.with-alpha(0.35);
+        drop-shadow-offset-y: 6px;
+        TouchArea { }
+        VerticalLayout {
+            padding: 18px;
+            spacing: 10px;
+            HorizontalLayout {
+                spacing: 12px;
+                Text {
+                    text: Strings.ow-choose;
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Theme.foreground;
+                    min-width: 0px;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Rectangle {
+                    min-width: root.platform-linux ? scope-choice.min-width : 0px;
+                    min-height: root.platform-linux ? scope-choice.min-height : 0px;
+                    horizontal-stretch: 0;
+                    scope-choice := CheckBox {
+                        visible: root.platform-linux;
+                        text: Strings.ow-display-other-apps;
+                        enabled: root.platform-linux && !root.busy;
+                        checked <=> root.show-other-apps;
+                        toggled => { root.scope-changed(self.checked); }
+                    }
+                }
+            }
+            search := SearchField {
+                enabled: !root.busy;
+                list-behind: true;
+                placeholder-text: Strings.ow-search-placeholder;
+                text <=> root.search-text;
+                edited(value) => { root.search-edited(value); }
+                app-key(event) => { root.handle-key(event) }
+            }
+            Rectangle {
+                vertical-stretch: 1;
+                background: Theme.alternate-background.with-alpha(0.5);
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: Theme.border;
+                apps := ScrollView {
+                    enabled: !root.busy;
+                    content-height: root.entries.length == 0 ? 52px : 12px + root.entries.length * 31px;
+                    horizontal-scrollbar-policy: always-off;
+                    accessible-role: list;
+                    if root.entries.length == 0 : Text {
+                        x: 6px; y: 6px;
+                        width: apps.visible-width - 12px;
+                        height: 40px;
+                        text: root.search-text == "" ? Strings.ow-empty : Strings.ow-no-results;
+                        font-size: 12px;
+                        color: Theme.foreground.with-alpha(0.45);
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    for entry[index] in root.entries : Rectangle {
+                        x: 6px; y: 6px + index * 31px;
+                        width: max(0px, apps.visible-width - 12px);
+                        height: 30px;
+                        border-radius: 5px;
+                        background: index == root.selected-index ? Theme.accent-background.with-alpha(0.3)
+                            : touch.has-hover && !root.busy ? Theme.alternate-background : transparent;
+                        accessible-role: list-item;
+                        accessible-label: entry.label;
+                        accessible-item-selectable: true;
+                        accessible-item-selected: index == root.selected-index;
+                        accessible-item-index: index;
+                        accessible-enabled: !root.busy && entry.available;
+                        accessible-action-default => { root.focus(); root.choose(index); }
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 8px;
+                            Rectangle {
+                                width: 18px; height: parent.height;
+                                Image {
+                                    x: 0px; y: (parent.height - self.height) / 2;
+                                    width: parent.width; height: 16px;
+                                    source: entry.icon.width > 0 ? entry.icon : @image-url("../../assets/icons/application.svg");
+                                    colorize: entry.icon.width > 0 ? transparent : Theme.foreground.with-alpha(0.7);
+                                    image-fit: contain;
+                                }
+                            }
+                            Text {
+                                text: entry.label;
+                                font-size: 13px;
+                                color: Theme.foreground;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                        }
+                        touch := TouchArea {
+                            enabled: !root.busy && entry.available;
+                            mouse-cursor: pointer;
+                            clicked => { root.focus(); root.choose(index); }
+                        }
+                    }
+                }
+            }
+            default-choice := CheckBox {
+                text: Strings.ow-set-default;
+                enabled: !root.busy;
+                checked <=> root.set-default;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                browse-button := Button {
+                    text: Strings.ow-pick-browse;
+                    enabled: !root.busy;
+                    clicked => { root.browse(); root.focus(); }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                cancel-button := Button {
+                    text: Strings.btn-cancel;
+                    enabled: !root.busy;
+                    clicked => { root.cancelled(); }
+                }
+                run-button := Button {
+                    text: Strings.ow-run;
+                    enabled: root.runnable;
+                    primary: true;
+                    clicked => { root.run(); }
+                }
+            }
+        }
+    }
+}

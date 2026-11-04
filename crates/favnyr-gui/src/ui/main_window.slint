@@ -24,14 +24,18 @@ import {
     CascadeAnchor, ColumnInfo, Crumb, FavNode, FileRow, ItemGrid, ItemRect,
     MenuShortcuts, OpenerItem, OpProgress, OrphanRow, OwRecipe, PanelBox, PanelView, PropRow,
     ShellCtxEntry, ShellExtRow, ShortcutCap, ShortcutGroup, ShortcutRow, SidebarPlace,
-    SplitterView, TabInfo, WorkspaceEntry
+    SplitterView, TabInfo, TabBarState, TabDropGap, TabGroupChoice, WorkspaceEntry
 } from "types.slint";
 import { Strings } from "strings.slint";
 import { CtxNav, Dismiss, Flyout, KeyAdapter, Note, TextMetrics, Tip, WindowFocus } from "globals.slint";
 import { Theme, Tokens } from "theme.slint";
+import { TabGroupEditor } from "tab_groups.slint";
+import { NewItemMenu } from "new_items.slint";
+import { ApplicationPicker } from "application_picker.slint";
+import { BulkRenameDialog, BulkRenameInputs, BulkRenameOptions, BulkRenameRow } from "bulk_rename.slint";
 import {
     DeferredLineEditFocus, EditLineEdit, EditTextInput, FieldLink, HintEdit, MarkBox,
-    ModalBackdrop, ProgressToast, SearchField, WsButton, WsIconBtn
+    ModalBackdrop, ProgressToast, ProgressToastLayout, SearchField, WsButton, WsIconBtn
 } from "controls.slint";
 import {
     CommandIcon, FlyoutCloseTimer, FolderSwatchRow, IconMenuRow, MenuItem, ShellMenuRow,
@@ -49,7 +53,8 @@ import { WorkspaceRow } from "workspaces.slint";
 // Only what this file exports reaches the generated Rust API: the structs the
 // bridge exchanges with the window and the globals it drives directly.
 export {
-    TabInfo, Crumb, WorkspaceEntry, SidebarPlace, OpenerItem, ShellCtxEntry, OrphanRow,
+    BulkRenameInputs, BulkRenameOptions, BulkRenameRow,
+    TabInfo, TabBarState, TabDropGap, TabGroupChoice, Crumb, WorkspaceEntry, SidebarPlace, OpenerItem, ShellCtxEntry, OrphanRow,
     ShellExtRow, FavNode, ColumnInfo, MenuShortcuts, ShortcutCap, ShortcutRow, ShortcutGroup,
     FileRow, PanelBox, ItemGrid, ItemRect, PanelView, SplitterView, OwRecipe,
     OpProgress, PropRow, CascadeAnchor,
@@ -184,11 +189,16 @@ export component MainWindow inherits Window {
     in property <[PanelBox]> panel-boxes;
     in property <[SplitterView]> splitters;
     in property <int> active-panel-idx: 0;
+    /// A bar held open on an empty filter belongs to the view that asked for
+    /// it, and does not follow the keyboard to the next one.
+    changed active-panel-idx => { root.filter-forced = false; }
     // Counter bumped by Ctrl+L (`focus-address`) → each PanelComponent observes it;
     // the ACTIVE panel enters address bar edit mode.
     property <int> address-focus-gen: 0;
     in property <bool> can-add-panel: true;
     callback panel-clicked(int);
+    // True selects the previous view in spatial reading order.
+    callback panel-cycle(bool);
     callback panel-closed(int);
     /// Reposition a whole view: source, target, zone (center or split edge).
     callback view-dropped(int, int, int);
@@ -282,7 +292,7 @@ export component MainWindow inherits Window {
     /// normalized by `chord-key-name`.
     callback match-action(string, bool, bool, bool, bool) -> string;
     /// Emitted by the bridge when a thumbnail is ready (full path, generation, image).
-    callback thumb-ready(string, int, image);
+    callback thumb-ready(string, int, image, bool);
     /// Exact viewport of a panel: drives virtualization and prioritization.
     callback panel-viewport-changed(int, length, length, ItemGrid) -> length;
     callback panel-item-at-content-point(int, length, length, ItemGrid) -> int;
@@ -308,7 +318,7 @@ export component MainWindow inherits Window {
     in-out property <length> split-menu-y;
 
     // "Tab bar position" menu: 3 radio options (top /
-    // left / right), per view. `set-tab-bar-mode(panel, mode)` → bridge.
+    // left / right / hidden), per view. A negative mode toggles visibility.
     in-out property <bool> tabbar-menu-open: false;
     property <bool> display-menu-open: false;
     property <length> display-menu-x;
@@ -367,6 +377,9 @@ export component MainWindow inherits Window {
     // Tab bar scroll target — geometric computation on the bridge side
     // (panel, tab_idx[-1=chevron], forward, content-x, view-w) → content-x.
     callback panel-scroll-target(int, int, bool, length, length) -> length;
+    // Tab the wheel moves to over a tab bar (panel, forward) → logical index.
+    // Resolved on the bridge side, which knows which entries the bar shows.
+    callback panel-tab-step(int, bool) -> int;
     // check/uncheck a column (panel_idx, col_id, visible) + menu.
     callback column-toggle(int, string, bool);
     // Reordering: panel, column identifier, and target visible index.
@@ -390,8 +403,17 @@ export component MainWindow inherits Window {
     // input (filter-type/backspace/clear) feeds the extension filter instead of
     // the by-name type-ahead → shared routing on the bridge side.
     in property <bool> active-ext-filter-on: false;
+    /// Holds the by-name bar open on an empty filter, so its field owns the
+    /// keyboard before the first keystroke. Typing on the list cannot offer
+    /// that: the key that brings the bar up is read here as a finished
+    /// character, while an input method composes one character from several
+    /// keystrokes and needs the field focused first. Cleared as soon as the
+    /// filter carries text, which then keeps the bar on by itself, so an
+    /// emptied field still closes it.
+    property <bool> filter-forced: false;
     /// Is a filter bar, and therefore its field, on screen?
-    property <bool> filter-bar-on: root.active-filter != "" || root.active-ext-filter-on;
+    property <bool> filter-bar-on: root.active-filter != "" || root.active-ext-filter-on
+        || root.filter-forced;
     /// The bar and its field go away together, by Escape, by the cross, by an
     /// emptied field or by any navigation that resets the filter. Whichever
     /// route took it, the keyboard comes back to the list instead of staying
@@ -423,7 +445,7 @@ export component MainWindow inherits Window {
     in-out property <bool> rows-pointer-busy: false;
     out property <bool> rows-interaction-busy: root.rows-pointer-busy
         || root.popup-overlay-open || root.file-drag-active || root.drag-active
-        || root.native-drag-armed || root.view-drag-active || root.op-busy;
+        || root.native-drag-active || root.view-drag-active || root.op-busy;
     property <bool> active-search-recursive: root.active-panel-idx >= 0
         && root.active-panel-idx < root.panels.length && root.panels[root.active-panel-idx].search-recursive;
     // Is an overlay/popup open? (gates the filter's keyboard capture)
@@ -433,7 +455,7 @@ export component MainWindow inherits Window {
     // apart.
     out property <bool> popup-overlay-open:
         root.prop-open || root.exit-warning-open || root.settings-open || root.workspaces-open || root.ws-dirty-warn-open || root.rename-popup-open
-        || root.create-popup-open || root.ctx-menu-open
+        || root.create-popup-open || root.ctx-menu-open || root.bulk-open
         || root.paste-conflict-open || root.columns-menu-open || root.trash-menu-open
         || root.drive-menu-open
         || root.url-menu-open || root.split-menu-open || root.tabbar-menu-open || root.display-menu-open || root.sort-menu-open
@@ -442,7 +464,8 @@ export component MainWindow inherits Window {
         || root.fav-newc-open || root.tab-menu-open || root.tab-empty-menu-open
         || root.ow-menu-open || root.new-menu-open || root.mark-menu-open
         || root.ow-popup-open || root.ow-picker-open || root.archive-open
-        || root.delete-warning-open || root.open-many-open;
+        || root.delete-warning-open || root.open-many-open
+        || root.group-menu-open || root.group-choices-open || root.group-editor-open;
     property <bool> any-overlay-open: root.popup-overlay-open || root.file-drag-active;
     // One of those appearing in the middle of a gesture ends it, rather than
     // leaving it drawn on screen with no way to finish it.
@@ -460,6 +483,9 @@ export component MainWindow inherits Window {
     /// time, so ending all of them is exact, and each area holding local state
     /// follows its own flag going down.
     function cancel-mouse-gestures() {
+        root.tab-drag-cancelled();
+        root.drag-target-group = "";
+        root.drag-target-group-name = "";
         // A carried view is CANCELLED, not dropped: should the release still
         // arrive, it must not tear the view off.
         if (root.view-drag-active) { root.view-drag-cancelled = true; }
@@ -550,15 +576,52 @@ export component MainWindow inherits Window {
     callback rubber-band-update(length, length, length, length);
     callback row-right-clicked(int, length, length);
     callback tab-new();
-    callback tab-clicked(int);
+    callback tab-clicked(int, int);
+    callback tab-wheel-selected(int);
+    callback tab-context-selection(int, int) -> int;
+    in property <[TabBarState]> tab-bars;
+    pure callback tab-drop-gap(int, length, bool) -> TabDropGap;
+    in property <bool> external-tab-legacy: false;
+    in property <int> external-tab-drop-query;
+    callback external-tab-drop-resolved(int, int, int, int, string);
+    callback group-toggle(int, string);
+    callback group-clicked(int, string, int);
+    callback group-context(int, string);
+    callback group-command(int, string);
+    callback group-color(int);
+    callback group-editor-submit(string, int) -> bool;
+    in property <[TabGroupChoice]> group-choices;
+    in property <bool> group-can-remove;
+    in property <int> group-current-color;
+    in-out property <bool> group-menu-confirm-delete: false;
+    in-out property <bool> group-editor-open;
+    in property <bool> group-editor-creating;
+    in-out property <string> group-editor-name;
+    in-out property <int> group-editor-color;
+    in-out property <string> group-editor-error;
+    in-out property <bool> group-menu-open;
+    property <length> group-menu-x;
+    property <length> group-menu-y;
+    property <bool> group-choices-open;
+    property <CascadeAnchor> group-choices-at;
+    property <bool> group-parent-hover;
+    property <bool> group-flyout-hover;
+    callback reset-tab-selection() -> bool;
+    callback reset-panel-tab-selection(int) -> bool;
     callback tab-closed(int);
-    // (src_panel, src_tab, target_intra, abs_x, abs_y) — src_panel passed
-    // explicitly to handle a drag from a NON-active panel.
-    callback tab-drag-completed(int, int, int, length, length);
+    // Capture (source panel, logical tab, optional group) once at gesture start.
+    // Completion carries (target panel, zone, gap, group, absolute x, absolute y).
+    callback tab-drag-started(int, int, string) -> bool;
+    callback tab-drag-cancelled();
+    callback tab-drag-completed(int, int, int, string, length, length);
+    in property <int> tab-drag-count: 1;
+    in property <bool> tab-drag-can-detach: true;
+    in property <bool> tab-drag-external-blocked;
+    in-out property <string> drag-target-group;
+    in-out property <string> drag-target-group-name;
     callback tab-drag-progress(int, length, length);
-    /// Drop of a tab on a FAVORITES folder: (src_panel, src_tab,
-    /// container id). Saves the tab's path into this folder.
-    callback tab-to-favorite(int, int, string);
+    /// Bookmark the frozen tab batch in the supplied favorites container.
+    callback tab-to-favorite(string);
     /// Drop of a view's SELECTION (files/folders) on a FAVORITES
     /// folder: (src_panel, container id).
     callback file-to-favorite(int, string);
@@ -575,14 +638,11 @@ export component MainWindow inherits Window {
     in-out property <bool> drag-active: false;
     in-out property <length> drag-abs-x: 0px;
     in-out property <length> drag-abs-y: 0px;
-    /// Last insertion gap claimed during the drag + claiming panel
-    /// . Read by the BRIDGE on cross-view drop: if `drag-target-gap-panel`
-    /// == target panel, the drop in its header uses this EXACT gap; otherwise
-    /// (drop in the body) the tab goes to the end of the bar. Reset at drag start.
+    /// Claimed insertion gap and its panel. Capture these before clearing the
+    /// drag bindings on release. A body-center drop appends instead.
     in-out property <int> drag-target-gap: -1;
     in-out property <int> drag-target-gap-panel: -1;
-    // Index of the tab drag's SOURCE panel (for the danger preview "will
-    // close" on the source whose last tab is being dragged). -1 = none.
+    // Source panel for the preview of a view emptied by the dragged batch.
     in-out property <int> drag-source-panel: -1;
     // Drop target — set by the panel under the cursor.
     // `panel` = index (-1 if none); `zone` = 0 none·1 center·2 W·3 E·4 N·5 S.
@@ -598,6 +658,12 @@ export component MainWindow inherits Window {
         && (!root.sidebar-item-drag-active || root.directory-panel-drop-valid)
         && !(root.drag-target-gap-panel >= 0 && root.drag-target-gap >= 0)
         && !root.fav-hover-panel;
+    property <bool> tab-gap-drop: (root.drag-active || root.sidebar-item-drag-active)
+        && root.drag-target-gap-panel >= 0 && root.drag-target-gap >= 0 && !root.fav-hover-panel;
+    property <bool> tab-drag-outside: root.drag-active && (root.drag-abs-x < 0px
+        || root.drag-abs-y < 0px || root.drag-abs-x >= root.width || root.drag-abs-y >= root.height);
+    property <bool> tab-drag-no-target: root.drag-active && !root.fav-hover-panel
+        && !root.tab-gap-drop && !root.panel-layout-drop && !root.tab-drag-outside;
 
     // File drag'n'drop between views -----
     in-out property <bool> file-drag-active: false;
@@ -626,7 +692,7 @@ export component MainWindow inherits Window {
     // folder" gesture into a drop into another application. Private: its only
     // reader is the arming guard, which an incoming external drag never runs.
     property <bool> folder-open-drag-used: false;
-    callback folder-drag-dropped(int /*panel*/, int /*gap*/, int /*zone*/);
+    callback folder-drag-dropped(int /*panel*/, int /*gap*/, int /*zone*/, string /*group*/);
     callback folder-drag-cancelled();
     callback file-drag-action-for-modifiers(bool /*control*/, bool /*shift*/) -> int;
     // -1 opens the action menu, 0 moves immediately, 1 copies immediately.
@@ -699,6 +765,8 @@ export component MainWindow inherits Window {
     // Native (OLE) drag triggered once when the cursor leaves the
     // window during a drag → external apps. Re-armed on every new drag.
     in-out property <bool> native-drag-armed: false;
+    // Only the synchronous native handoff blocks progressive row updates.
+    in-out property <bool> native-drag-active: false;
     callback start-native-drag(int /*src_panel*/);
     callback file-drag-begin(int /*src_panel*/, int /*row_idx*/) -> bool; // ensures selection, returns whether it contains a directory
     // Drop menu (Move / Copy / Link here) + panels captured on drop.
@@ -774,9 +842,13 @@ export component MainWindow inherits Window {
     callback ow-browse();                           // opens an exe picker (native)
     // Home-grown application picker: list enumerated by the OS.
     callback ow-open-picker();                      // "Choose an application…"
-    callback ow-pick(string /*key handler*/);       // choice → launches + captures
-    callback ow-pick-browse();                      // browse the OS → saves + launches
+    callback ow-pick();                            // confirms the selected application
+    callback ow-pick-browse();                      // stages a program from the native picker
+    callback ow-picker-select(string);
+    callback ow-picker-closed();
     in property <[OpenerItem]> ow-picker-handlers;
+    in property <int> ow-picker-selected-index: -1;
+    in-out property <bool> ow-picker-busy: false;
     in-out property <string> ow-picker-search-text: "";
     callback ow-picker-search(string);
     in-out property <bool> ow-picker-open: false;
@@ -786,6 +858,9 @@ export component MainWindow inherits Window {
     // "Set as default": the chosen app becomes Favnyr's default for the
     // file's extension (overrides the OS). Unchecked on every opening.
     in-out property <bool> ow-picker-set-default: false;
+    changed ow-picker-open => {
+        if !root.ow-picker-open { root.ow-picker-closed(); key-scope.focus(); }
+    }
     // "Open with" submenu: flyout on hover of the entry (the parent menu
     // stays visible). Hover tracked via two properties (the entry + the flyout) for
     // a clean deferred close, without referencing conditional elements.
@@ -843,6 +918,20 @@ export component MainWindow inherits Window {
     property <CascadeAnchor> new-menu-at;
     in-out property <bool> new-parent-hover: false;
     in-out property <bool> new-flyout-hover: false;
+    in property <[ShellCtxEntry]> new-documents;
+    callback document-new-prepare();
+    callback document-new-delivered();
+    callback document-new-release();
+    callback document-new-run(int);
+    callback document-create-confirmed(string) -> bool;
+    callback document-create-release();
+    callback document-created-changed();
+    changed new-menu-open => {
+        if (root.platform-windows) {
+            if (root.new-menu-open) { root.document-new-prepare(); }
+            else { root.document-new-release(); }
+        }
+    }
     in-out property <bool> folder-menu-open: false;
     in-out property <bool> folder-menu-reveal: false;
     property <CascadeAnchor> folder-menu-at;
@@ -961,6 +1050,7 @@ export component MainWindow inherits Window {
     /// opened it. Which one is open does not matter: closing all of them is
     /// exact, since only one can be.
     function leave-submenu() {
+        root.group-choices-open = false;
         root.ow-menu-open = false;
         root.folder-menu-open = false;
         root.mark-menu-open = false;
@@ -974,6 +1064,10 @@ export component MainWindow inherits Window {
     // `changed`) → deterministic order when a trigger closes-then-reopens (=
     // teleporting the menu under the cursor on a right-click in a valid zone).
     function close-ctx-menus() {
+        root.group-choices-open = false;
+        root.group-parent-hover = false;
+        root.group-flyout-hover = false;
+        root.group-menu-open = false;
         CtxNav.disarm();
         root.ctx-menu-open = false;      // the "Open with" flyout follows via `changed`
         root.url-menu-open = false;
@@ -1060,6 +1154,8 @@ export component MainWindow inherits Window {
     // Setting: integrate the Windows menu (kill-switch if the extension is slow/broken).
     in-out property <bool> shell-menu-enabled: true;
     callback shell-menu-changed(bool);
+    in-out property <bool> registered-types-enabled: true;
+    callback registered-types-changed(bool);
     // "Detected Windows entries" settings panel: list built at
     // launch (completed as used), checkboxes → hide/show the entry.
     in property <[ShellExtRow]> shell-ext-rows;
@@ -1068,6 +1164,17 @@ export component MainWindow inherits Window {
 
     // ----- Rename modal popup -----
     in-out property <bool> rename-popup-open: false;
+    in-out property <bool> bulk-open: false;
+    in property <[BulkRenameRow]> bulk-rows;
+    in property <string> bulk-summary;
+    in property <bool> bulk-ready;
+    in property <bool> bulk-running;
+    in property <bool> bulk-finished;
+    callback bulk-edited();
+    callback bulk-submit();
+    callback bulk-cancel();
+    callback bulk-poll();
+    Timer { running: root.bulk-open; interval: 100ms; triggered => { root.bulk-poll(); } }
     in property <string> rename-current-name;
     // Folders keep the caret at the end; for a file, the bridge places
     // the caret right before the extension via `fs::ops::split_name`.
@@ -1097,7 +1204,7 @@ export component MainWindow inherits Window {
 
     // ----- New folder / file / shortcut popup (empty area) -----
     in-out property <bool> create-popup-open: false;
-    // Type of entry to create: 0 = folder, 1 = file, 2 = shortcut.
+    // Type: 0 = folder, 1 = file, 2 = shortcut, 3 = link, 4 = registered document.
     in-out property <int> create-kind: 0;
     in-out property <string> create-name;
     // New folder/file: live validation shared with Rename.
@@ -1118,7 +1225,7 @@ export component MainWindow inherits Window {
     in-out property <bool> create-link-symlink: false;
     property <bool> create-focus-armed: false;
     property <bool> create-can-confirm:
-        (root.create-kind == 0 || root.create-kind == 1)
+        (root.create-kind == 0 || root.create-kind == 1 || root.create-kind == 4)
             ? (root.create-name-valid && !root.create-conflict)
             : ((root.create-kind == 2 && root.create-target != "")
                 || (root.create-kind == 3 && root.create-name != ""));
@@ -1135,7 +1242,10 @@ export component MainWindow inherits Window {
         }
         // On close the edit field is destroyed → return focus to the keyboard
         // scope so Escape / shortcuts keep working (see grouped note below).
-        else { key-scope.focus(); }
+        else {
+            root.document-create-release();
+            key-scope.focus();
+        }
     }
 
     // Permanent-deletion warning, shared between a network volume
@@ -1444,10 +1554,14 @@ export component MainWindow inherits Window {
     in-out property <int> left-panel: 1;
     in-out property <length> sidebar-width: 210px;
     callback sidebar-place-clicked(string, int);   // (path, kind)
+    function click-sidebar-place(path: string, kind: int) {
+        root.reset-tab-selection();
+        root.sidebar-place-clicked(path, kind);
+    }
     callback place-open-new-tab(string, int);      // (path, kind) → new tab (active view)
     // A navigable location dropped on a tab gap or onto a panel. Favorite ids
     // use kind -1; the bridge resolves their stored path before acting.
-    callback sidebar-item-dropped(string, int, int, int, int);
+    callback sidebar-item-dropped(string, int, int, int, int, string);
     in-out property <bool> sidebar-item-drag-active: false;
     property <bool> directory-panel-drop-valid:
         (root.folder-open-drag-active || root.sidebar-item-drag-active)
@@ -1471,6 +1585,9 @@ export component MainWindow inherits Window {
     /// Starts dragging a navigable sidebar location. Every source reaching
     /// this designates a directory, so a view destination is always eligible.
     function begin-sidebar-item-drag(abs-x: length, abs-y: length) {
+        root.reset-tab-selection();
+        root.drag-target-group = "";
+        root.drag-target-group-name = "";
         root.drag-abs-x = abs-x;
         root.drag-abs-y = abs-y;
         root.drag-source-panel = -1;
@@ -1486,6 +1603,8 @@ export component MainWindow inherits Window {
         root.drag-abs-y = abs-y;
     }
     function cancel-sidebar-item-drag() {
+        root.drag-target-group = "";
+        root.drag-target-group-name = "";
         root.sidebar-item-drag-active = false;
         root.drag-target-panel = -1;
         root.drag-target-zone = 0;
@@ -1504,11 +1623,12 @@ export component MainWindow inherits Window {
         let panel-accepted: bool = !gap-accepted && root.directory-panel-drop-valid;
         let panel: int = gap-accepted ? gap-panel : root.drag-target-panel;
         let drop-gap: int = gap-accepted ? gap : -1;
+        let group: string = gap-accepted ? root.drag-target-group : "";
         let drop-zone: int = panel-accepted ? root.drag-target-zone : 0;
         let accepted: bool = gap-accepted || panel-accepted;
         root.cancel-sidebar-item-drag();
         if (accepted) {
-            root.sidebar-item-dropped(source, kind, panel, drop-gap, drop-zone);
+            root.sidebar-item-dropped(source, kind, panel, drop-gap, drop-zone, group);
         }
         return accepted;
     }
@@ -1590,6 +1710,8 @@ export component MainWindow inherits Window {
         }
     }
     changed tab-menu-open => {
+        if (root.tab-menu-open) { CtxNav.level = 1; CtxNav.menu-y = -1px; }
+        else { root.group-choices-open = false; }
         if (!root.tab-menu-open && root.mark-target-kind == 1) {
             root.mark-menu-open = false;
         }
@@ -1603,7 +1725,11 @@ export component MainWindow inherits Window {
     // binding is applied. When a submenu closes on pointer leave, navigation
     // returns to the row that opened it.
     property <bool> ctx-sub-open: root.ow-menu-open || root.mark-menu-open || root.folder-menu-open
-        || root.new-menu-open || root.ctx-shell-sub-open;
+        || root.new-menu-open || root.ctx-shell-sub-open || root.group-choices-open;
+    changed group-menu-open => {
+        root.group-menu-confirm-delete = false;
+        if (root.group-menu-open) { CtxNav.level = 1; CtxNav.menu-y = -1px; }
+    }
     function select-first-submenu-item() {
         if (root.ctx-sub-open && CtxNav.want-first && CtxNav.level == 2) {
             CtxNav.want-first = false;
@@ -1678,6 +1804,7 @@ export component MainWindow inherits Window {
     callback sidebar-section-state-changed(int /*0 drives · 1 shortcuts · 2 favorites · 3 network*/,
         bool /*collapsed*/);
     function toggle-sidebar-section(section: int) {
+        root.reset-tab-selection();
         if (section == 0) {
             root.sidebar-drives-collapsed = !root.sidebar-drives-collapsed;
             root.sidebar-section-state-changed(0, root.sidebar-drives-collapsed);
@@ -1766,6 +1893,7 @@ export component MainWindow inherits Window {
     }
     function start-sidebar-section-drag(section: int, abs-x: length, abs-y: length) {
         if (section < 0 || section > 3 || root.left-panel != 1) { return; }
+        root.reset-tab-selection();
         root.sidebar-section-drag-active = true;
         root.sidebar-section-drag-source = section;
         root.sidebar-section-drag-target = root.sidebar-section-rank(section);
@@ -1812,6 +1940,7 @@ export component MainWindow inherits Window {
     in-out property <int> tab-menu-panel: -1;
     in-out property <int> tab-menu-tab: -1;
     in-out property <int> tab-menu-folder-slot: 0;
+    property <int> tab-menu-selection-count: 1;
     // Menu of a tab bar's dead zone. It reuses the existing favorites
     // callback and only exposes the specific restore action.
     in-out property <bool> tab-empty-menu-open: false;
@@ -1933,7 +2062,40 @@ export component MainWindow inherits Window {
     // Executes action `id` (resolved by `match-action`). Centralizes each
     // shortcut's behavior; the combination→id mapping is
     // driven by the config (rebind).
+    function perform-view-action(id: string) -> bool {
+        if (id == "save-workspace") { root.ws-save-current(); return true; }
+        if (id == "open-settings") { root.settings-open = true; return true; }
+        if (id == "open-workspaces") { root.workspaces-open = true; return true; }
+        if (id == "tab-new") { root.tab-new(); return true; }
+        if (id == "tab-reopen-closed") { root.reopen-last-closed-tab(root.active-panel-idx); return true; }
+        if (id == "tab-bar-toggle") { root.set-tab-bar-mode(root.active-panel-idx, -1); return true; }
+        if (id == "tab-next" || id == "tab-prev") {
+            if (root.panels[root.active-panel-idx].tab-bar-mode == 3) {
+                let state = root.tab-bars[root.active-panel-idx];
+                let next = id == "tab-next";
+                let anchor = state.group-page ? state.group-index - (next ? 1 : 0) : state.active;
+                root.tab-clicked(mod(anchor + (next ? 1 : -1) + state.count, state.count), 0);
+            } else {
+                root.tab-wheel-selected(root.panel-tab-step(root.active-panel-idx, id == "tab-next"));
+            }
+            return true;
+        }
+        if (id == "view-next" || id == "view-prev") { root.panel-cycle(id == "view-prev"); return true; }
+        if (id == "split-side") { root.panel-split(0); return true; }
+        if (id == "split-stack") { root.panel-split(1); return true; }
+        if (id == "equalize-views") { root.equalize-views(-1); return true; }
+        return false;
+    }
+
     function perform-action(id: string) {
+        if (root.perform-view-action(id)) { return; }
+        // A group page is not a folder. Workspace slots remain available,
+        // but directory actions must never use the retained tab behind it.
+        if (root.active-panel-idx < root.tab-bars.length
+                && root.tab-bars[root.active-panel-idx].group-page) {
+            root.ws-load-slot-action(id);
+            return;
+        }
         // Cursor navigation (keyboard)
         if (id == "cursor-up") { root.move-cursor(0, false); return; }
         if (id == "cursor-left") { root.move-cursor(4, false); return; }
@@ -1954,46 +2116,26 @@ export component MainWindow inherits Window {
         // Ctrl+L: focuses the ACTIVE panel's address bar. The counter
         // is observed by each PanelComponent; only the active one enters edit mode.
         if (id == "focus-address") { root.address-focus-gen += 1; return; }
+        // Ctrl+F: opens the active view's search bar with its field already
+        // holding the keyboard, which is what an input method needs to compose
+        // the very first character. Suspended only where that bar cannot
+        // appear: the extension filter occupies the same row.
+        if (id == "focus-search") {
+            if (!root.active-ext-filter-on) {
+                root.filter-take-keyboard = true;
+                root.filter-forced = true;
+            }
+            return;
+        }
         // Selection
         if (id == "select-all") { root.select-all(); return; }
         // Tabs & views
-        if (id == "tab-new") { root.tab-new(); return; }
         if (id == "tab-close") {
             if (root.active-panel-idx < root.panels.length) {
-                root.tab-closed(root.panels[root.active-panel-idx].active-tab-idx);
+                root.tab-closed(root.tab-bars[root.active-panel-idx].active);
             }
             return;
         }
-        if (id == "tab-reopen-closed") {
-            root.reopen-last-closed-tab(root.active-panel-idx);
-            return;
-        }
-        if (id == "tab-next") {
-            if (root.active-panel-idx < root.panels.length) {
-                root.tab-clicked(mod(
-                    root.panels[root.active-panel-idx].active-tab-idx + 1,
-                    root.panels[root.active-panel-idx].tabs.length));
-            }
-            return;
-        }
-        if (id == "tab-prev") {
-            if (root.active-panel-idx < root.panels.length) {
-                root.tab-clicked(root.panels[root.active-panel-idx].active-tab-idx <= 0
-                    ? root.panels[root.active-panel-idx].tabs.length - 1
-                    : root.panels[root.active-panel-idx].active-tab-idx - 1);
-            }
-            return;
-        }
-        if (id == "view-next" || id == "view-prev") {
-            if (root.panels.length > 1) {
-                root.panel-clicked(mod(root.active-panel-idx
-                    + (id == "view-prev" ? root.panels.length - 1 : 1), root.panels.length));
-            }
-            return;
-        }
-        if (id == "split-side") { root.panel-split(0); return; }
-        if (id == "split-stack") { root.panel-split(1); return; }
-        if (id == "equalize-views") { root.equalize-views(-1); return; }
         // File operations
         if (id == "open") { root.action-open(); return; }
         if (id == "copy") { root.action-copy(); return; }
@@ -2021,10 +2163,6 @@ export component MainWindow inherits Window {
             return;
         }
         if (id == "toggle-view-mode") { root.toggle-preview-mode(root.active-panel-idx); return; }
-        // Application
-        if (id == "save-workspace") { root.ws-save-current(); return; }
-        if (id == "open-settings") { root.settings-open = true; return; }
-        if (id == "open-workspaces") { root.workspaces-open = true; return; }
         // The nine workspace slots are ids that differ only by their digit,
         // which the bridge reads. Listing them here would be nine lines saying
         // the same thing, and an id matching nothing simply does nothing.
@@ -2152,11 +2290,16 @@ export component MainWindow inherits Window {
                 // → Escape closes the popup first, not the settings.
                 if (root.ow-popup-open) { root.ow-popup-open = false; return accept; }
                 if (root.archive-open) { root.archive-cancel(); return accept; }
-                if (root.ow-picker-open) { root.ow-picker-open = false; return accept; }
+                if (root.ow-picker-open) {
+                    if !root.ow-picker-busy { root.ow-picker-open = false; }
+                    return accept;
+                }
                 // A submenu is peeled off first: Escape closes what it
                 // opened, not everything at once. Same route as the left
                 // arrow, so the keyboard lands back on the parent row.
+                if (root.group-editor-open) { root.group-editor-open = false; return accept; }
                 if (root.ctx-sub-open) { root.leave-submenu(); return accept; }
+                if (root.group-menu-open) { root.close-ctx-menus(); return accept; }
                 if (root.fav-save-open) { root.fav-save-open = false; return accept; }
                 if (root.fav-newc-open) { root.fav-newc-open = false; return accept; }
                 if (root.fav-menu-open) { root.fav-menu-open = false; return accept; }
@@ -2179,15 +2322,21 @@ export component MainWindow inherits Window {
                 if (root.ws-theme-picker-open) { root.ws-theme-picker-open = false; return accept; }
                 if (root.ws-dirty-warn-open) { root.ws-dirty-warn-open = false; return accept; }
                 if (root.workspaces-open) { root.workspaces-open = false; return accept; }
+                if (root.bulk-open) { root.bulk-cancel(); return accept; }
                 if (root.rename-popup-open) { root.rename-popup-open = false; return accept; }
                 if (root.create-popup-open) { root.create-popup-open = false; return accept; }
                 if (root.delete-warning-open) { root.delete-warning-open = false; return accept; }
                 if (root.open-many-open) { root.open-many-open = false; return accept; }
                 if (root.fav-name-open) { root.fav-name-open = false; return accept; }
+                if (root.reset-tab-selection()) { return accept; }
                 // Escape first closes the active filter (by-name OR by-extension
                 // type-ahead — shared via filter-clear bridge-side), otherwise
                 // deselects.
-                if (root.filter-bar-on) { root.filter-clear(); return accept; }
+                if (root.filter-bar-on) {
+                    root.filter-forced = false;
+                    root.filter-clear();
+                    return accept;
+                }
                 root.deselect-all();
                 return accept;
             }
@@ -2202,7 +2351,7 @@ export component MainWindow inherits Window {
             // Arrow navigation of the view's context menu: the keyboard has to
             // be able to finish what the Menu key started. Placed before the
             // dispatch below, which an open overlay suspends in any case.
-            if (root.ctx-menu-open && CtxNav.level > 0) {
+            if ((root.ctx-menu-open || root.tab-menu-open || root.group-menu-open) && CtxNav.level > 0) {
                 if (event.text == Key.DownArrow || event.text == Key.UpArrow) {
                     // Wrapping both ways: going up from nothing lands on the
                     // last entry, which is what a menu does elsewhere.
@@ -2230,7 +2379,8 @@ export component MainWindow inherits Window {
             // has no combination to describe — and placed ahead of the dispatch
             // below so no binding can mask it.
             if (event.text == Key.Menu) {
-                if (!root.any-overlay-open) {
+                if (!root.any-overlay-open && (root.active-panel-idx >= root.tab-bars.length
+                        || !root.tab-bars[root.active-panel-idx].group-page)) {
                     root.close-ctx-menus();
                     root.menu-key-serial += 1;
                 }
@@ -2263,6 +2413,7 @@ export component MainWindow inherits Window {
             // Ctrl/Alt/Meta left to the shortcuts.
             // Space extends an existing filter but never starts name filtering.
             if (!root.any-overlay-open
+                    && (root.active-panel-idx >= root.tab-bars.length || !root.tab-bars[root.active-panel-idx].group-page)
                     && !event.modifiers.control && !event.modifiers.alt && !event.modifiers.meta
                     && (event.text != Key.Space || root.filter-bar-on)
                     && event.text != "" && event.text >= " " && event.text < "\u{F700}") {
@@ -2282,6 +2433,9 @@ export component MainWindow inherits Window {
         TouchArea {
             pointer-event(ev) => {
                 if (ev.kind == PointerEventKind.down) { Dismiss.serial += 1; }
+                if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                    root.reset-tab-selection();
+                }
             }
         }
 
@@ -2305,9 +2459,9 @@ export component MainWindow inherits Window {
                     left-panel: root.left-panel;
 
                     shortcuts: root.menu-shortcuts;
-                    toggle-places => { root.left-panel = root.left-panel == 1 ? 0 : 1; }
-                    open-workspaces => { root.workspaces-open = true; }
-                    open-settings => { root.settings-open = true; }
+                    toggle-places => { root.reset-tab-selection(); root.left-panel = root.left-panel == 1 ? 0 : 1; }
+                    open-workspaces => { root.reset-tab-selection(); root.workspaces-open = true; }
+                    open-settings => { root.reset-tab-selection(); root.settings-open = true; }
                 }
 
                 // ===== UNIFIED side column (Places + Favorites) =====
@@ -2360,7 +2514,7 @@ export component MainWindow inherits Window {
                             section-drag-moved(section, x, y) => { root.update-sidebar-section-drag(section, x, y); }
                             section-drag-dropped(section, x, y) => { root.drop-sidebar-section-drag(section, x, y); }
                             item-drag-active: root.sidebar-item-drag-active;
-                            place-clicked(path, kind) => { root.sidebar-place-clicked(path, kind); }
+                            place-clicked(path, kind) => { root.click-sidebar-place(path, kind); }
                             place-middle-clicked(path, kind) => { root.place-open-new-tab(path, kind); }
                             place-drag-started(x, y) => { root.begin-sidebar-item-drag(x, y); }
                             place-drag-moved(x, y) => { root.update-sidebar-item-drag(x, y); }
@@ -2388,7 +2542,7 @@ export component MainWindow inherits Window {
                             section-drag-moved(section, x, y) => { root.update-sidebar-section-drag(section, x, y); }
                             section-drag-dropped(section, x, y) => { root.drop-sidebar-section-drag(section, x, y); }
                             item-drag-active: root.sidebar-item-drag-active;
-                            place-clicked(path, kind) => { root.sidebar-place-clicked(path, kind); }
+                            place-clicked(path, kind) => { root.click-sidebar-place(path, kind); }
                             place-middle-clicked(path, kind) => { root.place-open-new-tab(path, kind); }
                             place-drag-started(x, y) => { root.begin-sidebar-item-drag(x, y); }
                             place-drag-moved(x, y) => { root.update-sidebar-item-drag(x, y); }
@@ -2445,7 +2599,7 @@ export component MainWindow inherits Window {
                             section-drag-started(section, x, y) => { root.start-sidebar-section-drag(section, x, y); }
                             section-drag-moved(section, x, y) => { root.update-sidebar-section-drag(section, x, y); }
                             section-drag-dropped(section, x, y) => { root.drop-sidebar-section-drag(section, x, y); }
-                            row-activate(id) => { root.fav-row-activate(id); }
+                            row-activate(id) => { root.reset-tab-selection(); root.fav-row-activate(id); }
                             row-middle(id) => { root.fav-row-middle(id); }
                             row-context(id, is-cont, is-dir, is-file, slot, label, x, y) => {
                                 root.close-ctx-menus();
@@ -2470,6 +2624,7 @@ export component MainWindow inherits Window {
                             // is changed, and every other destination refuses
                             // the drop.
                             row-drag-move(ri, cx, cy, rt) => {
+                                if (!root.fav-drag-active) { root.reset-tab-selection(); }
                                 root.fav-drag-move(ri, cy, rt);
                                 if (ri >= 0 && ri < root.fav-nodes.length
                                         && !root.fav-nodes[ri].is-container
@@ -2499,10 +2654,11 @@ export component MainWindow inherits Window {
                                     ri, cy, rt, !tab-drop-accepted && in-favorites);
                             }
                             can-collapse: root.fav-can-collapse;
+                            empty-left-pressed => { root.reset-tab-selection(); }
                             // Header "+" → root container creation popup.
-                            new-container => { root.open-fav-name(false, "", ""); }
-                            collapse-all => { root.fav-collapse-all(); }
-                            expand-all => { root.fav-expand-all(); }
+                            new-container => { root.reset-tab-selection(); root.open-fav-name(false, "", ""); }
+                            collapse-all => { root.reset-tab-selection(); root.fav-collapse-all(); }
+                            expand-all => { root.reset-tab-selection(); root.fav-expand-all(); }
                         }
                         network-section := Sidebar {
                             row: root.sidebar-section-rank(3);
@@ -2521,7 +2677,7 @@ export component MainWindow inherits Window {
                             section-drag-moved(section, x, y) => { root.update-sidebar-section-drag(section, x, y); }
                             section-drag-dropped(section, x, y) => { root.drop-sidebar-section-drag(section, x, y); }
                             item-drag-active: root.sidebar-item-drag-active;
-                            place-clicked(path, kind) => { root.sidebar-place-clicked(path, kind); }
+                            place-clicked(path, kind) => { root.click-sidebar-place(path, kind); }
                             place-middle-clicked(path, kind) => { root.place-open-new-tab(path, kind); }
                             place-drag-started(x, y) => { root.begin-sidebar-item-drag(x, y); }
                             place-drag-moved(x, y) => { root.update-sidebar-item-drag(x, y); }
@@ -2543,7 +2699,7 @@ export component MainWindow inherits Window {
                             title: "";
                             header-visible: false;
                             item-drag-active: root.sidebar-item-drag-active;
-                            place-clicked(path, kind) => { root.sidebar-place-clicked(path, kind); }
+                            place-clicked(path, kind) => { root.click-sidebar-place(path, kind); }
                             place-middle-clicked(path, kind) => { root.place-open-new-tab(path, kind); }
                             place-drag-started(x, y) => { root.begin-sidebar-item-drag(x, y); }
                             place-drag-moved(x, y) => { root.update-sidebar-item-drag(x, y); }
@@ -2589,6 +2745,7 @@ export component MainWindow inherits Window {
                             if (ev.kind == PointerEventKind.down
                                     && ev.button == PointerEventButton.left) {
                                 Dismiss.serial += 1;
+                                root.reset-tab-selection();
                                 parent.start-w = root.sidebar-width;
                                 parent.start-x = self.absolute-position.x + self.mouse-x;
                             }
@@ -2657,6 +2814,22 @@ export component MainWindow inherits Window {
                     view-swap-flying: root.view-swap-flying
                         && (root.swap-flight-a == idx || root.swap-flight-b == idx);
                     view: panel;
+                    tab-state: root.tab-bars[idx];
+                    tab-gap(position) => { return root.tab-drop-gap(idx, position, !root.external-tab-legacy); }
+                    tab-drop-center-only: root.external-tab-legacy;
+                    tab-drop-query: root.external-tab-drop-query;
+                    tab-drop-resolved(query, zone, gap, group) => { root.external-tab-drop-resolved(query, idx, zone, gap, group); }
+                    group-toggle(id) => { root.group-toggle(idx, id); }
+                    group-clicked(id, m) => { root.group-clicked(idx, id, m); }
+                    group-context(id, x, y) => {
+                        root.close-ctx-menus();
+                        root.group-menu-confirm-delete = false;
+                        root.group-context(idx, id);
+                        root.group-menu-x = x;
+                        root.group-menu-y = y;
+                        root.group-menu-open = true;
+                        key-scope.focus();
+                    }
                     // Dragging a VIEW. The claim on the target follows the
                     // idiom used for the separator outline: only the view that
                     // claimed it may drop it, since leaving one and entering
@@ -2728,11 +2901,16 @@ export component MainWindow inherits Window {
                     drag-panel-zones: root.drag-active
                         || root.folder-open-drag-active
                         || root.sidebar-item-drag-active;
-                    drag-panel-split-edges: root.drag-active || root.can-add-panel;
+                    drag-panel-split-edges: !root.external-tab-legacy && (root.drag-active
+                        ? ((root.can-add-panel || (root.drag-source-panel >= 0
+                            && root.tab-drag-count == root.tab-bars[root.drag-source-panel].count))
+                            && !(idx == root.drag-source-panel && root.tab-drag-count == self.tab-state.count))
+                        : root.can-add-panel);
                     drag-abs-x: root.folder-open-drag-active ? root.file-drag-abs-x : root.drag-abs-x;
                     drag-abs-y: root.folder-open-drag-active ? root.file-drag-abs-y : root.drag-abs-y;
                     tab-tooltip-enabled: root.tab-tooltip-enabled;
                     is-drag-source: root.drag-active && idx == root.drag-source-panel;
+                    tab-drag-count: root.tab-drag-count;
                     // The panel under the cursor claims the drop target.
                     changed drag-zone => {
                         if (self.drag-zone > 0) {
@@ -2821,10 +2999,12 @@ export component MainWindow inherits Window {
                         // Slint drag (releases ghost + state) before the modal loop.
                         if (root.file-drag-active && !root.folder-open-drag-used && !root.native-drag-armed
                                 && (x < 0px || y < 0px || x > root.width || y > root.height)) {
+                            let source: int = root.file-drag-source-panel;
                             root.native-drag-armed = true;
+                            root.native-drag-active = true;
                             root.end-file-drag();
                             root.folder-drag-cancelled();
-                            root.start-native-drag(root.file-drag-source-panel);
+                            root.start-native-drag(source);
                         }
                     }
                     file-drag-dropped(x, y) => {
@@ -2835,6 +3015,7 @@ export component MainWindow inherits Window {
                             let gap: int = root.drag-target-gap;
                             let gap-panel: int = root.drag-target-gap-panel;
                             let gap-accepted: bool = gap-panel >= 0 && gap >= 0;
+                            let group: string = gap-accepted ? root.drag-target-group : "";
                             let panel: int = gap-accepted ? gap-panel : root.drag-target-panel;
                             let zone: int = root.directory-panel-drop-valid ? root.drag-target-zone : 0;
                             let fav-container: string = root.fav-hover-container;
@@ -2845,7 +3026,7 @@ export component MainWindow inherits Window {
                             if (over-favorites) {
                                 root.file-to-favorite(source, fav-container);
                             } else if (gap-accepted || zone > 0) {
-                                root.folder-drag-dropped(panel, gap-accepted ? gap : -1, zone);
+                                root.folder-drag-dropped(panel, gap-accepted ? gap : -1, zone, group);
                             }
                             root.folder-drag-cancelled();
                             return;
@@ -2907,9 +3088,17 @@ export component MainWindow inherits Window {
                     ext-filter-toggle => { root.ext-filter-toggle(idx); }
                     tabs-scrolled(vx) => { root.panel-tabs-scrolled(idx, vx); }
                     scroll-target(ti, fwd, vx, vw) => { return root.panel-scroll-target(idx, ti, fwd, vx, vw); }
+                    tab-step(fwd) => { return root.panel-tab-step(idx, fwd); }
                     filter-text: root.active-filter;
                     filter-take-keyboard: root.filter-take-keyboard;
-                    filter-set(value) => { root.filter-set(value); }
+                    filter-forced: root.filter-forced;
+                    filter-set(value) => {
+                        // Text of its own keeps the bar on, so the hold taken
+                        // to focus the empty field is released here and an
+                        // emptied field closes the bar as it always has.
+                        if (value != "") { root.filter-forced = false; }
+                        root.filter-set(value);
+                    }
                     filter-focused => { root.filter-take-keyboard = false; }
                     // Resolved exactly as the window's own key scope would,
                     // so a rebound combination behaves the same inside the
@@ -3017,19 +3206,21 @@ export component MainWindow inherits Window {
                     menu-key-serial: root.menu-key-serial;
                     keyboard-context-row() => { return root.keyboard-context-row(); }
                     select-all => { root.select-all(); }
+                    // The tab selection is already released by the press that
+                    // opened this gesture, wherever in the listing it landed.
                     deselect-all => { root.reclaim-list-keyboard(); root.deselect-all(); }
+                    reset-tab-selection => { root.reset-panel-tab-selection(idx); }
                     rubber-band-begin(m) => { root.reclaim-list-keyboard(); root.rubber-band-begin(m); }
                     rubber-band-update(a, b, c, d) => { root.rubber-band-update(a, b, c, d); }
                     tab-new => { root.tab-new(); }
-                    tab-clicked(i) => { root.tab-clicked(i); }
+                    tab-clicked(i, modifiers) => { root.tab-clicked(i, modifiers); }
+                    tab-wheel-selected(i) => { root.tab-wheel-selected(i); }
                     tab-closed(i) => { root.tab-closed(i); }
                     tab-context(ti, x, y) => {
                         root.close-ctx-menus();
+                        root.tab-menu-selection-count = root.tab-context-selection(idx, ti);
                         root.tab-menu-panel = idx;
                         root.tab-menu-tab = ti;
-                        root.tab-menu-folder-slot = ti >= 0 && ti < panel.tabs.length
-                            ? panel.tabs[ti].folder-slot
-                            : 0;
                         root.tab-menu-x = x;
                         root.tab-menu-y = y;
                         root.tab-menu-open = true;
@@ -3042,51 +3233,51 @@ export component MainWindow inherits Window {
                         root.tab-empty-menu-open = true;
                     }
                     tab-drag-completed(i, ti, ax, ay) => {
-                        // Drop on a FAVORITES folder: takes priority over
-                        // the normal drop (panel / tear-off / transfer), which is
-                        // thus left 100% INTACT. `fav-hover-container` is read
-                        // PULL-BASED BEFORE cutting the drag (the binding resets
-                        // as soon as `drag-active = false`); non-empty = hovered container.
-                        if (root.fav-hover-container != "") {
-                            // `idx` = drag's SOURCE panel (may be non-active).
-                            root.tab-to-favorite(idx, i, root.fav-hover-container);
-                            root.drag-active = false;
-                            root.drag-target-gap = -1;
-                            root.drag-target-gap-panel = -1;
-                        } else if (root.fav-hover-panel) {
-                            // Empty / dead zone of the favorites → root ("").
-                            root.tab-to-favorite(idx, i, "");
-                            root.drag-active = false;
-                            root.drag-target-gap = -1;
-                            root.drag-target-gap-panel = -1;
-                        } else {
-                            root.drag-active = false;
-                            root.tab-drag-completed(idx, i, ti, ax, ay);
-                        }
+                        // Resolve destinations before clearing the bindings that describe the drag.
+                        let favorite: bool = root.fav-hover-container != "" || root.fav-hover-panel;
+                        let container: string = root.fav-hover-container;
+                        let at-gap: bool = root.drag-target-gap-panel >= 0 && root.drag-target-gap >= 0;
+                        let target: int = at-gap ? root.drag-target-gap-panel : root.drag-target-panel;
+                        let zone: int = at-gap ? 0 : root.drag-target-zone;
+                        let gap: int = at-gap ? root.drag-target-gap : -1;
+                        let group: string = at-gap ? root.drag-target-group : "";
+                        root.drag-active = false;
+                        if (favorite) { root.tab-to-favorite(container); }
+                        else { root.tab-drag-completed(target, zone, gap, group, ax, ay); }
+                        root.drag-target-gap = -1;
+                        root.drag-target-gap-panel = -1;
+                        root.drag-target-group = "";
+                        root.drag-target-group-name = "";
                         root.drag-target-panel = -1;
                         root.drag-target-zone = 0;
                         root.drag-source-panel = -1;
                     }
-                    tab-drag-progress(i, ax, ay) => {
-                        // Drag start → purges the previous drag's gap.
+                    tab-drag-progress(i, group, ax, ay) => {
                         if (!root.drag-active) {
+                            if (!root.tab-drag-started(idx, i, group)) { return; }
                             root.drag-target-gap = -1;
                             root.drag-target-gap-panel = -1;
+                            root.drag-target-group = "";
+                            root.drag-target-group-name = "";
                         }
-                        root.drag-active = true;
+                        root.drag-source-panel = idx;
                         root.drag-abs-x = ax;
                         root.drag-abs-y = ay;
-                        root.drag-source-panel = idx;
+                        root.drag-active = true;
                         root.tab-drag-progress(i, ax, ay);
                     }
-                    tab-gap-claimed(g) => {
+                    tab-gap-claimed(g, group, name) => {
                         root.drag-target-gap = g;
                         root.drag-target-gap-panel = idx;
+                        root.drag-target-group = group;
+                        root.drag-target-group-name = name;
                     }
                     tab-gap-cleared => {
                         if (root.drag-target-gap-panel == idx) {
                             root.drag-target-gap = -1;
                             root.drag-target-gap-panel = -1;
+                            root.drag-target-group = "";
+                            root.drag-target-group-name = "";
                         }
                     }
                     request-focus => { key-scope.focus(); }
@@ -3119,6 +3310,7 @@ export component MainWindow inherits Window {
                 // Separators (resize grips) overlaid on the seams.
                 for sp[i] in root.splitters : PanelSplitterAbs {
                     vertical: sp.vertical;
+                    press-started => { root.reset-tab-selection(); }
                     equalize => { root.equalize-views(sp.idx); }
                     // Only the separator that claimed the outline may drop it:
                     // leaving one and entering the next fires both handlers in
@@ -3302,7 +3494,7 @@ export component MainWindow inherits Window {
                     hovered(h) => { root.mark-parent-hover = h; }
                 }
                 Rectangle { height: 1px; background: Theme.border; }
-                MenuItem { nav-level: root.ctx-full-nav-level; label: Strings.ctx-rename; shortcut: root.menu-shortcuts.rename; clicked => { root.ctx-close(); root.action-rename(); } }
+                MenuItem { nav-level: root.ctx-full-nav-level; label: root.ctx-selection-single ? Strings.ctx-rename : Strings.bulk-title; shortcut: root.menu-shortcuts.rename; clicked => { root.ctx-close(); root.action-rename(); } }
                 MenuItem { nav-level: root.ctx-full-nav-level; label: root.ctx-selection-in-trash ? Strings.net-delete-confirm : Strings.ctx-delete; shortcut: root.menu-shortcuts.delete; clicked => { root.ctx-close(); root.action-delete(); } }
                 // WINDOWS context menu entries (shell extensions).
                 if root.ctx-shell-entries.length > 0 : Rectangle { height: 1px; background: Theme.border; }
@@ -3641,12 +3833,12 @@ export component MainWindow inherits Window {
         }
 
         // ===== "Tab bar position" menu =====
-        // 3 radio options (checkmark on the current mode), per view.
+        // Four positions, including a hidden bar with keyboard access to tabs.
         if root.tabbar-menu-open : Rectangle {
             x: Flyout.pinned-x(root.tabbar-menu-x, self.width, root.width);
             y: Flyout.pinned-y(root.tabbar-menu-y, self.height, root.height);
             width: 224px;
-            height: 120px;
+            height: 156px;
             background: Theme.background;
             border-radius: Tokens.radius-overlay;
             border-width: 1px;
@@ -3686,6 +3878,15 @@ export component MainWindow inherits Window {
                     clicked => {
                         root.tabbar-menu-open = false;
                         root.set-tab-bar-mode(root.tabbar-menu-panel, 2);
+                    }
+                }
+                TabBarMenuItem {
+                    icon: @image-url("../../assets/icons/eye-off.svg");
+                    label: Strings.tabbar-hidden;
+                    selected: root.tabbar-menu-mode == 3;
+                    clicked => {
+                        root.tabbar-menu-open = false;
+                        root.set-tab-bar-mode(root.tabbar-menu-panel, 3);
                     }
                 }
             }
@@ -3970,44 +4171,24 @@ export component MainWindow inherits Window {
         }
 
         // ===== "New" submenu (flyout on hover) =====
-        // Same mechanism as "Open with" above (no backdrop: the parent
-        // menu stays active). Opens the creation popup with the right `create-kind`.
-        if root.new-menu-open : Rectangle {
+        // The native document commands share the existing creation flyout.
+        if root.new-menu-open : NewItemMenu {
             x: Flyout.cascade-x(root.new-menu-at, self.width, root.width);
             y: Flyout.cascade-y(root.new-menu-at, self.height, root.height);
-            width: 200px;
-            height: 8px + (root.platform-windows ? 3 : 2) * 26px;
-            background: Theme.background;
-            border-radius: Tokens.radius-overlay;
-            border-width: 1px;
-            border-color: Theme.border;
-            drop-shadow-blur: 18px;
-            drop-shadow-color: Theme.shadow.with-alpha(0.25);
-            drop-shadow-offset-y: 4px;
-            TouchArea {
-                changed has-hover => { root.new-flyout-hover = self.has-hover; }
-                VerticalLayout {
-                    padding: 4px;
-                    MenuItem {
-                        nav-level: root.ctx-new-nav-level;
-                        label: Strings.ctx-new-folder;
-                        clicked => { root.ctx-close(); root.create-kind = 0; root.create-name = ""; root.create-target = ""; root.create-popup-open = root.search-root-action-allowed(); }
-                    }
-                    MenuItem {
-                        nav-level: root.ctx-new-nav-level;
-                        label: Strings.ctx-new-file;
-                        clicked => { root.ctx-close(); root.create-kind = 1; root.create-name = ""; root.create-target = ""; root.create-popup-open = root.search-root-action-allowed(); }
-                    }
-                    // .lnk shortcut: Windows ONLY (a concept absent on Linux,
-                    // where symbolic links are followed natively).
-                    if root.platform-windows : MenuItem {
-                        nav-level: root.ctx-new-nav-level > 0
-                            && root.platform-windows ? 2 : 0;
-                        label: Strings.ctx-new-shortcut;
-                        clicked => { root.ctx-close(); root.create-kind = 2; root.create-name = ""; root.create-target = ""; root.create-shortcut-folder = true; root.create-popup-open = root.search-root-action-allowed(); }
-                    }
-                }
+            windows: root.platform-windows;
+            documents: root.platform-windows ? root.new-documents : [];
+            nav-level: root.ctx-new-nav-level;
+            available-height: root.height - 16px;
+            changed hovered => { root.new-flyout-hover = self.hovered; }
+            create(kind) => {
+                root.ctx-close();
+                root.create-kind = kind;
+                root.create-name = "";
+                root.create-target = "";
+                if (kind == 2) { root.create-shortcut-folder = true; }
+                root.create-popup-open = root.search-root-action-allowed();
             }
+            document(id) => { root.document-new-run(id); }
         }
 
         // ===== Windows shell menu CASCADE flyout =====
@@ -4040,131 +4221,27 @@ export component MainWindow inherits Window {
 
         // ===== Home-grown application picker =====
         if root.ow-picker-open : ModalBackdrop {
-            dismiss-on-click: true;
-            dismiss => { root.ow-picker-open = false; }
+            dismiss-on-click: !root.ow-picker-busy;
+            dismiss => { if !root.ow-picker-busy { root.ow-picker-open = false; } }
         }
-        if root.ow-picker-open : Rectangle {
+        if root.ow-picker-open : ApplicationPicker {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             width: min(440px, parent.width - 24px);
             height: min(420px, parent.height - 24px);
-            background: Theme.background;
-            border-radius: 8px;
-            border-width: 1px;
-            border-color: Theme.border;
-            drop-shadow-blur: 24px;
-            drop-shadow-color: Theme.shadow.with-alpha(0.35);
-            drop-shadow-offset-y: 6px;
-            // This catch-all absorbs clicks in the panel's empty areas. Only
-            // a click outside the panel, received by the backdrop, closes the picker.
-            TouchArea { }
-            VerticalBox {
-                padding: 18px;
-                spacing: 10px;
-                HorizontalLayout {
-                    spacing: 12px;
-                    Text {
-                        text: Strings.ow-choose;
-                        font-size: 16px;
-                        font-weight: 700;
-                        color: Theme.foreground;
-                        min-width: 0px;
-                        horizontal-stretch: 1;
-                        vertical-alignment: center;
-                        overflow: elide;
-                    }
-                    if root.platform-linux : CheckBox {
-                        text: Strings.ow-display-other-apps;
-                        checked <=> root.ow-picker-show-other-apps;
-                        toggled => { root.ow-picker-show-other-apps-changed(self.checked); }
-                    }
-                }
-                picker-search := SearchField {
-                    placeholder-text: Strings.ow-search-placeholder;
-                    text <=> root.ow-picker-search-text;
-                    edited(value) => { root.ow-picker-search(value); }
-                }
-                Rectangle {
-                    vertical-stretch: 1;
-                    background: Theme.alternate-background.with-alpha(0.5);
-                    border-radius: 8px;
-                    border-width: 1px;
-                    border-color: Theme.border;
-                    ScrollView {
-                        VerticalLayout {
-                            padding: 6px;
-                            spacing: 1px;
-                            if root.ow-picker-handlers.length == 0 : Text {
-                                text: root.ow-picker-search-text == ""
-                                    ? Strings.ow-empty
-                                    : Strings.ow-no-results;
-                                font-size: 12px;
-                                color: Theme.foreground.with-alpha(0.45);
-                                height: 40px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            for h in root.ow-picker-handlers : Rectangle {
-                                height: 30px;
-                                border-radius: 5px;
-                                background: pick-ta.has-hover ? Theme.alternate-background : transparent;
-                                HorizontalLayout {
-                                    padding-left: 10px;
-                                    padding-right: 10px;
-                                    spacing: 8px;
-                                    Rectangle {
-                                        width: 18px;
-                                        height: parent.height;
-                                        if h.icon.width > 0 : Image {
-                                            source: h.icon;
-                                            width: 16px;
-                                            height: 16px;
-                                            x: 0;
-                                            y: (parent.height - self.height) / 2;
-                                        }
-                                        if h.icon.width == 0 : Image {
-                                            width: 16px;
-                                            x: 0;
-                                            y: (parent.height - self.height) / 2;
-                                            source: @image-url("../../assets/icons/application.svg");
-                                            colorize: Theme.foreground.with-alpha(0.7);
-                                        }
-                                    }
-                                    Text {
-                                        text: h.label;
-                                        font-size: 13px;
-                                        color: Theme.foreground;
-                                        vertical-alignment: center;
-                                        overflow: elide;
-                                        horizontal-stretch: 1;
-                                    }
-                                }
-                                pick-ta := TouchArea {
-                                    mouse-cursor: pointer;
-                                    clicked => { root.ow-picker-open = false; root.ow-pick(h.id); }
-                                }
-                            }
-                        }
-                    }
-                }
-                // "Set as default": when the app is chosen, also saves the
-                // file's extension as a Favnyr default (overrides the OS).
-                CheckBox {
-                    text: Strings.ow-set-default;
-                    checked <=> root.ow-picker-set-default;
-                }
-                HorizontalBox {
-                    padding: 0px;
-                    // Browse the OS for a custom exe (like the "…" in Custom
-                    // Command): the handler saves it as an opener then launches it.
-                    Button {
-                        text: Strings.ow-pick-browse;
-                        clicked => { root.ow-pick-browse(); }
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                    Button { text: Strings.btn-cancel; clicked => { root.ow-picker-open = false; } }
-                }
-            }
+            entries: root.ow-picker-handlers;
+            selected-index: root.ow-picker-selected-index;
+            busy: root.ow-picker-busy;
+            platform-linux: root.platform-linux;
+            search-text <=> root.ow-picker-search-text;
+            set-default <=> root.ow-picker-set-default;
+            show-other-apps <=> root.ow-picker-show-other-apps;
+            selected(id) => { root.ow-picker-select(id); }
+            search-edited(value) => { root.ow-picker-search(value); }
+            scope-changed(value) => { root.ow-picker-show-other-apps-changed(value); }
+            run => { root.ow-pick(); }
+            browse => { root.ow-pick-browse(); }
+            cancelled => { root.ow-picker-open = false; }
         }
 
         // ===== Promotion toast after the native dialog (Windows) =====
@@ -4349,7 +4426,7 @@ export component MainWindow inherits Window {
             x: Flyout.pinned-x(root.tab-menu-x, self.width, root.width);
             y: Flyout.pinned-y(root.tab-menu-y, self.height, root.height);
             width: 260px;
-            height: 122px;
+            height: root.tab-menu-selection-count > 1 ? 60px : 148px;
             background: Theme.background;
             border-radius: Tokens.radius-overlay;
             border-width: 1px;
@@ -4360,18 +4437,21 @@ export component MainWindow inherits Window {
             TouchArea { }
             VerticalLayout {
                 padding: 4px;
-                MenuItem {
+                if root.tab-menu-selection-count <= 1 : MenuItem {
+                    nav-level: 1;
                     label: Strings.tab-duplicate;
                     clicked => {
                         root.tab-menu-open = false;
                         root.duplicate-tab(root.tab-menu-panel, root.tab-menu-tab);
                     }
                 }
-                SubmenuRow {
+                if root.tab-menu-selection-count <= 1 : SubmenuRow {
+                    nav-level: 1;
                     label: Strings.ctx-mark;
                     open: root.mark-menu-open && root.mark-target-kind == 1;
                     flyout-hover: root.mark-flyout-hover;
                     show(at) => {
+                        root.group-choices-open = false;
                         root.mark-target-kind = 1;
                         root.mark-current-color = root.tab-menu-folder-slot;
                         root.mark-menu-at = at;
@@ -4379,7 +4459,8 @@ export component MainWindow inherits Window {
                     }
                     hovered(h) => { root.mark-parent-hover = h; }
                 }
-                MenuItem {
+                if root.tab-menu-selection-count <= 1 : MenuItem {
+                    nav-level: 1;
                     label: Strings.fav-save-tab;
                     clicked => {
                         root.tab-menu-open = false;
@@ -4388,13 +4469,130 @@ export component MainWindow inherits Window {
                 }
                 MenuItem {
                     label: Strings.fav-save-all-tabs;
+                    nav-level: 1;
                     clicked => {
                         root.tab-menu-open = false;
                         root.fav-save-all-tabs(root.tab-menu-panel);
                     }
                 }
+                SubmenuRow {
+                    label: Strings.tab-group-menu;
+                    nav-level: 1;
+                    open: root.group-choices-open;
+                    flyout-hover: root.group-flyout-hover;
+                    hovered(h) => { root.group-parent-hover = h; }
+                    show(at) => {
+                        root.mark-menu-open = false;
+                        root.group-choices-at = at;
+                        root.group-choices-open = true;
+                    }
+                }
                 // The tab bar's position is set from its dedicated
                 // button in the navigation bar.
+            }
+        }
+
+        FlyoutCloseTimer {
+            open <=> root.group-choices-open;
+            parent-hover: root.group-parent-hover;
+            flyout-hover: root.group-flyout-hover;
+        }
+        if root.group-choices-open : Rectangle {
+            x: Flyout.cascade-x(root.group-choices-at, self.width, root.width);
+            y: Flyout.cascade-y(root.group-choices-at, self.height, root.height);
+            width: 280px;
+            height: min(root.height - 16px, 8px + 26px * (1 + root.group-choices.length
+                + (root.group-can-remove ? 1 : 0)));
+            background: Theme.background;
+            border-width: 1px; border-color: Theme.border; border-radius: Tokens.radius-overlay;
+            // Include the scroll viewport and its rows in hover tracking, so
+            // the close timer cannot dismiss the flyout beneath the pointer.
+            TouchArea {
+                changed has-hover => { root.group-flyout-hover = self.has-hover; }
+                ScrollView {
+                    x: 4px; y: 4px; width: parent.width - 8px; height: parent.height - 8px;
+                    content-width: self.width;
+                    horizontal-scrollbar-policy: always-off;
+                    property <length> selected-y: CtxNav.sub-y;
+                    changed selected-y => {
+                        if (CtxNav.keyboard-holds) {
+                            self.content-y = clamp(self.content-y,
+                                -max(0px, self.selected-y), min(0px, self.height - self.selected-y - 26px));
+                        }
+                    }
+                    VerticalLayout {
+                        spacing: 0px;
+                        MenuItem {
+                            nav-level: 2; label: Strings.tab-group-new;
+                            clicked => { root.close-ctx-menus(); root.group-command(0, ""); }
+                        }
+                        for group in root.group-choices : MenuItem {
+                            nav-level: 2; label: group.name; color-slot: group.slot; checked: group.checked;
+                            elide-label: true;
+                            clicked => { root.close-ctx-menus(); root.group-command(1, group.id); }
+                        }
+                        if root.group-can-remove : MenuItem {
+                            nav-level: 2; label: Strings.tab-group-remove;
+                            clicked => { root.close-ctx-menus(); root.group-command(2, ""); }
+                        }
+                    }
+                }
+            }
+        }
+        if root.group-menu-open : Rectangle {
+            x: Flyout.pinned-x(root.group-menu-x, self.width, root.width);
+            y: Flyout.pinned-y(root.group-menu-y, self.height, root.height);
+            // 4+4 padding, four 2px gaps, three 26px entries, the 30px swatch
+            // row and the 26px destructive entry.
+            width: 280px; height: 150px;
+            background: Theme.background;
+            border-width: 1px; border-color: Theme.border; border-radius: Tokens.radius-overlay;
+            TouchArea { }
+            VerticalLayout {
+                padding: 4px; spacing: 2px;
+                MenuItem { nav-level: 1; label: Strings.tab-group-edit;
+                    clicked => { root.close-ctx-menus(); root.group-command(3, ""); } }
+                FolderSwatchRow {
+                    current: root.group-current-color; neutral-color: Theme.foreground;
+                    picked(slot) => { root.group-color(slot); }
+                }
+                MenuItem { nav-level: 1; label: Strings.tab-group-select;
+                    clicked => { root.close-ctx-menus(); root.group-command(5, ""); } }
+                MenuItem { nav-level: 1; label: Strings.tab-group-dissolve;
+                    clicked => { root.close-ctx-menus(); root.group-command(6, ""); } }
+                MenuItem {
+                    nav-level: 1;
+                    destructive: true;
+                    confirming: root.group-menu-confirm-delete;
+                    label: root.group-menu-confirm-delete
+                        ? Strings.tab-group-delete-confirm : Strings.tab-group-delete;
+                    clicked => {
+                        if (root.group-menu-confirm-delete) {
+                            root.close-ctx-menus();
+                            root.group-command(7, "");
+                        } else {
+                            root.group-menu-confirm-delete = true;
+                        }
+                    }
+                }
+            }
+        }
+        if root.group-editor-open : ModalBackdrop { }
+        if root.group-editor-open : TabGroupEditor {
+            width: min(420px, root.width - 24px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            creating: root.group-editor-creating;
+            blocked: root.exit-warning-open;
+            name <=> root.group-editor-name;
+            color-slot <=> root.group-editor-color;
+            error <=> root.group-editor-error;
+            cancel => { root.group-editor-open = false; key-scope.focus(); }
+            submit => {
+                if (root.group-editor-submit(root.group-editor-name, root.group-editor-color)) {
+                    root.group-editor-open = false;
+                    key-scope.focus();
+                }
             }
         }
 
@@ -4895,9 +5093,7 @@ export component MainWindow inherits Window {
                 Rectangle {
                     height: 30px;
                     border-radius: 4px;
-                    opacity: root.panels[root.columns-menu-panel].manual-order ? 0.42 : 1.0;
-                    background: xfitem.has-hover && !root.panels[root.columns-menu-panel].manual-order
-                        ? Theme.alternate-background : transparent;
+                    background: xfitem.has-hover ? Theme.alternate-background : transparent;
                     HorizontalLayout {
                         padding-left: 8px;
                         padding-right: 10px;
@@ -4934,14 +5130,14 @@ export component MainWindow inherits Window {
                         }
                     }
                     xfitem := TouchArea {
-                        enabled: !root.panels[root.columns-menu-panel].manual-order;
-                        mouse-cursor: root.panels[root.columns-menu-panel].manual-order ? default : pointer;
+                        mouse-cursor: pointer;
                         clicked => {
                             root.filter-take-keyboard = true;
                             root.ext-filter-toggle(root.columns-menu-panel);
                             root.columns-menu-open = false;
-                            // Immediate keyboard focus → direct input with no click,
-                            // like the type-ahead filter (no caret).
+                            // The menu is going away, so the keyboard cannot be
+                            // left on it. The bar's own field claims it a moment
+                            // later, which is what puts a caret in there.
                             key-scope.focus();
                         }
                     }
@@ -6904,12 +7100,7 @@ export component MainWindow inherits Window {
                         }
 
                         // ===== Detected Windows entries (shell extensions) =====
-                        // Dedicated sub-tab. List built at LAUNCH
-                        // (completed as right-clicks happen); unchecking hides
-                        // the entry from the context menu.
-                        // Global toggle for the Windows context menu —
-                        // moved here from the General tab: everything
-                        // related to shell extensions lives in this sub-tab.
+                        // Shell integrations share one card and the existing master switch.
                         if root.platform-windows && root.ow-subtab == 1 : Rectangle {
                             background: Theme.alternate-background.with-alpha(0.5);
                             border-radius: 8px;
@@ -6917,6 +7108,7 @@ export component MainWindow inherits Window {
                             border-color: Theme.border;
                             VerticalLayout {
                                 padding: 12px;
+                                spacing: 10px;
                                 HorizontalLayout {
                                     spacing: 12px;
                                     VerticalLayout {
@@ -6938,6 +7130,33 @@ export component MainWindow inherits Window {
                                     CheckBox {
                                         checked <=> root.shell-menu-enabled;
                                         toggled => { root.shell-menu-changed(self.checked); }
+                                    }
+                                }
+                                Rectangle { height: 1px; background: Theme.border; }
+                                HorizontalLayout {
+                                    spacing: 12px;
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        spacing: 3px;
+                                        Text {
+                                            text: Strings.settings-registered-types-label;
+                                            font-size: 13px;
+                                            font-weight: 600;
+                                            color: Theme.foreground;
+                                            wrap: word-wrap;
+                                        }
+                                        Text {
+                                            text: Strings.settings-registered-types-hint;
+                                            font-size: 11px;
+                                            color: Theme.foreground.with-alpha(0.55);
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                    CheckBox {
+                                        enabled: root.shell-menu-enabled;
+                                        accessible-label: Strings.settings-registered-types-label;
+                                        checked <=> root.registered-types-enabled;
+                                        toggled => { root.registered-types-changed(self.checked); }
                                     }
                                 }
                             }
@@ -7838,6 +8057,9 @@ export component MainWindow inherits Window {
                 armed <=> root.comment-focus-armed;
                 blocked: root.exit-warning-open;
                 apply-focus => {
+                    // The editor can be instantiated before the popup opens, so
+                    // load the current note when the popup actually takes focus.
+                    comment-edit.text = root.comment-text;
                     comment-edit.focus();
                     // Whole text selected: reopening the editor on an existing
                     // note is most often about replacing it.
@@ -7860,15 +8082,8 @@ export component MainWindow inherits Window {
                     font-size: 12px;
                     overflow: elide;
                 }
-                // The note is copied in on every opening. Conditional elements
-                // are instantiated eagerly, so initialization cannot represent
-                // the popup's open transition.
                 comment-edit := EditLineEdit {
                     placeholder-text: Strings.comment-placeholder;
-                    property <bool> open-watch: root.comment-popup-open;
-                    changed open-watch => {
-                        if (self.open-watch) { self.text = root.comment-text; }
-                    }
                     accepted(t) => {
                         root.comment-confirmed(t);
                         root.comment-popup-open = false;
@@ -7909,6 +8124,16 @@ export component MainWindow inherits Window {
             }
         }
 
+        if root.bulk-open : ModalBackdrop { }
+        if root.bulk-open : BulkRenameDialog {
+            open: root.bulk-open;
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            width: min(840px, parent.width - 24px); height: min(760px, parent.height - 24px);
+            rows: root.bulk-rows; summary: root.bulk-summary;
+            ready: root.bulk-ready; running: root.bulk-running; finished: root.bulk-finished;
+            blocked: root.exit-warning-open;
+            edited => { root.bulk-edited(); } submit => { root.bulk-submit(); } cancel => { root.bulk-cancel(); }
+        }
         if root.rename-popup-open : ModalBackdrop { }
         if root.rename-popup-open : Rectangle {
             x: (parent.width - self.width) / 2;
@@ -8070,7 +8295,7 @@ export component MainWindow inherits Window {
                 Text {
                     text: root.create-kind == 0
                         ? Strings.ctx-new-folder
-                        : (root.create-kind == 1 ? Strings.ctx-new-file
+                        : (root.create-kind == 1 || root.create-kind == 4 ? Strings.ctx-new-file
                             : (root.create-kind == 2 ? Strings.ctx-new-shortcut
                                 : Strings.ctx-create-link));
                     font-size: 16px;
@@ -8090,7 +8315,7 @@ export component MainWindow inherits Window {
                         }
                     }
                 }
-                if root.create-kind == 0 || root.create-kind == 1 : Text {
+                if root.create-kind == 0 || root.create-kind == 1 || root.create-kind == 4 : Text {
                     text: root.create-name-error == "" ? " " : root.create-name-error;
                     color: Tokens.danger;
                     font-size: 12px;
@@ -8741,8 +8966,12 @@ export component MainWindow inherits Window {
         // below. Each card runs its own auto-dismiss countdown.
         for op[i] in root.ops : ProgressToast {
             visible: i < 3;
+            stack-height: parent.height;
+            width: min(360px, parent.width - 32px);
             x: parent.width - self.width - 16px;
-            y: parent.height - 16px - (i + 1) * 88px - i * 8px;
+            y: parent.height - 16px - self.height - i * 8px
+                - (i > 0 ? ProgressToastLayout.card-height(root.ops[0].state, root.ops[0].detail != "", parent.height) : 0px)
+                - (i > 1 ? ProgressToastLayout.card-height(root.ops[1].state, root.ops[1].detail != "", parent.height) : 0px);
             op-state: op.state;
             progress: op.progress;
             indeterminate: op.indeterminate;
@@ -8756,8 +8985,11 @@ export component MainWindow inherits Window {
         // Sits one slot above the third card, on the same right edge.
         if root.ops.length > 3 : Rectangle {
             x: parent.width - self.width - 16px;
-            y: parent.height - 16px - 3 * 88px - 3 * 8px - 32px;
-            width: 360px;
+            y: parent.height - 16px - 3 * 8px - 32px
+                - ProgressToastLayout.card-height(root.ops[0].state, root.ops[0].detail != "", parent.height)
+                - ProgressToastLayout.card-height(root.ops[1].state, root.ops[1].detail != "", parent.height)
+                - ProgressToastLayout.card-height(root.ops[2].state, root.ops[2].detail != "", parent.height);
+            width: min(360px, parent.width - 32px);
             height: 32px;
             background: Theme.background;
             border-radius: Tokens.radius-overlay;
@@ -8872,15 +9104,19 @@ export component MainWindow inherits Window {
                 // Invalid destinations hide the action label.
                 // Favorites always retain their action label.
                 if drag-pill.over-fav || !drag-pill.will-cancel : Text {
-                    text: drag-pill.over-fav
+                    property <string> action-label: drag-pill.over-fav
                         ? Strings.drop-favorite
                         : (drag-pill.manual-reorder
                             ? Strings.manual-order-drag
                             : (drag-pill.exec-drop
                             ? Strings.drag-open-with
                             : (root.folder-open-drag-active
-                                ? (drag-pill.split-drop ? Strings.drop-split : Strings.ctx-open-new-tab)
+                                ? (root.drag-target-group != "" ? Strings.tab-drag-join + " “" + root.drag-target-group-name + "”"
+                                    : (drag-pill.split-drop ? Strings.drop-split : Strings.ctx-open-new-tab))
                                 : (root.file-drag-action == 1 ? Strings.drop-copy : Strings.drop-move))));
+                    text: self.action-label + (root.drag-active && root.tab-drag-count > 1 ? " (" + root.tab-drag-count + ")" : "");
+                    max-width: 300px;
+                    overflow: elide;
                     font-size: 11px;
                     color: Theme.accent-foreground;
                     vertical-alignment: center;
@@ -8889,12 +9125,16 @@ export component MainWindow inherits Window {
         }
 
         // Layout feedback shared by whole views, tabs and sidebar directories.
-        // Tab insertion gaps keep their own preview without an extra pill.
-        if root.view-drag-active || root.panel-layout-drop : layout-drop-pill := Rectangle {
+        // Group destinations and batches add a compact label to the insertion preview.
+        if root.view-drag-active || root.panel-layout-drop || root.tab-drag-outside || root.tab-drag-no-target
+            || (root.drag-active && root.tab-drag-external-blocked)
+            || (root.tab-gap-drop && (root.drag-target-group != "" || (root.drag-active && root.tab-drag-count > 1))) : layout-drop-pill := Rectangle {
             property <bool> whole-view: root.view-drag-active;
-            property <bool> outside: self.whole-view && root.view-drag-outside;
-            property <bool> accepted: self.whole-view ? root.view-drag-target >= 0 : root.panel-layout-drop;
-            property <int> zone: self.whole-view ? root.view-drag-target-zone : root.drag-target-zone;
+            property <bool> blocked: root.drag-active && (root.tab-drag-external-blocked
+                || (root.tab-drag-outside && !root.tab-drag-can-detach));
+            property <bool> outside: !self.blocked && (self.whole-view ? root.view-drag-outside : root.tab-drag-outside);
+            property <bool> accepted: !self.blocked && (self.whole-view ? root.view-drag-target >= 0 : root.panel-layout-drop || root.tab-gap-drop);
+            property <int> zone: self.whole-view ? root.view-drag-target-zone : root.tab-gap-drop ? 1 : root.drag-target-zone;
             x: (self.whole-view ? root.view-drag-abs-x : root.drag-abs-x) + 14px;
             y: (self.whole-view ? root.view-drag-abs-y : root.drag-abs-y) + 12px;
             width: layout-drop-pill-row.preferred-width + 18px;
@@ -8939,11 +9179,15 @@ export component MainWindow inherits Window {
                 // Nothing under the cursor → the icon alone and the pill
                 // shrinks to a dot, the same abbreviation the file pill uses.
                 if layout-drop-pill.accepted || layout-drop-pill.outside : Text {
-                    text: layout-drop-pill.outside
+                    text: (layout-drop-pill.outside
                         ? Strings.drop-detach
+                        : (root.tab-gap-drop && root.drag-target-group != "" ? Strings.tab-drag-join + " “" + root.drag-target-group-name + "”"
                         : (layout-drop-pill.zone != 1 ? Strings.drop-split
                             : (layout-drop-pill.whole-view ? Strings.drop-swap
-                                : (root.drag-active ? Strings.drop-move : Strings.ctx-open-new-tab)));
+                                : (root.drag-active ? Strings.drop-move : Strings.ctx-open-new-tab)))))
+                        + (root.drag-active && root.tab-drag-count > 1 ? " (" + root.tab-drag-count + ")" : "");
+                    max-width: 300px;
+                    overflow: elide;
                     font-size: 11px;
                     color: Theme.accent-foreground;
                     vertical-alignment: center;

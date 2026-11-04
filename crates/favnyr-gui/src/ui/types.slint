@@ -5,16 +5,51 @@
 
 // Represents a tab in a panel's tab bar.
 // `width` and `offset` are computed by the bridge from the title, with a
-// width clamped to 90-180 px. Rendering and drop logic thus share
-// a geometry independent of the reactive layout.
+// width clamped to 90-180 px for a tab and 76-180 px for a group header.
+// Rendering and drop logic thus share a geometry independent of the reactive
+// layout.
 export struct TabInfo {
+    index: int,
+    group-id: string,
+    is-group: bool,
+    group-slot: int,
+    grouped: bool,
+    // Last visible entry of its group, which closes the attachment rail. A
+    // collapsed group whose only visible entry is its header carries both ends.
+    rail-tail: bool,
+    count: int,
+    collapsed: bool,
+    // Transient group target, independent of the active folder and keyboard focus.
+    group-highlighted: bool,
+    selection-marked: bool,
     title: string,
     folder-slot: int,       // shared path annotation, 0 = unmarked
     width: length,
     offset: length,
+    // Boundary gaps carved out of `width` along the bar axis, at a group's two
+    // ends. They set the group apart from its neighbours, which are only one
+    // pitch away, so the run of entries reads as a single block.
+    pad-lead: length,
+    pad-trail: length,
     // Full path shown in the tooltip on hover.
     path: string,
 }
+
+export struct TabBarState {
+    // No file tab is active while a group page is displayed.
+    active: int,
+    count: int,
+    revision: int,
+    group-page: bool,
+    // Logical anchor used to reveal a group's header in any bar orientation.
+    group-index: int,
+    group-name: string,
+    group-collapsed: bool,
+}
+
+export struct TabDropGap { index: int, position: length, group-id: string, group-name: string }
+
+export struct TabGroupChoice { id: string, name: string, slot: int, checked: bool }
 
 // A breadcrumb segment. `label` is the displayed name,
 // `path` the absolute path to navigate to on click.
@@ -208,6 +243,7 @@ export struct FileRow {
     is-dir: bool,
     drop-runnable: bool,
     is-symlink: bool,   // symbolic link / junction → marked ("folder + arrow" icon)
+    content-remote: bool, // content is known to require a remote recall
     is-share: bool,     // root of a network share → "folder + network" icon
     // Colour slot assigned to a folder, 0 = the default gold.
     folder-slot: int,
@@ -232,9 +268,8 @@ export struct FileRow {
     // `.lnk` shortcut pointing to a FOLDER → "folder + arrow" icon
     // (folder-symlink.svg), like a folder symbolic link.
     link-folder: bool,
-    // The type can produce a real content thumbnail (image/video/PDF,
-    // SVG included). Stable even before the worker finishes: the height doesn't
-    // jump when the texture arrives.
+    // Reserve preview space for a supported reader or a confirmed native
+    // thumbnail. Optional providers can still be tried without enlarging icons.
     preview-capable: bool,
     // Vertical geometry precomputed by the bridge. It is the shared
     // source for rendering, hit-testing, keyboard scrolling, and rubber-band selection.
@@ -320,7 +355,6 @@ export struct PanelView {
     secondary-sort-column: string,
     secondary-sort-asc: bool,
     group-dates-by-day: bool,
-    active-tab-idx: int,
     title: string,                  // e.g.: "Panel 1 · Documents"
     crumbs: [Crumb],                // clickable breadcrumb trail
     // Column widths SPECIFIC to this panel (each view is independent).
@@ -366,7 +400,7 @@ export struct PanelView {
     search-recursive: bool,
     search-query: string,
     // Tab bar position for the view: 0 = horizontal at the
-    // top · 1 = vertical on the left · 2 = vertical on the right.
+    // top, 1 = vertical on the left, 2 = vertical on the right, 3 = hidden.
     tab-bar-mode: int,
     // USER-set width of the vertical bar (0 = automatic).
     vbar-user-w: length,

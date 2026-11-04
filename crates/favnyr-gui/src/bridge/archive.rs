@@ -4,7 +4,7 @@
 use super::*;
 use crate::archives::{self, Action, Format, Job, Kind, Outcome, Output, TarCompression};
 
-type Delivery = (i32, Job, Outcome, bool);
+type Delivery = (i32, Job, Outcome, bool, String);
 
 #[derive(Default)]
 pub(super) struct State {
@@ -46,7 +46,7 @@ impl State {
             .unwrap_or_else(|p| p.into_inner())
             .drain(..)
             .collect();
-        for (id, _, outcome, _) in deliveries {
+        for (id, _, outcome, _, _) in deliveries {
             drop(outcome);
             self.running.set(false);
             finished.push(id);
@@ -284,17 +284,56 @@ fn start(window: &MainWindow, state: &AppState, job: Job, password: String) {
                     );
                 }
             });
+            let failure_detail = if let Outcome::Failed(failure) = &outcome {
+                failure_notice(&job, failure, lang)
+            } else {
+                String::new()
+            };
             deliveries
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .push_back((id, job, outcome, !password.is_empty()));
+                .push_back((id, job, outcome, !password.is_empty(), failure_detail));
         })
         .map_err(|err| {
             state.archive.running.set(false);
             window.invoke_op_finished(id);
             error!(error = %err, "cannot start archive worker");
-            notice(window, i18n::tr(lang, "archive_failed"), NoticeKind::Error);
+            let detail = i18n::tr(lang, "archive_failed");
+            window.invoke_op_progress(terminal_op_progress(
+                id,
+                OP_ERROR,
+                i18n::tr(lang, "op_errors"),
+                detail.clone(),
+            ));
+            notice(window, detail, NoticeKind::Error);
         });
+}
+
+/// Called on the archive worker: lock diagnosis must not block the UI.
+fn failure_notice(job: &Job, failure: &archives::Failure, lang: Lang) -> String {
+    if let Some(path) = &failure.path {
+        if matches!(job.kind, Kind::Compress { .. })
+            && job
+                .inputs
+                .iter()
+                .any(|input| path == input || path.starts_with(input))
+            && let Some(message) = locked_item_notice(path, lang)
+        {
+            return message;
+        }
+        return i18n::file_operation_failed(
+            lang,
+            "archive_item_failed",
+            &path.display().to_string(),
+            &i18n::file_error_reason(lang, failure.kind),
+        );
+    }
+    let mut message = i18n::tr(lang, "archive_failed");
+    if failure.kind.is_some() {
+        message.push('\n');
+        message.push_str(&i18n::file_error_reason(lang, failure.kind));
+    }
+    message
 }
 
 fn poll(window: &MainWindow, state: &AppState) {
@@ -311,7 +350,7 @@ fn poll(window: &MainWindow, state: &AppState) {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .pop_front();
-        if let Some((id, job, outcome, tried_password)) = delivery {
+        if let Some((id, job, outcome, tried_password, failure_detail)) = delivery {
             archive.running.set(false);
             let cancelled = state
                 .ops
@@ -338,11 +377,15 @@ fn poll(window: &MainWindow, state: &AppState) {
                         Outcome::PasswordRequired => {
                             show_prompt(window, state, job, tried_password)
                         }
-                        Outcome::Failed => notice(
-                            window,
-                            i18n::tr(state.config.borrow().language, "archive_failed"),
-                            NoticeKind::Error,
-                        ),
+                        Outcome::Failed(_) => {
+                            window.invoke_op_progress(terminal_op_progress(
+                                id,
+                                OP_ERROR,
+                                i18n::tr(state.config.borrow().language, "op_errors"),
+                                failure_detail.clone(),
+                            ));
+                            notice(window, failure_detail, NoticeKind::Error);
+                        }
                         Outcome::Cancelled => push_op(
                             &window.as_weak(),
                             id,
@@ -427,11 +470,13 @@ mod tests {
         assert!(state.queued.borrow().is_empty());
         assert!(state.prompt.borrow().is_none());
         assert!(state.pending());
-        state
-            .deliveries
-            .lock()
-            .unwrap()
-            .push_back((7, job(), Outcome::PasswordRequired, false));
+        state.deliveries.lock().unwrap().push_back((
+            7,
+            job(),
+            Outcome::PasswordRequired,
+            false,
+            String::new(),
+        ));
         assert_eq!(state.discard_pending(), vec![7]);
         assert!(!state.pending());
         assert!(state.prompt.borrow().is_none());

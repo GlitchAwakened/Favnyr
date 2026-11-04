@@ -31,12 +31,21 @@
 //! integration. All native access goes through the `windows` crate.
 
 #[cfg(windows)]
+mod documents;
+#[cfg(windows)]
+pub use documents::{
+    DocumentChoice, DocumentMenuSession, DocumentTemplate, build_for_folder, discover_documents,
+};
+#[cfg(windows)]
+pub(crate) use imp::ShellEntry;
+
+#[cfg(windows)]
 mod imp {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
-    use anyhow::{Result, anyhow};
+    use anyhow::Result;
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree};
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
@@ -58,10 +67,12 @@ mod imp {
     use crate::winutil::wide;
 
     /// Range of ids reserved for menu entries (offsets 0..=ID_LAST-ID_FIRST).
-    const ID_FIRST: u32 = 1;
-    const ID_LAST: u32 = 0x7FFF;
+    pub(super) const ID_FIRST: u32 = 1;
+    pub(super) const ID_LAST: u32 = 0x7FFF;
     /// Cap on re-rendered entries (chatty extensions get truncated).
     const MAX_ENTRIES: usize = 24;
+    /// Document types live in a scrolling submenu rather than the main menu.
+    const MAX_DOCUMENT_ENTRIES: usize = 512;
     /// Max depth of flattened submenus (archiver and version control cascades = 1 level).
     const MAX_DEPTH: u8 = 1;
 
@@ -188,12 +199,12 @@ mod imp {
 
     /// Session kept alive between the menu's OPENING and its INVOCATION: the
     /// ids are only valid for THIS `IContextMenu`, and the `HMENU` must
-    /// outlive it. UI-thread only (COM STA) — carried by an `Rc<RefCell<…>>`.
+    /// outlive it. Keep the session on its creating COM STA thread.
     pub struct ShellMenuSession {
-        icm: IContextMenu,
-        hmenu: HMENU,
+        pub(super) icm: IContextMenu,
+        pub(super) hmenu: HMENU,
         /// Working directory (wide, NUL-terminated) passed to `InvokeCommand`.
-        dir: Vec<u16>,
+        pub(super) dir: Vec<u16>,
     }
 
     impl Drop for ShellMenuSession {
@@ -272,11 +283,35 @@ mod imp {
         icm: &IContextMenu,
         icm2: &Option<IContextMenu2>,
     ) -> Vec<ShellEntry> {
+        unsafe { walk_menu(hmenu, depth, icm, icm2, false) }
+    }
+
+    pub(super) unsafe fn walk_documents(
+        hmenu: HMENU,
+        icm: &IContextMenu,
+        icm2: &Option<IContextMenu2>,
+    ) -> Vec<ShellEntry> {
+        unsafe { walk_menu(hmenu, 0, icm, icm2, true) }
+    }
+
+    unsafe fn walk_menu(
+        hmenu: HMENU,
+        depth: u8,
+        icm: &IContextMenu,
+        icm2: &Option<IContextMenu2>,
+        documents: bool,
+    ) -> Vec<ShellEntry> {
         unsafe {
             let mut out = Vec::new();
             let count = GetMenuItemCount(Some(hmenu));
             for i in 0..count.max(0) as u32 {
-                if out.len() >= MAX_ENTRIES {
+                if out.len()
+                    >= if documents {
+                        MAX_DOCUMENT_ENTRIES
+                    } else {
+                        MAX_ENTRIES
+                    }
+                {
                     break;
                 }
                 let mut buf = [0u16; 260];
@@ -317,14 +352,14 @@ mod imp {
                     .replace('\u{1}', "&");
                 // Discarded by LABEL — applies to both leaves AND cascades (e.g.
                 // the "Open with" cascade, which the verb filter can't see).
-                if label_blocklisted(&label) {
+                if !documents && label_blocklisted(&label) {
                     continue;
                 }
                 let icon = stable_menu_icon(&label, menu_item_bitmap_rgba(&mii));
                 if !mii.hSubMenu.is_invalid() {
                     // Cascade (e.g. an archiver's submenu): filled ON THE FLY by the
                     // extension on WM_INITMENUPOPUP → simulated via HandleMenuMsg.
-                    if depth >= MAX_DEPTH {
+                    if documents || depth >= MAX_DEPTH {
                         continue;
                     }
                     if let Some(icm2) = icm2 {
@@ -349,7 +384,12 @@ mod imp {
                         continue;
                     }
                     let offset = mii.wID - ID_FIRST;
-                    if VERB_BLOCKLIST.contains(&canonical_verb(icm, offset).as_str()) {
+                    let verb = canonical_verb(icm, offset);
+                    if if documents {
+                        matches!(verb.as_str(), "newfolder" | "newlink" | "link")
+                    } else {
+                        VERB_BLOCKLIST.contains(&verb.as_str())
+                    } {
                         continue;
                     }
                     out.push(ShellEntry {
@@ -432,7 +472,7 @@ mod imp {
 
     /// A command's canonical verb (lowercase), or "" if the extension doesn't
     /// expose one (common for COM entries — which we precisely want to keep).
-    unsafe fn canonical_verb(icm: &IContextMenu, offset: u32) -> String {
+    pub(super) unsafe fn canonical_verb(icm: &IContextMenu, offset: u32) -> String {
         unsafe {
             let mut buf = [0u16; 128];
             if icm
@@ -473,7 +513,10 @@ mod imp {
             session
                 .icm
                 .InvokeCommand(&info as *const CMINVOKECOMMANDINFOEX as *const CMINVOKECOMMANDINFO)
-                .map_err(|e| anyhow!("InvokeCommand({offset}): {e}"))
+                .map_err(|error| {
+                    let message = format!("InvokeCommand({offset}): {error}");
+                    anyhow::Error::new(error).context(message)
+                })
         }
     }
 

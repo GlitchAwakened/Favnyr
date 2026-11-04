@@ -229,8 +229,8 @@ pub struct Config {
     #[serde(default)]
     pub view_item_spacing: i32,
     /// DEFAULT tab bar position for views created "from
-    /// scratch" (new workspace, reset): 0 = top · 1 = left · 2 =
-    /// right. Existing views keep their PER-VIEW setting (workspace);
+    /// scratch" (new workspace, reset): 0 = top, 1 = left, 2 =
+    /// right, 3 = hidden. Existing views keep their per-view setting (workspace);
     /// a split inherits from the view it split off, not this default.
     #[serde(default)]
     pub default_tab_bar_mode: u8,
@@ -287,6 +287,9 @@ pub struct Config {
     /// slow or unstable third-party extension, since they run in-process.
     #[serde(default = "default_true")]
     pub shell_ctx_menu: bool,
+    /// Shows registered Windows document types in the New menu.
+    #[serde(default = "default_true")]
+    pub registered_file_types: bool,
     /// Windows context-menu entries HIDDEN by the user,
     /// identified by their top-level LABEL (stable per machine/OS
     /// language). Checked/unchecked in Settings › Open with.
@@ -372,6 +375,7 @@ impl Default for Config {
             compact_icon_rows_in_preview: true,
             clock_utc: false,
             shell_ctx_menu: true,
+            registered_file_types: true,
             shell_menu_disabled: Vec::new(),
             ffmpeg_hint_shown: false,
             ui_scale: default_ui_scale(),
@@ -596,6 +600,20 @@ mod tests {
         let restored: Config = toml::from_str(&toml::to_string(&on).unwrap()).unwrap();
         assert!(restored.default_show_hidden);
         assert!(!Config::default().default_show_hidden);
+    }
+
+    #[test]
+    fn registered_file_types_default_on_and_preserve_an_explicit_opt_out() {
+        let old: Config = toml::from_str("").unwrap();
+        assert!(old.registered_file_types);
+        assert!(Config::default().registered_file_types);
+        let off: Config = toml::from_str("registered_file_types = false").unwrap();
+        let restored: Config = toml::from_str(&toml::to_string(&off).unwrap()).unwrap();
+        assert!(!restored.registered_file_types);
+        assert!(restored.shell_ctx_menu);
+        let master_off: Config = toml::from_str("shell_ctx_menu = false").unwrap();
+        assert!(!master_off.shell_ctx_menu);
+        assert!(master_off.registered_file_types);
     }
 
     #[test]

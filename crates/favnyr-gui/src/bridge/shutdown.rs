@@ -32,7 +32,8 @@ pub(super) fn stopping(state: &AppState) -> bool {
 }
 
 pub(super) fn pending(state: &AppState) -> bool {
-    state.ops.in_flight()
+    tabs::ipc::pending(state)
+        || state.ops.in_flight()
         || state.paste_job.borrow().is_some()
         || archive::pending(state)
         || crate::background_work::in_flight()
@@ -69,6 +70,7 @@ fn stay(window: &MainWindow, state: &AppState) {
 }
 
 fn cancel_pending(window: &MainWindow, state: &AppState) {
+    tabs::ipc::cancel(window, state);
     state.ops.cancel_all();
     state.paste_job.borrow_mut().take();
     state.pending_file_drop.borrow_mut().take();

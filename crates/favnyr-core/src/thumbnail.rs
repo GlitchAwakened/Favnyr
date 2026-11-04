@@ -29,7 +29,7 @@ mod test_support;
 
 pub use audio::from_audio;
 pub use decode::from_encoded;
-pub use images::{from_image, image_meta};
+pub use images::{from_image, image_meta, is_image_preview_extension};
 pub use pdf::from_pdf;
 pub use tools::SEVEN_ZIP_PROGRAMS;
 pub use video::from_video;

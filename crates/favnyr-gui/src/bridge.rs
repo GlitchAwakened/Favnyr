@@ -65,26 +65,29 @@ use crate::{
 /// Minimum ratio for one side of a split (guards against degenerate panels).
 const MIN_SPLIT_RATIO: f32 = 0.08;
 
+mod ambiguous;
+mod app_picker;
 mod archive;
+mod bulk_rename;
 mod folder_stats;
 mod item_geometry;
 mod properties;
 mod recovery;
+#[cfg(windows)]
+mod registered_documents;
 mod search;
 mod shutdown;
+mod tabs;
+#[cfg(test)]
+mod thumbnail_tests;
+
+use crate::{TabBarState, TabDropGap, TabGroupChoice};
+use favnyr_core::reorder;
+use tabs::projection::vbar_width;
+use tabs::{Tab, TabBook, TabDisplayDefaults, tab_from_state, tab_to_state};
 
 use folder_stats::{Job as FolderStatsJob, request_folder_stats};
 use item_geometry::{GridLayout, ItemAnchor, ItemBand, ItemBands};
-
-/// Context remembered for the "Open with" picker between enumeration
-/// (opening) and the user's choice.
-struct OwPickCtx {
-    ext: String,
-    path: PathBuf,
-    handlers: Vec<openwith::AppHandler>,
-    /// Cached rows keep icon extraction out of the typing path.
-    items: Vec<OpenerItem>,
-}
 
 // ---------- Internal clipboard ----------
 
@@ -192,64 +195,6 @@ struct ManualOrderInsertion {
     fallback_gap: usize,
 }
 
-// ---------- Navigation history ----------
-
-#[derive(Debug, Default)]
-struct NavHistory {
-    stack: Vec<PathBuf>,
-    cursor: usize,
-}
-
-impl NavHistory {
-    fn current(&self) -> Option<&Path> {
-        self.stack.get(self.cursor).map(|p| p.as_path())
-    }
-
-    /// Pushes a new path, truncating any "forward" entries.
-    fn push(&mut self, path: PathBuf) {
-        if self.current().map(|c| c == path).unwrap_or(false) {
-            return;
-        }
-        if !self.stack.is_empty() {
-            self.stack.truncate(self.cursor + 1);
-        }
-        self.stack.push(path);
-        self.cursor = self.stack.len() - 1;
-    }
-
-    fn can_back(&self) -> bool {
-        self.cursor > 0
-    }
-    fn can_forward(&self) -> bool {
-        self.cursor + 1 < self.stack.len()
-    }
-    fn back(&mut self) -> Option<PathBuf> {
-        if !self.can_back() {
-            return None;
-        }
-        self.cursor -= 1;
-        Some(self.stack[self.cursor].clone())
-    }
-    fn forward(&mut self) -> Option<PathBuf> {
-        if !self.can_forward() {
-            return None;
-        }
-        self.cursor += 1;
-        Some(self.stack[self.cursor].clone())
-    }
-
-    fn relocate(&mut self, from: &Path, to: &Path) -> bool {
-        let mut changed = false;
-        for path in &mut self.stack {
-            if let Some(relocated) = ops::relocated_path(path, from, to) {
-                *path = relocated;
-                changed = true;
-            }
-        }
-        changed
-    }
-}
-
 // ---------- Sort state ----------
 
 #[derive(Debug, Clone, Copy)]
@@ -269,288 +214,6 @@ impl Default for SortState {
     }
 }
 
-// Tabs ----------
-
-/// A tab groups a current path, its navigation history, and its
-/// sort order. Selection is not persisted between tabs; it is,
-/// however, preserved when refreshing the same folder via the
-/// `same-dir` mechanism of `refresh_listing`.
-#[derive(Debug)]
-struct Tab {
-    current_path: PathBuf,
-    history: NavHistory,
-    sort: SortState,
-    /// Selection anchor for Shift+click. `-1` if none.
-    selection_anchor: i32,
-    /// Content thumbnails, derived from list zoom only while using the list.
-    /// Grid thumbnails are independent of either size setting.
-    preview: bool,
-    /// Zoom level of entries (Ctrl+wheel). Mapped to a row height by
-    /// `zoom_to_height`, and persisted per tab in the workspace TOML: a view
-    /// left at a chosen thumbnail size reopens at that size, not at the
-    /// default for its mode.
-    zoom: i32,
-    item_arrangement: ItemArrangement,
-    /// None preserves the absence of a grid preference in older workspaces.
-    /// The grid renderer supplies its default when the user first opens it.
-    grid_zoom: Option<i32>,
-    /// Whether hidden files are shown (dotfiles + Windows HIDDEN attribute).
-    /// `false` by default. Persisted per tab in the workspace TOML.
-    show_hidden: bool,
-    /// Grouping mode (folders, coloured folders or files first, or mixed).
-    /// Persisted per tab in the workspace TOML.
-    group_mode: GroupMode,
-    /// "Cursor" row (head of arrow-key keyboard navigation). `-1`
-    /// = none. Session only (not persisted).
-    cursor: i32,
-    /// Counter incremented on each keyboard cursor movement → triggers
-    /// scroll-into-view on the Slint side (without doing so on other refreshes).
-    scroll_gen: i32,
-    /// Extension filter: bar enabled from the columns menu.
-    /// `ext_filter_on` = bar shown; `ext_filter` = free text ("jpg, png",
-    /// loose syntax). Session only (not persisted in the workspace).
-    ext_filter_on: bool,
-    ext_filter: String,
-}
-
-#[derive(Clone, Copy)]
-struct TabDisplayDefaults {
-    preview: bool,
-    thumbnail_zoom: i32,
-    arrangement: ItemArrangement,
-    show_hidden: bool,
-}
-
-impl From<&Config> for TabDisplayDefaults {
-    fn from(config: &Config) -> Self {
-        Self {
-            preview: config.default_preview_mode,
-            thumbnail_zoom: config
-                .default_thumbnail_zoom
-                .clamp(MIN_THUMBNAIL_ZOOM, MAX_THUMBNAIL_ZOOM),
-            arrangement: config.default_item_arrangement,
-            show_hidden: config.default_show_hidden,
-        }
-    }
-}
-
-#[cfg(test)]
-impl From<bool> for TabDisplayDefaults {
-    fn from(preview: bool) -> Self {
-        Self {
-            preview,
-            arrangement: ItemArrangement::List,
-            thumbnail_zoom: DEFAULT_THUMBNAIL_ZOOM,
-            show_hidden: false,
-        }
-    }
-}
-
-impl Tab {
-    fn new(initial: PathBuf, display: impl Into<TabDisplayDefaults>) -> Self {
-        let display = display.into();
-        let preview = display.preview;
-        let mut h = NavHistory::default();
-        h.push(initial.clone());
-        let zoom = if preview {
-            display.thumbnail_zoom
-        } else {
-            LIST_DEFAULT_ZOOM
-        };
-        Self {
-            current_path: initial,
-            history: h,
-            sort: SortState::default(),
-            selection_anchor: -1,
-            preview,
-            zoom,
-            item_arrangement: display.arrangement,
-            grid_zoom: (display.thumbnail_zoom != GRID_DEFAULT_ZOOM)
-                .then_some(display.thumbnail_zoom),
-            show_hidden: display.show_hidden,
-            group_mode: GroupMode::FoldersFirst,
-            cursor: -1,
-            scroll_gen: 0,
-            ext_filter_on: false,
-            ext_filter: String::new(),
-        }
-    }
-
-    /// Builds a tab restored from a workspace: path + sort + display
-    /// mode. History restarts with a single entry (back/forward not
-    /// persisted).
-    fn restored(path: PathBuf, saved: &TabState) -> Self {
-        let mut h = NavHistory::default();
-        h.push(path.clone());
-        // A workspace saved before the level was persisted carries none: the
-        // tab reopens at the default for the mode it was in, exactly as it
-        // used to. A hand-edited file is clamped rather than trusted.
-        let zoom = match saved.zoom {
-            Some(z) => z.clamp(MIN_ZOOM, MAX_ZOOM),
-            None if saved.preview => THUMB_DEFAULT_ZOOM,
-            None => LIST_DEFAULT_ZOOM,
-        };
-        Self {
-            current_path: path,
-            history: h,
-            sort: SortState {
-                column: saved.sort_column,
-                order: saved.sort_order,
-                secondary: saved
-                    .secondary_sort
-                    .filter(|s| !s.column.same_field(saved.sort_column)),
-            },
-            selection_anchor: -1,
-            // Keep the historical list precedence, including hand-edited
-            // workspaces. Grid representation has its own explicit choice.
-            preview: match saved.item_arrangement {
-                ItemArrangement::List => zoom >= THUMB_ZOOM,
-                ItemArrangement::Grid => saved.preview,
-            },
-            zoom,
-            item_arrangement: saved.item_arrangement,
-            grid_zoom: saved
-                .grid_zoom
-                .map(|zoom| zoom.clamp(MIN_GRID_ZOOM, MAX_GRID_ZOOM)),
-            show_hidden: saved.show_hidden,
-            group_mode: saved.group_mode,
-            cursor: -1,
-            scroll_gen: 0,
-            ext_filter_on: false,
-            ext_filter: String::new(),
-        }
-    }
-}
-
-fn tab_to_state(tab: &Tab) -> TabState {
-    TabState {
-        path: tab.current_path.display().to_string(),
-        sort_column: tab.sort.column,
-        sort_order: tab.sort.order,
-        secondary_sort: tab.sort.secondary,
-        preview: tab.preview,
-        show_hidden: tab.show_hidden,
-        group_mode: tab.group_mode,
-        zoom: Some(tab.zoom),
-        item_arrangement: tab.item_arrangement,
-        grid_zoom: tab.grid_zoom,
-    }
-}
-
-fn tab_from_state(tab: TabState) -> Tab {
-    Tab::restored(resolve_restored_path(&tab.path), &tab)
-}
-
-#[derive(Debug)]
-struct TabBook {
-    tabs: Vec<Tab>,
-    active: usize,
-}
-
-impl TabBook {
-    /// Inserts a tab at a visible gap, clamping stale UI coordinates, and
-    /// activates it. Shared by every source that creates or transfers a tab.
-    fn insert_tab_at(&mut self, at: usize, tab: Tab) -> usize {
-        let at = at.min(self.tabs.len());
-        self.tabs.insert(at, tab);
-        self.active = at;
-        at
-    }
-
-    fn open(&mut self, path: PathBuf, display: impl Into<TabDisplayDefaults>) -> usize {
-        self.insert_tab_at(self.tabs.len(), Tab::new(path, display))
-    }
-
-    /// Inserts `tab` right after tab `idx` and activates the new entry.
-    /// Common primitive for contextual openings and duplication.
-    fn insert_after(&mut self, idx: usize, tab: Tab) -> Option<usize> {
-        if idx >= self.tabs.len() {
-            return None;
-        }
-        Some(self.insert_tab_at(idx + 1, tab))
-    }
-
-    /// Opens a target right after the active tab. A `TabBook` always has
-    /// at least one tab; the fallback at the end nonetheless protects this invariant.
-    fn open_after_active(
-        &mut self,
-        path: PathBuf,
-        display: impl Into<TabDisplayDefaults>,
-    ) -> usize {
-        if self.active >= self.tabs.len() {
-            return self.open(path, display);
-        }
-        self.insert_after(self.active, Tab::new(path, display))
-            .expect("active tab was validated")
-    }
-
-    /// Duplicates tab `idx`: inserts a copy (same path + view settings)
-    /// RIGHT AFTER it and activates it. `false` if the index is out of bounds.
-    fn duplicate(&mut self, idx: usize) -> bool {
-        let Some(src) = self.tabs.get(idx) else {
-            return false;
-        };
-        let dup = Tab::restored(src.current_path.clone(), &tab_to_state(src));
-        self.insert_after(idx, dup).is_some()
-    }
-
-    /// Closes tab `idx` and returns it. Refuses to close the last one.
-    fn close(&mut self, idx: usize) -> Option<Tab> {
-        if self.tabs.len() <= 1 || idx >= self.tabs.len() {
-            return None;
-        }
-        let closed = self.tabs.remove(idx);
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len() - 1;
-        } else if idx < self.active {
-            self.active -= 1;
-        }
-        Some(closed)
-    }
-
-    fn select(&mut self, idx: usize) -> bool {
-        if idx < self.tabs.len() && idx != self.active {
-            self.active = idx;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Moves the tab at `from` to an **insertion position** `to_pre`
-    /// computed BEFORE the removal: the user saw the cursor (and the
-    /// preview line) at index position `to_pre` in the current list
-    /// (so `to_pre ∈ [0, len]` — `len` = insert at the end).
-    ///
-    /// Internally, this is converted to a "post-remove index":
-    ///   - if `to_pre > from`, the post-remove index is `to_pre - 1` (because
-    ///     removing `from` shifted the elements to its right);
-    ///   - otherwise, the post-remove index stays `to_pre`.
-    ///
-    /// Adjusts `active` so it keeps pointing at the same Tab.
-    fn move_tab(&mut self, from: usize, to_pre: usize) -> bool {
-        let n = self.tabs.len();
-        if from >= n {
-            return false;
-        }
-        let to = if to_pre > from { to_pre - 1 } else { to_pre };
-        let to = to.min(n - 1);
-        if to == from {
-            return false;
-        }
-        let tab = self.tabs.remove(from);
-        self.tabs.insert(to, tab);
-        if self.active == from {
-            self.active = to;
-        } else if from < self.active && to >= self.active {
-            self.active -= 1;
-        } else if from > self.active && to <= self.active {
-            self.active += 1;
-        }
-        true
-    }
-}
-
 // View panel ----------
 
 /// A panel represents an independent file view: tabs, row
@@ -558,11 +221,15 @@ impl TabBook {
 /// each navigation.
 struct Panel {
     tabs: TabBook,
+    tab_presentation: tabs::projection::Presentation,
     rows_model: Rc<VecModel<FileRow>>,
     /// Virtualized window over `rows_model`. The filter follows the
     /// technical field `FileRow.rendered`; operations keep using the
     /// full model and its stable indices.
     rendered_rows_model: ModelRc<FileRow>,
+    /// A listing-time gate, kept outside Slint. Ordinary icon-only views never
+    /// scan their rows for content work during a thumbnail refresh.
+    has_ambiguous_files: Cell<bool>,
     /// Revision of order/geometry. Unlike content notifications
     /// (selection, thumbnail...), it forces hit-tests under a motionless pointer.
     rows_revision: Cell<i32>,
@@ -570,6 +237,8 @@ struct Panel {
     viewport_reset_gen: Cell<i32>,
     /// Last exact viewport published by Slint, in content coordinates.
     viewport_top: Cell<f32>,
+    /// One-shot scroll anchor after optional previews change row heights.
+    thumbnail_restore_top: Cell<Option<f32>>,
     viewport_height: Cell<f32>,
     item_grid: Cell<Option<GridLayout>>,
     /// Half-open interval currently accepted by `rendered_rows_model`.
@@ -603,8 +272,10 @@ struct Panel {
     /// insertion gap for a tab received from another instance. Session.
     tabs_viewport_x: f32,
     /// Tab bar position: 0 = horizontal at the top,
-    /// 1 = vertical on the left, 2 = vertical on the right. Persisted per view.
+    /// 1 = vertical on the left, 2 = vertical on the right, 3 = hidden.
     tab_bar_mode: u8,
+    /// Last visible position, retained while the tab bar is hidden.
+    tab_bar_restore_mode: u8,
     /// USER width of the vertical bar (logical px), set via the
     /// handle. `0` = automatic (clamped 40% formula). Persisted per view.
     vbar_user_w: f32,
@@ -641,6 +312,11 @@ impl Panel {
     fn from_tab(tab: Tab, columns: Vec<ColumnSpec>, tab_bar_mode: u8, vbar_user_w: f32) -> Self {
         Self::from_book(
             TabBook {
+                identity: Default::default(),
+                selection: Default::default(),
+                focused_group: None,
+                active_group: None,
+                groups: Default::default(),
                 tabs: vec![tab],
                 active: 0,
             },
@@ -652,20 +328,26 @@ impl Panel {
 
     /// Restored and newly created views share all transient model state.
     fn from_book(
-        tabs: TabBook,
+        mut tabs: TabBook,
         columns: Vec<ColumnSpec>,
         tab_bar_mode: u8,
         vbar_user_w: f32,
     ) -> Self {
+        tabs.groups.normalize(&mut tabs.tabs);
+        tabs.reset_selection();
+        tabs.highlight_active_group();
         let initial = tabs.tabs[tabs.active].current_path.clone();
         let (rows_model, rendered_rows_model) = new_row_models();
         Self {
             tabs,
+            tab_presentation: Default::default(),
             rows_model,
             rendered_rows_model,
+            has_ambiguous_files: Cell::new(false),
             rows_revision: Cell::new(0),
             viewport_reset_gen: Cell::new(0),
             viewport_top: Cell::new(0.0),
+            thumbnail_restore_top: Cell::new(None),
             viewport_height: Cell::new(DEFAULT_RENDER_VIEWPORT_HEIGHT),
             item_grid: Cell::new(None),
             rendered_first: Cell::new(0),
@@ -678,7 +360,8 @@ impl Panel {
             listing_failed: false,
             last_recovery: None,
             tabs_viewport_x: 0.0,
-            tab_bar_mode: tab_bar_mode.min(2),
+            tab_bar_mode: tab_bar_mode.min(3),
+            tab_bar_restore_mode: if tab_bar_mode < 3 { tab_bar_mode } else { 0 },
             vbar_user_w: vbar_user_w.max(0.0),
             pending_initial: false,
             pending_listing: false,
@@ -693,7 +376,30 @@ impl Panel {
             .set(self.rows_revision.get().wrapping_add(1));
     }
 
-    fn from_detached(view: &ViewState, dirs: &[PathBuf]) -> Option<Self> {
+    /// Negative mode toggles visibility; explicit modes choose a position.
+    fn set_tab_bar_mode(&mut self, mode: i32) -> bool {
+        let mode = if mode < 0 {
+            if self.tab_bar_mode == 3 {
+                self.tab_bar_restore_mode.min(2)
+            } else {
+                3
+            }
+        } else {
+            mode.clamp(0, 3) as u8
+        };
+        if self.tab_bar_mode == mode {
+            return false;
+        }
+        if self.tab_bar_mode < 3 {
+            self.tab_bar_restore_mode = self.tab_bar_mode;
+        }
+        self.tab_bar_mode = mode;
+        // The old offset belongs to a different axis or an invisible bar.
+        self.tabs_viewport_x = 0.0;
+        true
+    }
+
+    fn from_detached(view: &ViewState, dirs: &[PathBuf], group_name: &str) -> Option<Self> {
         if dirs.is_empty() || dirs.len() != view.tabs.len() {
             return None;
         }
@@ -702,18 +408,33 @@ impl Panel {
             .zip(&view.tabs)
             .map(|(path, saved)| Tab::restored(path.clone(), saved))
             .collect();
-        Some(Self::from_book(
+        let mut panel = Self::from_book(
             TabBook {
+                identity: Default::default(),
+                selection: Default::default(),
+                focused_group: None,
+                active_group: None,
+                groups: view.tab_groups.clone(),
                 tabs,
                 active: view.active_tab.min(dirs.len() - 1),
             },
             view.columns.clone(),
             view.tab_bar_mode,
             view.vbar_width,
-        ))
+        );
+        panel.tab_bar_restore_mode = view.tab_bar_restore_mode.min(2);
+        panel.repair_group_names(group_name);
+        Some(panel)
+    }
+
+    fn repair_group_names(&mut self, fallback: &str) {
+        if let Err(error) = self.tabs.groups.repair_names(fallback) {
+            tracing::warn!(?error, "Invalid tab group name fallback");
+        }
     }
 
     fn reset_rows_viewport(&self) {
+        self.thumbnail_restore_top.set(None);
         self.viewport_top.set(0.0);
         self.viewport_reset_gen
             .set(self.viewport_reset_gen.get().wrapping_add(1));
@@ -722,6 +443,8 @@ impl Panel {
     /// Replaces the logical model, marking BEFORE the notification the small
     /// interval to render around the current viewport.
     fn replace_rows(&self, mut rows: Vec<FileRow>) {
+        self.has_ambiguous_files
+            .set(rows.iter().any(|row| ambiguous::rule(row).is_some()));
         let (first, end) = mark_render_window(
             &mut rows,
             self.viewport_top.get(),
@@ -741,12 +464,14 @@ fn file_row_is_rendered(row: &FileRow) -> bool {
 
 fn panel_to_state(panel: &Panel) -> ViewState {
     ViewState {
+        tab_groups: panel.tabs.groups.clone(),
         // Split proportions live in the workspace layout tree.
         stretch: 1.0,
         active_tab: panel.tabs.active,
         tabs: panel.tabs.tabs.iter().map(tab_to_state).collect(),
         columns: panel.columns.clone(),
         tab_bar_mode: panel.tab_bar_mode,
+        tab_bar_restore_mode: panel.tab_bar_restore_mode,
         vbar_width: panel.vbar_user_w,
     }
 }
@@ -779,6 +504,12 @@ struct AsyncListingDelivery {
 /// on the UI thread where the application state is reachable. Named for the
 /// operation rather than the trash: a move reports here too.
 enum OpDelivery {
+    BulkRenamed {
+        op_id: i32,
+        plan: favnyr_core::bulk_rename::Plan,
+        outcome: favnyr_core::bulk_rename::Outcome,
+        lang: Lang,
+    },
     Trashed(PathBuf),
     /// An item the worker ACTUALLY moved, so its colour and its note can follow
     /// it. Reported per item rather than per operation: a move that fails
@@ -1102,11 +833,16 @@ pub struct AppState {
     paste_job: Rc<RefCell<Option<PasteJob>>>,
     archive: Rc<archive::State>,
     shutdown: Rc<shutdown::State>,
+    tab_ipc: Rc<tabs::ipc::State>,
+    /// Tab drag in progress. Shared so a drop query can tell what is being
+    /// dragged: a group offers no destination inside its own span.
+    tab_drag: Rc<tabs::drag::Session>,
     recovery: Rc<recovery::State>,
     /// Exact source of the rename popup. A path, not the visual row
     /// index: a watcher/re-sort can rebuild the model while the
     /// dialog is open without ever causing a different entry to be renamed.
     rename_source: Rc<RefCell<Option<PathBuf>>>,
+    bulk_rename: Rc<bulk_rename::State>,
     /// Selection frozen at the moment the permanent-delete warning
     /// is opened. A watcher may re-list underneath the popup: the confirmation must
     /// always apply to the announced paths, never to a new row.
@@ -1133,6 +869,8 @@ pub struct AppState {
     thumb_scheduler: Arc<ThumbScheduler>,
     /// In-memory LRU cache (path → image). Session only, nothing on disk.
     thumb_cache: Rc<RefCell<ThumbLru>>,
+    /// Coalesces optional-provider geometry updates without a permanent timer.
+    thumb_layout_pending: Rc<Cell<bool>>,
     /// Per-path annotations: the colour assigned to a folder, and the note
     /// attached to an item. Global and written the moment it changes, like the
     /// favorites tree — the data belongs to a path, not to a window layout, so
@@ -1250,7 +988,7 @@ pub struct AppState {
     opener_settings_cache: Rc<RefCell<Vec<OpenerItem>>>,
     /// Application picker context: ext + path + handlers
     /// enumerated by the OS, remembered between opening the picker and the choice.
-    ow_pick_ctx: Rc<RefCell<Option<OwPickCtx>>>,
+    ow_pick_ctx: Rc<RefCell<Option<app_picker::Context>>>,
     /// Paths waiting to be saved by the "Save as favorite" popup.
     fav_save_pending: Rc<RefCell<Vec<PathBuf>>>,
     /// Container ids in the popup dropdown order (index 0 = root).
@@ -1290,7 +1028,7 @@ impl AppState {
     /// Default state: one panel, one tab on `$HOME`. The tab bar
     /// takes the DEFAULT position from settings.
     pub fn new(config: Config) -> Self {
-        let mode = config.default_tab_bar_mode.min(2);
+        let mode = config.default_tab_bar_mode.min(3);
         Self::new_at(config, home_dir(), mode)
     }
 
@@ -1309,13 +1047,15 @@ impl AppState {
                 book.open(dir.clone(), default_display);
             }
             book.active = 0;
+            book.reset_selection();
         });
     }
 
     /// Applies a validated detached view before installing UI callbacks.
     /// Native paths remain authoritative; the TOML carries only settings.
     pub fn adopt_detached_view(&self, view: &ViewState, dirs: &[PathBuf]) {
-        if let Some(panel) = Panel::from_detached(view, dirs) {
+        let group_name = i18n::tr(self.config.borrow().language, "tab_group_default_name");
+        if let Some(panel) = Panel::from_detached(view, dirs, &group_name) {
             self.panels.borrow_mut()[0] = panel;
         }
     }
@@ -1350,8 +1090,11 @@ impl AppState {
             paste_job: Rc::new(RefCell::new(None)),
             archive: Rc::new(archive::State::default()),
             shutdown: Rc::new(shutdown::State::default()),
+            tab_ipc: Rc::new(tabs::ipc::State::default()),
+            tab_drag: Rc::new(tabs::drag::Session::default()),
             recovery: Rc::new(recovery::State::default()),
             rename_source: Rc::new(RefCell::new(None)),
+            bulk_rename: Rc::default(),
             delete_pending: Rc::new(RefCell::new(Vec::new())),
             last_trashed: Rc::new(RefCell::new(None)),
             op_deliveries: Arc::new(std::sync::Mutex::new(VecDeque::new())),
@@ -1360,6 +1103,7 @@ impl AppState {
             ops_model: Rc::new(VecModel::default()),
             thumb_scheduler: Arc::new(ThumbScheduler::new()),
             thumb_cache: Rc::new(RefCell::new(ThumbLru::new(512))),
+            thumb_layout_pending: Rc::new(Cell::new(false)),
             annotations: Rc::new(RefCell::new(
                 favnyr_core::annotations::AnnotationStore::load(&paths::annotations_path()),
             )),
@@ -1415,15 +1159,14 @@ impl AppState {
     }
 
     /// Builds application state from a restored workspace.
-    /// Nonexistent paths (folder deleted/unmounted since the last
-    /// session) are replaced with `$HOME` — a tab is never lost,
-    /// it's just brought back to a safe point.
+    /// Unavailable paths are retained so that their tabs can recover later.
     pub fn from_workspace(config: Config, ws: WorkspaceState) -> Self {
         let current_workspace = ws.workspace_name.clone();
         let closed_tabs = ws.closed_tabs.clone();
         let sidebar_sections = ws.sidebar_sections;
         let keymap = shortcuts::Keymap::build(&config.shortcut_overrides);
-        let (panels, layout, active_panel) = build_panels(ws);
+        let group_name = i18n::tr(config.language, "tab_group_default_name");
+        let (panels, layout, active_panel) = build_panels(ws, &group_name);
         let (rmtime_tx, rmtime_rx) = mpsc::channel();
         let (imgmeta_tx, imgmeta_rx) = mpsc::channel();
         let state = Self {
@@ -1442,8 +1185,11 @@ impl AppState {
             paste_job: Rc::new(RefCell::new(None)),
             archive: Rc::new(archive::State::default()),
             shutdown: Rc::new(shutdown::State::default()),
+            tab_ipc: Rc::new(tabs::ipc::State::default()),
+            tab_drag: Rc::new(tabs::drag::Session::default()),
             recovery: Rc::new(recovery::State::default()),
             rename_source: Rc::new(RefCell::new(None)),
+            bulk_rename: Rc::default(),
             delete_pending: Rc::new(RefCell::new(Vec::new())),
             last_trashed: Rc::new(RefCell::new(None)),
             op_deliveries: Arc::new(std::sync::Mutex::new(VecDeque::new())),
@@ -1452,6 +1198,7 @@ impl AppState {
             ops_model: Rc::new(VecModel::default()),
             thumb_scheduler: Arc::new(ThumbScheduler::new()),
             thumb_cache: Rc::new(RefCell::new(ThumbLru::new(512))),
+            thumb_layout_pending: Rc::new(Cell::new(false)),
             annotations: Rc::new(RefCell::new(
                 favnyr_core::annotations::AnnotationStore::load(&paths::annotations_path()),
             )),
@@ -1524,7 +1271,8 @@ impl AppState {
     pub fn replace_with_workspace(&self, ws: WorkspaceState) {
         let closed_tabs = ws.closed_tabs.clone();
         let sidebar_sections = ws.sidebar_sections;
-        let (panels, layout, active_panel) = build_panels(ws);
+        let group_name = i18n::tr(self.config.borrow().language, "tab_group_default_name");
+        let (panels, layout, active_panel) = build_panels(ws, &group_name);
         *self.panels.borrow_mut() = panels;
         *self.layout.borrow_mut() = layout;
         *self.active_panel.borrow_mut() = active_panel;
@@ -1540,7 +1288,7 @@ impl AppState {
         // Reset → default columns and tab bar position from the
         // config (user settings).
         let default_cols = self.config.borrow().default_columns.clone();
-        let default_mode = self.config.borrow().default_tab_bar_mode.min(2);
+        let default_mode = self.config.borrow().default_tab_bar_mode.min(3);
         let default_display = TabDisplayDefaults::from(&*self.config.borrow());
         *self.panels.borrow_mut() = vec![Panel::with_mode(
             home_dir(),
@@ -1650,6 +1398,15 @@ impl AppState {
         })
     }
 
+    /// A new browsing surface starts at home when no folder is active.
+    fn new_view_path(&self) -> PathBuf {
+        if self.with_tabs(|book| book.group_page().is_some()) {
+            home_dir()
+        } else {
+            self.current_path()
+        }
+    }
+
     /// Selection anchor of the active panel (-1 if none).
     fn selection_anchor(&self) -> i32 {
         self.with_tabs(|book| {
@@ -1688,11 +1445,7 @@ impl AppState {
     /// Is the active tab's "extension filter" mode enabled?
     /// Used to route keyboard input (shared with the type-ahead filter).
     fn active_ext_filter_on(&self) -> bool {
-        let (path, enabled) = self.with_tabs(|b| {
-            let tab = &b.tabs[b.active];
-            (tab.current_path.clone(), tab.ext_filter_on)
-        });
-        enabled && !folder_state_now(self).is_manual(&path)
+        self.with_tabs(|b| b.tabs[b.active].ext_filter_on)
     }
 
     fn active_manual_order(&self) -> bool {
@@ -1700,12 +1453,31 @@ impl AppState {
         folder_state_now(self).is_manual(&path)
     }
 
+    /// Is part of this view's listing hidden by a filter? A drag can then only
+    /// permute what is on screen, which would rearrange a subset of the stored
+    /// order while leaving the rest in place. Reordering is suspended instead.
+    /// The by-name filter belongs to the active view; the extension one is
+    /// carried by each tab.
+    fn panel_filter_active(&self, panel_index: usize) -> bool {
+        let by_name =
+            panel_index == *self.active_panel.borrow() && !self.filter.borrow().is_empty();
+        by_name
+            || self
+                .panels
+                .borrow()
+                .get(panel_index)
+                .and_then(|panel| panel.tabs.tabs.get(panel.tabs.active))
+                .is_some_and(|tab| tab.ext_filter_on)
+    }
+
     fn remember_closed_tab(&self, tab: Tab) {
         let mut history = self.closed_tabs.borrow_mut();
         if history.len() >= workspace::MAX_CLOSED_TABS {
             history.remove(0);
         }
-        history.push(tab_to_state(&tab));
+        let mut saved = tab_to_state(&tab);
+        saved.tab_group_id = None;
+        history.push(saved);
     }
 
     fn pop_closed_tab(&self) -> Option<TabState> {
@@ -1719,16 +1491,23 @@ impl AppState {
 
 /// Records all tabs of an explicitly closed panel. The tab that
 /// was active is pushed last: "Reopen" therefore restores it first.
-fn remember_closed_panel(state: &AppState, mut panel: Panel) {
-    if panel.tabs.tabs.is_empty() {
-        return;
-    }
-    let active = panel.tabs.active.min(panel.tabs.tabs.len() - 1);
-    let active_tab = panel.tabs.tabs.remove(active);
-    for tab in panel.tabs.tabs {
+fn remember_closed_panel(state: &AppState, panel: Panel) {
+    let active = panel.tabs.tabs.get(panel.tabs.active).map(|tab| tab.id);
+    remember_closed_tabs(state, panel.tabs.tabs, active);
+}
+
+/// Shares closure history ordering between a whole view and a group.
+fn remember_closed_tabs(state: &AppState, mut closed: Vec<Tab>, active: Option<tabs::TabId>) {
+    let active_tab = closed
+        .iter()
+        .position(|tab| Some(tab.id) == active)
+        .map(|index| closed.remove(index));
+    for tab in closed {
         state.remember_closed_tab(tab);
     }
-    state.remember_closed_tab(active_tab);
+    if let Some(tab) = active_tab {
+        state.remember_closed_tab(tab);
+    }
 }
 
 // ---------- Callback installation ----------
@@ -1737,6 +1516,9 @@ pub fn install(window: &MainWindow, state: AppState) {
     shutdown::install(window, &state);
     recovery::install(window, &state);
     archive::install(window, &state);
+    bulk_rename::install(window, &state);
+    #[cfg(windows)]
+    registered_documents::install(window, &state);
     search::install(window, &state);
     // (The row model of the active panel no longer needs to be pushed as a
     // global `rows` — each panel carries its own model in
@@ -1778,7 +1560,7 @@ pub fn install(window: &MainWindow, state: AppState) {
         apply_workspace_theme(window, &state);
     }
     // Default tab bar position (settings).
-    window.set_tabbar_default_pref(cfg.default_tab_bar_mode.min(2) as i32);
+    window.set_tabbar_default_pref(cfg.default_tab_bar_mode.min(3) as i32);
     // Display mode for newly created tabs and views (settings).
     window.set_default_view_mode_index(if cfg.default_preview_mode { 1 } else { 0 });
     window.set_default_thumbnail_zoom(cfg.default_thumbnail_zoom);
@@ -1800,6 +1582,7 @@ pub fn install(window: &MainWindow, state: AppState) {
     refresh_mtime_offset(&state);
     // Windows shell context menu (shell extensions) — checked by default.
     window.set_shell_menu_enabled(cfg.shell_ctx_menu);
+    window.set_registered_types_enabled(cfg.registered_file_types);
     // Left panel: any positive state opens the unified Places +
     // Favorites panel. This normalization also accepts the serialized value 2.
     window.set_left_panel(if cfg.left_panel >= 1 { 1 } else { 0 });
@@ -2012,10 +1795,28 @@ pub fn install(window: &MainWindow, state: AppState) {
                         // the drop point then clears the preview).
                         on_tab_received(&w, &tab_state, &payload);
                     }
+                    crate::winmsg::Incoming::Batch(sender, payload) => {
+                        tabs::ipc::receive(&w, &tab_state, sender, &payload)
+                    }
+                    crate::winmsg::Incoming::BatchHover(sx, sy, count) => {
+                        if !tabs::ipc::receiving(&tab_state) {
+                            set_external_hover(&w, sx, sy);
+                            w.set_external_tab_legacy(false);
+                            w.set_tab_drag_count(count as i32);
+                        }
+                    }
                     // Hover from another instance: simulates a local drag at
                     // this point → the insertion preview lights up in the targeted panel.
-                    crate::winmsg::Incoming::Hover(sx, sy) => set_external_hover(&w, sx, sy),
-                    crate::winmsg::Incoming::HoverEnd => clear_external_hover(&w),
+                    crate::winmsg::Incoming::Hover(sx, sy) => {
+                        if !tabs::ipc::receiving(&tab_state) {
+                            set_external_hover(&w, sx, sy);
+                        }
+                    }
+                    crate::winmsg::Incoming::HoverEnd => {
+                        if !tabs::ipc::receiving(&tab_state) {
+                            clear_external_hover(&w);
+                        }
+                    }
                     // A device was plugged in or removed. The scan runs off the
                     // UI thread and publishes a new revision, which the drives
                     // poll below turns into a sidebar rebuild.
@@ -2074,6 +1875,7 @@ pub fn install(window: &MainWindow, state: AppState) {
                             action,
                             staging,
                         } => {
+                            let source_thread = crate::winmsg::drop_source_thread();
                             // Request activation while handling the user's OLE
                             // gesture, then restore focus after the source unwinds.
                             crate::winmsg::focus_self();
@@ -2088,17 +1890,30 @@ pub fn install(window: &MainWindow, state: AppState) {
                                     ClipOp::Cut
                                 },
                             });
-                            // The OLE source still holds the capture until
-                            // IDropTarget::Drop returns control. Focus and open
-                            // the menu on the next tick, after OLE has released
-                            // capture, so its first hover/click is usable.
+                            // Wait for native capture to settle before exposing
+                            // an interactive menu. A zero-delay UI tick can run
+                            // inside the source's nested OLE message loop.
                             let drop_state = file_state.clone();
                             let drop_weak = file_weak.clone();
                             let delivery_lease = crate::background_work::acquire();
-                            defer(move || {
+                            crate::winmsg::after_native_drop(source_thread, move |ready| {
                                 let _delivery_lease = delivery_lease;
                                 let Some(w) = drop_weak.upgrade() else { return };
-                                crate::winmsg::focus_self();
+                                if shutdown::stopping(&drop_state) {
+                                    return;
+                                }
+                                if !ready {
+                                    clear_external_file_hover(&w);
+                                    notice(
+                                        &w,
+                                        i18n::tr(
+                                            drop_state.config.borrow().language,
+                                            "drop_input_not_ready",
+                                        ),
+                                        NoticeKind::Error,
+                                    );
+                                    return;
+                                }
                                 on_external_file_drop(
                                     &w,
                                     &drop_state,
@@ -2361,7 +2176,12 @@ pub fn install(window: &MainWindow, state: AppState) {
         let st = state.clone();
         let weak = window.as_weak();
         window.on_sidebar_item_dropped(
-            move |source: SharedString, kind: i32, panel: i32, gap: i32, zone: i32| {
+            move |source: SharedString,
+                  kind: i32,
+                  panel: i32,
+                  gap: i32,
+                  zone: i32,
+                  group: SharedString| {
                 let Some(w) = weak.upgrade() else { return };
                 let target = if kind == -1 {
                     let stored = {
@@ -2377,7 +2197,7 @@ pub fn install(window: &MainWindow, state: AppState) {
                 };
                 let Some(target) = target else { return };
 
-                open_directory_at_drop(&w, &st, target, panel, gap, zone);
+                open_directory_at_drop(&w, &st, target, panel, gap, zone, &group);
             },
         );
     }
@@ -2534,27 +2354,6 @@ pub fn install(window: &MainWindow, state: AppState) {
                     .unwrap_or_default()
             };
             open_fav_save_popup(&w, &st, paths);
-        });
-    }
-    // Dropping a tab by DRAG onto a favorites folder: a "direct"
-    // duplicate of the right-click "save as favorite" (the target container is
-    // chosen by the drop point → no popup).
-    {
-        let st = state.clone();
-        let weak = window.as_weak();
-        window.on_tab_to_favorite(move |panel: i32, tab: i32, container: SharedString| {
-            let Some(w) = weak.upgrade() else { return };
-            let path = {
-                let panels = st.panels.borrow();
-                panels.get(panel.max(0) as usize).and_then(|p| {
-                    p.tabs
-                        .tabs
-                        .get(tab.max(0) as usize)
-                        .map(|t| t.current_path.clone())
-                })
-            };
-            let Some(path) = path else { return };
-            add_paths_to_favorite(&w, &st, std::slice::from_ref(&path), &container);
         });
     }
     // Dropping the SELECTION of a view (files/folders) onto a favorites
@@ -3227,7 +3026,7 @@ pub fn install(window: &MainWindow, state: AppState) {
     {
         let st = state.clone();
         window.on_tabbar_default_changed(move |idx: i32| {
-            let mode = idx.clamp(0, 2) as u8;
+            let mode = idx.clamp(0, 3) as u8;
             info!(mode, "default tab bar position changed");
             st.persist_config(|c| c.default_tab_bar_mode = mode);
         });
@@ -3935,7 +3734,7 @@ pub fn install(window: &MainWindow, state: AppState) {
             };
             let panel = *st.active_panel.borrow();
             let zone = if orientation == 1 { 5 } else { 3 };
-            open_directory_at_drop(&w, &st, target, panel as i32, -1, zone);
+            open_directory_at_drop(&w, &st, target, panel as i32, -1, zone, "");
         });
     }
     // "Create shortcut": opens the popup (kind 3) pre-filled to create,
@@ -4092,188 +3891,7 @@ pub fn install(window: &MainWindow, state: AppState) {
             }
         });
     }
-    // "Choose an application…": enumerates the OS's apps → custom picker.
-    {
-        let st = state.clone();
-        let weak = window.as_weak();
-        window.on_ow_open_picker(move || {
-            let Some(w) = weak.upgrade() else { return };
-            let Some(path) = selected_paths(&st).into_iter().next() else {
-                return;
-            };
-            let ext = path
-                .extension()
-                .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                .unwrap_or_default();
-            w.set_ow_picker_show_other_apps(false);
-            w.set_ow_picker_search_text(SharedString::new());
-            refresh_ow_picker_handlers(&w, &st, &ext, &path, false);
-            w.set_ow_picker_set_default(false); // unchecked on every opening
-            w.set_ow_picker_open(true);
-        });
-    }
-    // The picker search filters its cached rows only; application discovery and
-    // icon extraction remain tied to opening the picker or changing its scope.
-    {
-        let st = state.clone();
-        let weak = window.as_weak();
-        window.on_ow_picker_search(move |text: SharedString| {
-            let Some(w) = weak.upgrade() else { return };
-            push_filtered_ow_picker_ui(&w, &st, text.as_str());
-        });
-    }
-    // Linux-only option: include launchers that make no MIME declaration.
-    {
-        let st = state.clone();
-        let weak = window.as_weak();
-        window.on_ow_picker_show_other_apps_changed(move |show_other_apps| {
-            let Some(w) = weak.upgrade() else { return };
-            let context = st
-                .ow_pick_ctx
-                .borrow()
-                .as_ref()
-                .map(|ctx| (ctx.ext.clone(), ctx.path.clone()));
-            let Some((ext, path)) = context else { return };
-            refresh_ow_picker_handlers(&w, &st, &ext, &path, show_other_apps);
-        });
-    }
-    // Choice in the picker: launches + CAPTURES the app (persisted as an opener).
-    {
-        let st = state.clone();
-        let weak = window.as_weak();
-        window.on_ow_pick(move |key: SharedString| {
-            let Some(w) = weak.upgrade() else { return };
-            let key = key.to_string();
-            // Extracted from the context (path/ext + chosen handler), then releases the borrow.
-            let picked = {
-                let ctx = st.ow_pick_ctx.borrow();
-                let Some(ctx) = ctx.as_ref() else { return };
-                let handler = ctx.handlers.iter().find(|h| h.key == key).cloned();
-                (ctx.ext.clone(), ctx.path.clone(), handler)
-            };
-            let (ext, path, handler) = picked;
-            match openwith::launch(&key, &ext, &path) {
-                Ok(()) => {
-                    // Capture: registers ANY chosen app (regular exe OR an OS
-                    // app without an exe — Windows UWP/Store, Linux `.desktop`) and marks it
-                    // as the MOST RECENTLY used → head of the suggestions.
-                    if let Some(h) = handler {
-                        // "Set as default" checked → the app becomes Favnyr's
-                        // default for this extension (takes priority over the OS).
-                        let set_default = w.get_ow_picker_set_default();
-                        {
-                            let mut store = st.openers.borrow_mut();
-                            let id = match h.exe {
-                                Some(exe) => store
-                                    .openers
-                                    .iter()
-                                    .find(|o| o.program == exe)
-                                    .map(|o| o.id.clone())
-                                    .unwrap_or_else(|| {
-                                        store.add(&h.name, &exe, vec!["{file}".to_string()])
-                                    }),
-                                None => store
-                                    .openers
-                                    .iter()
-                                    .find(|o| o.assoc.as_deref() == Some(h.key.as_str()))
-                                    .map(|o| o.id.clone())
-                                    .unwrap_or_else(|| store.add_assoc(&h.name, &h.key)),
-                            };
-                            store.record_use(&id, Some(&ext));
-                            if set_default && !ext.is_empty() {
-                                store.set_default_ext(&id, &ext, true);
-                            }
-                        }
-                        save_openers(&st);
-                        push_openers_ui(&w, &st);
-                    }
-                }
-                Err(err) => {
-                    error!(error = %err, "open-with launch failed");
-                    let lang = st.config.borrow().language;
-                    notice(
-                        &w,
-                        i18n::tr(lang, "fav_toast_missing"),
-                        NoticeKind::FavMissing,
-                    );
-                }
-            }
-        });
-    }
-    // Picker's "Browse…": choose a custom exe from the OS (like the
-    // Custom Command's "…"), REGISTER it as a reusable opener, then
-    // launch it on the current selection. Symmetric across Windows (IFileOpenDialog) /
-    // Linux (zenity/kdialog).
-    {
-        let st = state.clone();
-        let weak = window.as_weak();
-        window.on_ow_pick_browse(move || {
-            let Some(w) = weak.upgrade() else { return };
-            // Picker context required (opened on a selection); we keep the
-            // first path as a fallback if the selection emptied in the meantime.
-            let ctx_path = {
-                let ctx = st.ow_pick_ctx.borrow();
-                let Some(ctx) = ctx.as_ref() else { return };
-                ctx.path.clone()
-            };
-            // Cancelling the native dialog → we leave everything untouched (picker stays open).
-            let lang = st.snapshot_config().language;
-            let Some(exe) = openwith::browse_for_exe(lang) else {
-                return;
-            };
-            let name = std::path::Path::new(&exe)
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| exe.clone());
-            // Registers the app (reuses the existing one if same program).
-            let opener = {
-                let mut store = st.openers.borrow_mut();
-                match store.openers.iter().find(|o| o.program == exe).cloned() {
-                    Some(o) => o,
-                    None => {
-                        let id = store.add(&name, &exe, vec!["{file}".to_string()]);
-                        store.get(&id).cloned().expect("opener was just added")
-                    }
-                }
-            };
-            save_openers(&st);
-            push_openers_ui(&w, &st);
-            // Launches on the current selection (multi-file handled by run_opener).
-            let mut paths = selected_paths(&st);
-            if paths.is_empty() {
-                paths.push(ctx_path);
-            }
-            let ext = paths.first().and_then(|p| {
-                p.extension()
-                    .map(|e| e.to_string_lossy().to_ascii_lowercase())
-            });
-            match archive::run_opener(&w, &st, &opener, &paths) {
-                Ok(()) => {
-                    let set_default = w.get_ow_picker_set_default();
-                    {
-                        let mut store = st.openers.borrow_mut();
-                        store.record_use(&opener.id, ext.as_deref());
-                        if set_default && let Some(e) = ext.as_deref().filter(|e| !e.is_empty()) {
-                            store.set_default_ext(&opener.id, e, true);
-                        }
-                    }
-                    save_openers(&st);
-                    push_openers_ui(&w, &st);
-                }
-                Err(err) => {
-                    error!(error = %err, label = opener.label, "ow-pick-browse run_opener failed");
-                    let lang = st.config.borrow().language;
-                    notice(
-                        &w,
-                        i18n::tr(lang, "ow_run_failed").replace("{name}", &opener.label),
-                        NoticeKind::Error,
-                    );
-                }
-            }
-            w.set_ow_picker_open(false);
-        });
-    }
+    app_picker::install(window, &state);
     // "Use as application": pre-fills from the selected exe.
     {
         let st = state.clone();
@@ -4837,7 +4455,7 @@ pub fn install(window: &MainWindow, state: AppState) {
         let weak = window.as_weak();
         window.on_op_progress(move |row: OpProgress| {
             let Some(w) = weak.upgrade() else { return };
-            upsert_op_row(&st, row);
+            upsert_op_row(&st.ops_model, row);
             refresh_ops_ui(&w, &st);
         });
     }
@@ -4907,14 +4525,19 @@ pub fn install(window: &MainWindow, state: AppState) {
         });
     }
 
-    // Rename opens a modal popup pre-filled with the name of the first selected
-    // row. The exact source path is captured in AppState: the row
+    // Rename selects the single-item editor or the batch preview. Exact source
+    // paths are captured in AppState: a row
     // index can become stale if the watcher re-lists while the dialog is open.
     {
         let st = state.clone();
         let weak = window.as_weak();
         window.on_action_rename(move || {
             let Some(w) = weak.upgrade() else { return };
+            let paths = selected_paths(&st);
+            if paths.len() > 1 {
+                bulk_rename::open(&w, &st, paths);
+                return;
+            }
             let rows = st.active_rows_model();
             let target = (0..rows.row_count())
                 .find(|&i| rows.row_data(i).map(|r| r.selected).unwrap_or(false));
@@ -5001,9 +4624,6 @@ pub fn install(window: &MainWindow, state: AppState) {
         let weak = window.as_weak();
         window.on_filter_clear(move || {
             let Some(w) = weak.upgrade() else { return };
-            if st.active_manual_order() {
-                return;
-            }
             // In extension mode: "close" = turn off the mode (hides the bar)
             // + clear it; otherwise clear the by-name type-ahead filter.
             if st.active_ext_filter_on() {
@@ -5104,13 +4724,15 @@ pub fn install(window: &MainWindow, state: AppState) {
     {
         let st = state.clone();
         let weak = window.as_weak();
-        window.on_folder_drag_dropped(move |panel: i32, gap: i32, zone: i32| {
-            let Some(w) = weak.upgrade() else { return };
-            let path = st.folder_drag_path.borrow_mut().take();
-            if let Some(path) = path {
-                open_directory_at_drop(&w, &st, path, panel, gap, zone);
-            }
-        });
+        window.on_folder_drag_dropped(
+            move |panel: i32, gap: i32, zone: i32, group: SharedString| {
+                let Some(w) = weak.upgrade() else { return };
+                let path = st.folder_drag_path.borrow_mut().take();
+                if let Some(path) = path {
+                    open_directory_at_drop(&w, &st, path, panel, gap, zone, &group);
+                }
+            },
+        );
     }
     // Real-time validation of the internal target. In the source view, the
     // `selected` flag allows an O(1) check of the common case (folder dropped onto itself).
@@ -5160,24 +4782,33 @@ pub fn install(window: &MainWindow, state: AppState) {
     // drop. Windows only; no-op elsewhere.
     {
         let st = state.clone();
-        #[cfg(windows)]
         let weak = window.as_weak();
         window.on_start_native_drag(move |src_panel: i32| {
             let src = src_panel.max(0) as usize;
             let paths = panel_selected_paths(&st, src);
-            if paths.is_empty() {
-                return;
-            }
             #[cfg(windows)]
             {
-                let outcome = crate::winddrag::drag_files(&paths);
-                debug!(
-                    count = paths.len(),
-                    dropped = outcome.dropped,
-                    "native OLE drag finished"
-                );
-                if !outcome.cleanup.is_empty() {
-                    if let Some(w) = weak.upgrade() {
+                let weak = weak.clone();
+                let st = st.clone();
+                defer(move || {
+                    let Some(w) = weak.upgrade() else { return };
+                    release_native_drag_pointer(
+                        &w,
+                        w.get_file_drag_abs_x(),
+                        w.get_file_drag_abs_y(),
+                    );
+                    if paths.is_empty() || !crate::winmsg::left_button_down() {
+                        w.set_native_drag_active(false);
+                        return;
+                    }
+                    let outcome = crate::winddrag::drag_files(&paths);
+                    w.set_native_drag_active(false);
+                    debug!(
+                        count = paths.len(),
+                        dropped = outcome.dropped,
+                        "native OLE drag finished"
+                    );
+                    if !outcome.cleanup.is_empty() {
                         let lang = st.snapshot_config().language;
                         start_heavy_op(
                             &w,
@@ -5188,16 +4819,17 @@ pub fn install(window: &MainWindow, state: AppState) {
                             None,
                             None,
                         );
+                    } else if outcome.moved {
+                        refresh_all_panels(&w, &st);
                     }
-                } else if outcome.moved
-                    && let Some(w) = weak.upgrade()
-                {
-                    refresh_all_panels(&w, &st);
-                }
+                });
             }
             #[cfg(not(windows))]
             {
                 let _ = paths; // no native drag outside Windows (v1)
+                if let Some(w) = weak.upgrade() {
+                    w.set_native_drag_active(false);
+                }
             }
         });
     }
@@ -5439,7 +5071,7 @@ pub fn install(window: &MainWindow, state: AppState) {
         let weak = window.as_weak();
         window.on_create_check(move |kind: i32, name: SharedString| {
             let Some(w) = weak.upgrade() else { return };
-            if kind != 0 && kind != 1 {
+            if kind != 0 && kind != 1 && kind != 4 {
                 w.set_create_name_valid(true);
                 w.set_create_conflict(false);
                 // Clears whatever the folder/file mode had reported: these
@@ -5467,6 +5099,10 @@ pub fn install(window: &MainWindow, state: AppState) {
                 let Some(w) = weak.upgrade() else {
                     return false;
                 };
+                #[cfg(windows)]
+                if kind == 4 {
+                    return w.invoke_document_create_confirmed(name);
+                }
                 if search::reject_ambiguous_destination(&w, &st) {
                     return false;
                 }
@@ -5515,32 +5151,11 @@ pub fn install(window: &MainWindow, state: AppState) {
                         }
                     }
                 };
-                // A newly created HIDDEN entry (dotfile) would land out of sight
-                // when the view isn't showing hidden files — a user might create
-                // `.myconfig` and never find it. So, ONLY when the created
-                // name is a dotfile, turn on "show hidden" for the active view
-                // before the refresh below reveals it.
-                if created.as_deref().is_some_and(|n| n.starts_with('.')) {
-                    let active = *st.active_panel.borrow();
-                    if let Some(panel) = st.panels.borrow_mut().get_mut(active) {
-                        let t = &mut panel.tabs.tabs[panel.tabs.active];
-                        t.show_hidden = true;
-                    }
-                }
-                if let Some(created_name) = created.as_ref() {
-                    let created_path = cur.join(created_name);
-                    append_paths_to_manual_order(&st, std::slice::from_ref(&created_path));
-                    invalidate_thumbnail_paths(&st, &[created_path]);
-                }
-                // Refresh every panel: other views on the same folder must show
-                // the new entry immediately (like delete/copy/move).
-                w.invoke_refresh_all();
-                // Targets the new entry (cursor + selection) → a simple Enter
-                // opens it right after (especially a folder just created).
                 if let Some(created_name) = created {
-                    focus_entry_by_name(&w, &st, &created_name);
+                    reveal_created_entry(&w, &st, &cur, &created_name);
                     true
                 } else {
+                    w.invoke_refresh_all();
                     false
                 }
             },
@@ -5634,6 +5249,14 @@ pub fn install(window: &MainWindow, state: AppState) {
             let mut refresh_after_restore = false;
             for event in events {
                 match event {
+                    OpDelivery::BulkRenamed {
+                        op_id,
+                        plan,
+                        outcome,
+                        lang,
+                    } => {
+                        bulk_rename::complete(&w, &st, op_id, plan, outcome, lang);
+                    }
                     // The colour and the note are keyed by path, so they follow
                     // the item. Moving a folder carries what was annotated
                     // inside it.
@@ -6145,14 +5768,6 @@ pub fn install(window: &MainWindow, state: AppState) {
         window.on_ext_filter_toggle(move |idx: i32| {
             let Some(w) = weak.upgrade() else { return };
             let p = idx.max(0) as usize;
-            let path = {
-                let panels = st.panels.borrow();
-                let Some(panel) = panels.get(p) else { return };
-                panel.tabs.tabs[panel.tabs.active].current_path.clone()
-            };
-            if folder_state_now(&st).is_manual(&path) {
-                return;
-            }
             let turned_on = {
                 let mut panels = st.panels.borrow_mut();
                 let Some(pn) = panels.get_mut(p) else { return };
@@ -6167,6 +5782,9 @@ pub fn install(window: &MainWindow, state: AppState) {
             // The two filters (name / extension) are MUTUALLY EXCLUSIVE: turning one on clears
             // the other → a single bar, a single keyboard stream.
             if turned_on {
+                // Switching views restores a running search's query. Cancel it
+                // first so it cannot revive the name filter being cleared here.
+                search::clear(&st, p);
                 st.filter.borrow_mut().clear();
             }
             *st.active_panel.borrow_mut() = p;
@@ -6174,9 +5792,9 @@ pub fn install(window: &MainWindow, state: AppState) {
             w.set_active_filter(st.filter.borrow().clone().into());
         });
     }
-    // Manual ordering belongs to the displayed directory. Sort, grouping and
-    // filters remain stored on the tab and are merely suspended while that
-    // directory is in manual mode.
+    // Manual ordering belongs to the displayed directory. Sort and grouping
+    // remain stored on the tab and are suspended while that directory is in
+    // manual mode. Filters stay available and leave the stored order intact.
     {
         let st = state.clone();
         let weak = window.as_weak();
@@ -6212,10 +5830,8 @@ pub fn install(window: &MainWindow, state: AppState) {
         window.on_tab_new(move || {
             let Some(w) = weak.upgrade() else { return };
             let default_display = TabDisplayDefaults::from(&*st.config.borrow());
+            let inherited = st.new_view_path();
             let target = st.with_tabs_mut(|book| {
-                // New UX: the new tab inherits the path of the
-                // previously active tab (instead of always $HOME).
-                let inherited = book.tabs[book.active].current_path.clone();
                 book.open(inherited, default_display);
                 let a = book.active;
                 book.tabs[a].current_path.clone()
@@ -6250,6 +5866,13 @@ pub fn install(window: &MainWindow, state: AppState) {
                 tab_scroll_target(&st, panel.max(0) as usize, idx, forward, viewport_x, view_w)
             },
         );
+    }
+    // A folded group contributes one wheel destination without activating a member.
+    {
+        let st = state.clone();
+        window.on_panel_tab_step(move |panel: i32, forward: bool| {
+            tab_step(&st, panel.max(0) as usize, forward)
+        });
     }
     {
         let st = state.clone();
@@ -6297,29 +5920,16 @@ pub fn install(window: &MainWindow, state: AppState) {
             if let Some((closed, p)) = closed_and_target {
                 st.remember_closed_tab(closed);
                 w.set_closed_tabs_available(true);
-                load_directory(&w, &st, &p, false);
+                if st.with_tabs(|book| book.group_page().is_some()) {
+                    update_panels_ui(&w, &st);
+                } else {
+                    load_directory(&w, &st, &p, false);
+                }
                 st.persist_workspace();
             }
         });
     }
-    {
-        let st = state.clone();
-        let weak = window.as_weak();
-        window.on_tab_clicked(move |idx: i32| {
-            let Some(w) = weak.upgrade() else { return };
-            let target: Option<PathBuf> = st.with_tabs_mut(|book| {
-                if book.select(idx as usize) {
-                    let a = book.active;
-                    Some(book.tabs[a].current_path.clone())
-                } else {
-                    None
-                }
-            });
-            if let Some(p) = target {
-                load_directory(&w, &st, &p, false);
-            }
-        });
-    }
+    tabs::ui::install(window, &state);
 
     // : Panels (split / close of the layout tree) -----
     {
@@ -6327,7 +5937,7 @@ pub fn install(window: &MainWindow, state: AppState) {
         let weak = window.as_weak();
         window.on_panel_split(move |dir: i32| {
             let Some(w) = weak.upgrade() else { return };
-            let inherited = st.current_path();
+            let inherited = st.new_view_path();
             let default_display = TabDisplayDefaults::from(&*st.config.borrow());
             let new_active = {
                 let mut panels = st.panels.borrow_mut();
@@ -6351,7 +5961,9 @@ pub fn install(window: &MainWindow, state: AppState) {
                         // is duplicated, as the user expects on split).
                         let cols = panels[active].columns.clone();
                         let mode = panels[active].tab_bar_mode;
-                        panels.push(Panel::with_mode(inherited, cols, mode, default_display));
+                        let mut panel = Panel::with_mode(inherited, cols, mode, default_display);
+                        panel.tab_bar_restore_mode = panels[active].tab_bar_restore_mode;
+                        panels.push(panel);
                         Some(new_idx)
                     } else {
                         None
@@ -6364,8 +5976,7 @@ pub fn install(window: &MainWindow, state: AppState) {
             }
         });
     }
-    // A view's tab bar position: 0 top · 1 left ·
-    // 2 right. Persisted per view in the workspace.
+    // The position menu and visibility shortcut share the same mutation path.
     {
         let st = state.clone();
         let weak = window.as_weak();
@@ -6376,14 +5987,9 @@ pub fn install(window: &MainWindow, state: AppState) {
                 let Some(p) = panels.get_mut(panel.max(0) as usize) else {
                     return;
                 };
-                let m = mode.clamp(0, 2) as u8;
-                if p.tab_bar_mode == m {
+                if !p.set_tab_bar_mode(mode) {
                     return;
                 }
-                p.tab_bar_mode = m;
-                // The scroll axis changes → the reported offset is stale (the
-                // view resets to 0; auto-reveal re-centers the active tab).
-                p.tabs_viewport_x = 0.0;
             }
             st.persist_workspace();
             update_panels_ui(&w, &st);
@@ -6425,9 +6031,10 @@ pub fn install(window: &MainWindow, state: AppState) {
             let Some(w) = weak.upgrade() else { return };
             let idx = idx as usize;
             let changed = {
-                let panels = st.panels.borrow();
+                let mut panels = st.panels.borrow_mut();
                 let mut active = st.active_panel.borrow_mut();
                 if idx < panels.len() && idx != *active {
+                    panels[*active].tabs.reset_selection();
                     *active = idx;
                     true
                 } else {
@@ -6453,6 +6060,8 @@ pub fn install(window: &MainWindow, state: AppState) {
             }
         });
     }
+
+    install_panel_cycle(window, state.layout.clone(), state.active_panel.clone());
 
     // Previews / thumbnails -----
     // Starts the scheduler's worker POOL for this application state.
@@ -6500,6 +6109,16 @@ pub fn install(window: &MainWindow, state: AppState) {
                             arranged_model_geometry(&*panel.rows_model, layout)
                                 .restore_top(anchor, top, height),
                         )
+                    })
+                    .unwrap_or(top);
+                let top = st
+                    .panels
+                    .try_borrow()
+                    .ok()
+                    .and_then(|panels| {
+                        panels
+                            .get(panel as usize)
+                            .and_then(|panel| panel.thumbnail_restore_top.take())
                     })
                     .unwrap_or(top);
                 let (first, last) = update_panel_render_window(&st, panel as usize, top, height);
@@ -6882,7 +6501,7 @@ pub fn install(window: &MainWindow, state: AppState) {
     // to the row(s) at the matching path, in preview panels.
     {
         let st = state.clone();
-        window.on_thumb_ready(move |path: SharedString, serial: i32, img: Image| {
+        window.on_thumb_ready(move |path, serial, img, remote| {
             let key = path.to_string();
             let target = PathBuf::from(&key);
             let locations = st.thumb_scheduler.in_flight_locations(&target, serial);
@@ -6892,8 +6511,33 @@ pub fn install(window: &MainWindow, state: AppState) {
                 st.thumb_scheduler.complete(&target, serial);
                 return;
             }
-            st.thumb_cache.borrow_mut().put(key.clone(), img.clone());
+            if let Some(resolution) = st.thumb_scheduler.take_probe_result(&target, serial) {
+                let requests = ambiguous::apply(
+                    &st.panels.borrow(),
+                    &st.thumb_cache,
+                    &st.config.borrow(),
+                    &target,
+                    &locations,
+                    resolution,
+                );
+                st.thumb_scheduler.complete(&target, serial);
+                if !requests.is_empty() {
+                    st.thumb_scheduler.merge_pending(requests);
+                }
+                return;
+            }
+            if !remote && img.size().width == 0 {
+                st.thumb_cache.borrow_mut().mark_failed(key);
+                st.thumb_scheduler.complete(&target, serial);
+                return;
+            }
+            if !remote {
+                st.thumb_cache.borrow_mut().put(key.clone(), img.clone());
+            } else {
+                st.thumb_cache.borrow_mut().remove_path(&target);
+            }
             let panels = st.panels.borrow();
+            let mut needs_layout = false;
             for location in locations {
                 let Some(panel) = panels.get(location.panel) else {
                     continue;
@@ -6908,10 +6552,26 @@ pub fn install(window: &MainWindow, state: AppState) {
                 };
                 // The index may have been recycled by a watcher: the path remains
                 // authoritative. A row outside the window keeps only the LRU.
-                if row.rendered && row.thumbnail.size().width == 0 && row_path(&row) == target {
-                    row.thumbnail = img.clone();
+                if row.rendered && row_path(&row) == target {
+                    if remote {
+                        row.content_remote = true;
+                        row.thumbnail = Image::default();
+                    } else if !row.content_remote && row.thumbnail.size().width == 0 {
+                        needs_layout |= ambiguous::can_promote(&row) && !row.preview_capable;
+                        row.thumbnail = img.clone();
+                    } else {
+                        continue;
+                    }
                     model.set_row_data(location.row, row);
                 }
+            }
+            drop(panels);
+            if needs_layout && !st.thumb_layout_pending.replace(true) {
+                let state = st.clone();
+                slint::Timer::single_shot(Duration::from_millis(16), move || {
+                    state.thumb_layout_pending.set(false);
+                    promote_cached_previews(&state);
+                });
             }
             // The worker waits for this acknowledgment before choosing the next job:
             // a scroll that happened during the decoding can therefore re-prioritize the
@@ -7010,181 +6670,8 @@ pub fn install(window: &MainWindow, state: AppState) {
         }
     });
 
-    // ----- Tab drag'n'drop -----
-    // The intra-instance target index computation (preview + drop) is done on the
-    // SLINT SIDE (same formula → visual/logic consistency). The bridge handles multi-
-    // instance: on every progress update, if ANOTHER Favnyr window is under the
-    // cursor, we send it the hover point → it shows its insertion
-    // preview. `hover_target` (shared with `tab-drag-completed`) remembers the
-    // last hovered instance so it can be sent a "hover end" at the
-    // right moment (target change OR end of drag).
-    let hover_target = Rc::new(std::cell::Cell::new(0isize));
-    {
-        let weak = window.as_weak();
-        let last = hover_target.clone();
-        window.on_tab_drag_progress(move |_from_idx: i32, ax: f32, ay: f32| {
-            let Some(w) = weak.upgrade() else { return };
-            // Logical client → physical screen (`WindowFromPoint`'s frame of reference).
-            let (sx, sy) = window_logical_to_screen(&w, ax, ay);
-            let target = crate::winmsg::target_at(sx, sy).unwrap_or(0);
-            let prev = last.get();
-            if prev != target && prev != 0 {
-                crate::winmsg::hover_end(prev); // left the previous instance
-            }
-            if target != 0 {
-                crate::winmsg::hover(target, sx, sy);
-            }
-            last.set(target);
-        });
-    }
-    {
-        let last_hover = hover_target.clone();
-        let st = state.clone();
-        let weak = window.as_weak();
-        window.on_tab_drag_completed(
-            move |src_panel: i32, from_idx: i32, target_intra: i32, abs_x: f32, abs_y: f32| {
-                let Some(w) = weak.upgrade() else { return };
-                // End of drag: clears any hover preview still displayed in
-                // another instance. For a TRANSFER, the target instance clears it
-                // too upon receiving it; this hover_end covers the other cases (tear-off,
-                // cancellation, or moving the cursor out of the hovered instance).
-                let hovered = last_hover.replace(0);
-                if hovered != 0 {
-                    crate::winmsg::hover_end(hovered);
-                }
-
-                // The SOURCE panel of the drag is passed explicitly (it may
-                // NOT be the active panel — we no longer activate mid-drag since that
-                // would rebuild the model and kill the drag).
-                let source_panel =
-                    (src_panel.max(0) as usize).min(st.panels.borrow().len().saturating_sub(1));
-
-                // --- Drop OUTSIDE this window: transfer to another Favnyr
-                // instance OR tear-off. `abs_x/abs_y` are in
-                // (logical) WINDOW coordinates; we compare against the client dimensions.
-                // 24px margin: avoids a tear-off on a simple edge overshoot
-                // (and covers most of the title bar at the top → no false
-                // positive when going a bit too far up).
-                {
-                    let outside = dropped_outside(&w, abs_x, abs_y);
-                    // Physical SCREEN position of the cursor at drop, converted from
-                    // the real Win32 CLIENT frame of reference (no borders/title bar).
-                    let at = window_logical_to_screen(&w, abs_x, abs_y);
-                    let from = from_idx.max(0) as usize;
-                    // 1) ANOTHER Favnyr window under the cursor → TRANSFER the tab
-                    // into that instance. Tested BEFORE `outside`: `WindowFromPoint`
-                    // returns the window at the TOP of the z-order — if instance B overlaps
-                    // A and the user sees B under the cursor, we do transfer
-                    // to B even if the point is still within A's bounds.
-                    if let Some(target) = crate::winmsg::target_at(at.0, at.1) {
-                        w.set_drag_target_panel(-1);
-                        w.set_drag_target_zone(0);
-                        w.set_drag_target_gap(-1);
-                        w.set_drag_target_gap_panel(-1);
-                        match transfer_tab_to(&w, &st, source_panel, from, target, at) {
-                            Transfer::Moved => {
-                                refresh_all_panels(&w, &st);
-                                return;
-                            }
-                            // Instance emptied → in the process of closing: don't touch anything.
-                            Transfer::Emptied | Transfer::Blocked => return,
-                            // Target frozen/gone → tear off if outside the window, otherwise abandon.
-                            Transfer::Failed => {
-                                if !outside {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    // 2) Outside the window, no target instance → tear-off: new
-                    // Favnyr instance on the tab's folder.
-                    if outside {
-                        w.set_drag_target_panel(-1);
-                        w.set_drag_target_zone(0);
-                        w.set_drag_target_gap(-1);
-                        w.set_drag_target_gap_panel(-1);
-                        if tear_off_tab(&st, source_panel, from, Some(at)) {
-                            refresh_all_panels(&w, &st);
-                        }
-                        return;
-                    }
-                }
-                // Target + zone computed by the hovered panel (Slint).
-                let dtp = w.get_drag_target_panel();
-                let zone = w.get_drag_target_zone();
-                w.set_drag_target_panel(-1);
-                w.set_drag_target_zone(0);
-                // Last claimed insertion gap (header) + panel claiming
-                // full geometry on the Slint side, exact for any width.
-                let gap = w.get_drag_target_gap();
-                let gap_panel = w.get_drag_target_gap_panel();
-                w.set_drag_target_gap(-1);
-                w.set_drag_target_gap_panel(-1);
-
-                // --- Drop on an EDGE → split of the target panel + adoption of the tab.
-                if dtp >= 0 && (2..=5).contains(&zone) {
-                    let target_panel = dtp as usize;
-                    let dir = if zone == 4 || zone == 5 {
-                        SplitDir::Column
-                    } else {
-                        SplitDir::Row
-                    };
-                    // West/North → the new panel goes first (left/top).
-                    let new_first = zone == 2 || zone == 4;
-                    let from = from_idx.max(0) as usize;
-                    if split_with_tab(&st, source_panel, from, target_panel, dir, new_first) {
-                        refresh_all_panels(&w, &st);
-                    }
-                    return;
-                }
-
-                // Drop outside any panel zone (gap, splitter, outside the window):
-                // the drag didn't hover any panel → we cancel (the tab stays put).
-                if dtp < 0 {
-                    return;
-                }
-                let target_panel = (dtp as usize).min(st.panels.borrow().len().saturating_sub(1));
-                let from = from_idx.max(0) as usize;
-
-                if target_panel == source_panel {
-                    // Same panel: reorder if an insertion position is
-                    // known (drop on the tab bar), otherwise no-op.
-                    if target_intra >= 0 {
-                        let moved = {
-                            let mut panels = st.panels.borrow_mut();
-                            source_panel < panels.len()
-                                && panels[source_panel]
-                                    .tabs
-                                    .move_tab(from, target_intra as usize)
-                        };
-                        if moved {
-                            update_panels_ui(&w, &st);
-                        }
-                    }
-                    // The drag (even a no-op one) activates the source panel.
-                    *st.active_panel.borrow_mut() = source_panel;
-                    update_panels_ui(&w, &st);
-                } else {
-                    // Cross-view: move the tab into the target panel. If the
-                    // source empties out (last tab), it gets closed (merge).
-                    // Insertion position: EXACT gap claimed by the TARGET's
-                    // header (drop on its tab bar); otherwise — drop in the body
-                    // ("move" zone) — at the END of the bar, predictably.
-                    let insert_at = if gap >= 0 && gap_panel == dtp {
-                        gap as usize
-                    } else {
-                        st.panels.borrow()[target_panel].tabs.tabs.len()
-                    };
-                    if let Some(active) =
-                        move_tab_between(&st, source_panel, from, target_panel, insert_at)
-                    {
-                        *st.active_panel.borrow_mut() = active;
-                        refresh_all_panels(&w, &st);
-                    }
-                }
-            },
-        );
-    }
+    tabs::drag::install(window, &state);
+    tabs::ipc::install(window, &state);
 
     // Resizing a splitter -----
     // `frac` = the pointer's absolute position as a fraction [0,1] of the container along
@@ -7374,8 +6861,7 @@ pub fn install(window: &MainWindow, state: AppState) {
                 let mut panels = st.panels.borrow_mut();
                 let panel = (panel.max(0) as usize).min(panels.len().saturating_sub(1));
                 let tabs = &mut panels[panel].tabs;
-                tabs.tabs.push(restored);
-                tabs.active = tabs.tabs.len() - 1;
+                tabs.insert_tab_at(tabs.tabs.len(), restored);
                 panel
             };
             *st.active_panel.borrow_mut() = panel;
@@ -7846,6 +7332,18 @@ fn defer(f: impl FnOnce() + 'static) {
     slint::Timer::single_shot(std::time::Duration::from_millis(0), f);
 }
 
+#[cfg(windows)]
+fn release_native_drag_pointer(window: &MainWindow, x: f32, y: f32) {
+    // OLE may consume the physical release. Finish Slint's captured press before
+    // entering its modal loop, so the next drop menu receives pointer events.
+    window
+        .window()
+        .dispatch_event(slint::platform::WindowEvent::PointerReleased {
+            position: slint::LogicalPosition::new(x, y),
+            button: slint::platform::PointerEventButton::Left,
+        });
+}
+
 /// Resolves the id of the currently active named workspace by looking it up
 /// by name in the on-disk list. `None` if no named workspace is active, or
 /// it can no longer be found.
@@ -8028,17 +7526,18 @@ fn reset_into(window: &MainWindow, state: &AppState) {
 ///
 /// We compare ONLY what matters to the user: **the tabs open per
 /// view** (path + sort + per-tab display settings), each view's **tab bar
-/// position**, and the four **collapsible sections of the left
+/// position**, group membership, names and colors, and the four **collapsible sections of the left
 /// sidebar**. We deliberately IGNORE volatile fields or ones not faithful to a
 /// capture∘load round-trip, which caused false positives: split
 /// ratios (`stretch` — always 1.0 at capture time — and ratios carried by `layout`),
 /// column widths, vertical bar width, as well as the ACTIVE
-/// tab/panel (simple focus, not an open/close).
+/// tab/panel and tab group collapse state (presentation, not content).
 ///
 /// All the retained fields are captured DIRECTLY from the live state, written
 /// as-is into the TOML, and faithfully reconstructed by `build_panels` → the
 /// comparison is stable in both directions.
 type TabSig = (
+    Option<String>,
     String,
     SortColumn,
     SortOrder,
@@ -8050,7 +7549,9 @@ type TabSig = (
     ItemArrangement,
     Option<i32>,
 );
-type WorkspaceSig = (Vec<(Vec<TabSig>, u8)>, SidebarSectionsState);
+type GroupSig = (String, String, u8);
+type ViewSig = (Vec<TabSig>, u8, Vec<GroupSig>);
+type WorkspaceSig = (Vec<ViewSig>, SidebarSectionsState);
 fn workspace_signature(ws: &WorkspaceState) -> WorkspaceSig {
     let panels = ws
         .panels
@@ -8061,6 +7562,7 @@ fn workspace_signature(ws: &WorkspaceState) -> WorkspaceSig {
                 .iter()
                 .map(|t| {
                     (
+                        t.tab_group_id.clone(),
                         t.path.clone(),
                         t.sort_column,
                         t.sort_order,
@@ -8074,7 +7576,13 @@ fn workspace_signature(ws: &WorkspaceState) -> WorkspaceSig {
                     )
                 })
                 .collect();
-            (tabs, p.tab_bar_mode)
+            let groups = p
+                .tab_groups
+                .entries()
+                .iter()
+                .map(|g| (g.id.clone(), g.name.clone(), g.color_slot))
+                .collect();
+            (tabs, p.tab_bar_mode, groups)
         })
         .collect();
     (panels, ws.sidebar_sections)
@@ -9256,15 +8764,27 @@ fn annotation_target_paths(
 /// tabs and their histories remain workspace state and follow the normal
 /// workspace save lifecycle.
 fn track_renamed_path(window: &MainWindow, state: &AppState, from: &Path, to: &Path) {
+    track_renamed_paths(window, state, &[(from.to_owned(), to.to_owned())]);
+}
+
+/// Apply chronological moves before saving each store once. Intermediate names
+/// preserve ownership when two entries exchange their final names.
+fn track_renamed_paths(window: &MainWindow, state: &AppState, steps: &[(PathBuf, PathBuf)]) {
     {
         let mut annotations = annotations_for_update(state);
-        annotations.rename(from, to);
+        for (from, to) in steps {
+            annotations.rename(from, to);
+        }
         save_annotations(state, &annotations);
     }
 
     let favorites_changed = {
         let mut favorites = favorites_for_update(state);
-        favorites.relocate_paths(from, to)
+        let mut changed = false;
+        for (from, to) in steps {
+            changed |= favorites.relocate_paths(from, to);
+        }
+        changed
     };
     if favorites_changed {
         save_favorites(state);
@@ -9278,22 +8798,34 @@ fn track_renamed_path(window: &MainWindow, state: &AppState, from: &Path, to: &P
         .collect();
     if visible_shortcuts
         .iter()
-        .any(|path| ops::is_within(path, from))
+        .any(|path| bulk_rename::relocated(path, steps) != *path)
     {
         state.persist_config(|config| {
-            redirect_shortcuts_after_rename(
-                &mut config.sidebar_shortcut_redirects,
-                &visible_shortcuts,
-                from,
-                to,
-            );
+            if let [(from, to)] = steps {
+                redirect_shortcuts_after_rename(
+                    &mut config.sidebar_shortcut_redirects,
+                    &visible_shortcuts,
+                    from,
+                    to,
+                );
+            } else {
+                bulk_rename::redirect_shortcuts(
+                    &mut config.sidebar_shortcut_redirects,
+                    &visible_shortcuts,
+                    steps,
+                );
+            }
         });
         refresh_sidebar(window, state);
     }
 
     {
         let mut folder_state = folder_state_for_update(state);
-        if folder_state.relocate(from, to) {
+        let mut changed = false;
+        for (from, to) in steps {
+            changed |= folder_state.relocate(from, to);
+        }
+        if changed {
             save_folder_state(state, &folder_state);
         }
     }
@@ -9301,7 +8833,11 @@ fn track_renamed_path(window: &MainWindow, state: &AppState, from: &Path, to: &P
     let workspace_changed = {
         let mut panels = state.panels.borrow_mut();
         let mut closed_tabs = state.closed_tabs.borrow_mut();
-        relocate_open_paths(&mut panels, &mut closed_tabs, from, to)
+        let mut changed = false;
+        for (from, to) in steps {
+            changed |= relocate_open_paths(&mut panels, &mut closed_tabs, from, to);
+        }
+        changed
     };
     if workspace_changed {
         state.persist_workspace();
@@ -9572,6 +9108,9 @@ fn refresh_annotation_models(
             }
         }
         for (index, mut tab) in panel.tabs.iter().enumerate() {
+            if tab.is_group {
+                continue;
+            }
             let slot = i32::from(annotations.color_of(Path::new(tab.path.as_str())));
             if tab.folder_slot != slot {
                 tab.folder_slot = slot;
@@ -9730,7 +9269,8 @@ fn is_drop_runnable(p: &Path) -> bool {
     #[cfg(not(windows))]
     {
         is_executable_path(p)
-            && rfs::classify_kind(p.extension().and_then(|e| e.to_str()), false).can_be_program()
+            && rfs::classify_kind(p.extension().and_then(|e| e.to_str()), false)
+                .can_be_program_with_extension(p.extension().and_then(|e| e.to_str()))
     }
 }
 
@@ -9754,51 +9294,6 @@ fn filtered_ow_picker_items(items: &[OpenerItem], filter: &str) -> Vec<OpenerIte
         .filter(|item| needle.is_empty() || item.label.to_lowercase().contains(&needle))
         .cloned()
         .collect()
-}
-
-fn push_filtered_ow_picker_ui(window: &MainWindow, state: &AppState, filter: &str) {
-    let visible = state
-        .ow_pick_ctx
-        .borrow()
-        .as_ref()
-        .map(|context| filtered_ow_picker_items(&context.items, filter))
-        .unwrap_or_default();
-    window.set_ow_picker_handlers(ModelRc::new(VecModel::from(visible)));
-}
-
-/// Rebuilds both the visible application list and the handler context used when
-/// the user picks an entry. Keeping them together prevents stale selections.
-fn refresh_ow_picker_handlers(
-    window: &MainWindow,
-    state: &AppState,
-    ext: &str,
-    path: &Path,
-    include_without_mime: bool,
-) {
-    let mut handlers = openwith::handlers_for_ext(ext, include_without_mime);
-    handlers.sort_by(|a, b| {
-        b.recommended
-            .cmp(&a.recommended)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-    let items: Vec<OpenerItem> = handlers
-        .iter()
-        .map(|handler| OpenerItem {
-            id: handler.key.clone().into(),
-            label: handler.name.clone().into(),
-            available: true,
-            icon: opener_icon(handler.exe.as_deref().unwrap_or_default()),
-            icon_kind: openers::OpenerIcon::None.as_i32(),
-        })
-        .collect();
-    *state.ow_pick_ctx.borrow_mut() = Some(OwPickCtx {
-        ext: ext.to_owned(),
-        path: path.to_owned(),
-        handlers,
-        items,
-    });
-    let filter = window.get_ow_picker_search_text();
-    push_filtered_ow_picker_ui(window, state, filter.as_str());
 }
 
 fn opener_matches_filter(opener: &openers::Opener, needle: &str) -> bool {
@@ -9907,11 +9402,9 @@ fn push_openers_ui(window: &MainWindow, state: &AppState) {
 /// Applies `edit` to whichever filter the active view is typing into, then
 /// republishes the listing. The two filters are mutually exclusive and share
 /// one keyboard stream, so the choice between them is made here once. A view
-/// in manual order has neither and is left alone.
+/// in manual order filters too: hiding entries never reaches the stored order,
+/// which is reconciled on the complete listing before any filtering.
 fn edit_active_filter(window: &MainWindow, state: &AppState, edit: impl FnOnce(&mut String)) {
-    if state.active_manual_order() {
-        return;
-    }
     if state.active_ext_filter_on() {
         state.with_tabs_mut(|b| {
             let a = b.active;
@@ -11141,6 +10634,7 @@ fn open_path_in_tab_at(
     path: PathBuf,
     panel: i32,
     gap: i32,
+    group: &str,
 ) -> bool {
     let Some(panel) = usize::try_from(panel).ok() else {
         return false;
@@ -11151,9 +10645,19 @@ fn open_path_in_tab_at(
         let Some(target) = panels.get_mut(panel) else {
             return false;
         };
-        target
-            .tabs
-            .insert_tab_at(gap.max(0) as usize, Tab::new(path.clone(), default_display));
+        let destination = tabs::batch::Destination {
+            gap: gap.max(0) as usize,
+            group: (!group.is_empty()).then(|| group.to_owned()),
+        };
+        if tabs::batch::insert(
+            &mut target.tabs,
+            Tab::new(path.clone(), default_display),
+            &destination,
+        )
+        .is_err()
+        {
+            return false;
+        }
     }
     *state.active_panel.borrow_mut() = panel;
     load_directory(window, state, &path, false);
@@ -11169,10 +10673,11 @@ fn open_directory_at_drop(
     panel: i32,
     gap: i32,
     zone: i32,
+    group: &str,
 ) -> bool {
     if gap >= 0 || zone == 1 {
         let insert_at = if gap >= 0 { gap } else { i32::MAX };
-        return open_path_in_tab_at(window, state, path, panel, insert_at);
+        return open_path_in_tab_at(window, state, path, panel, insert_at, group);
     }
     let Ok(panel) = usize::try_from(panel) else {
         return false;
@@ -11297,6 +10802,26 @@ fn favorite_target_exists(path: &Path) -> bool {
     path.exists()
 }
 
+/// Inserts validated targets in order, ignoring paths already in the container.
+fn add_favorite_entries<'a>(
+    store: &mut favorites::FavStore,
+    paths: impl IntoIterator<Item = &'a PathBuf>,
+    container: &str,
+) -> usize {
+    let mut added = 0;
+    for path in paths {
+        let path_str = path.display().to_string();
+        if !store.container_has_path(container, &path_str)
+            && store
+                .add_favorite(container, &default_alias(path), &path_str)
+                .is_some()
+        {
+            added += 1;
+        }
+    }
+    added
+}
+
 /// Saves `paths` into the `container` favorites folder: deduplication
 /// (already-present path ignored) + default alias, then saves + refreshes
 /// the UI + appropriate toast (added / already present). SHARED core for drag
@@ -11318,22 +10843,10 @@ fn add_paths_to_favorite(
     if paths.is_empty() {
         return false;
     }
-    let mut added = 0usize;
-    {
+    let added = {
         let mut fav = favorites_for_update(state);
-        for p in paths {
-            let path_str = p.display().to_string();
-            if fav.container_has_path(container, &path_str) {
-                continue; // already in this favorites folder → ignored
-            }
-            if fav
-                .add_favorite(container, &default_alias(p), &path_str)
-                .is_some()
-            {
-                added += 1;
-            }
-        }
-    }
+        add_favorite_entries(&mut fav, paths, container)
+    };
     let lang = state.config.borrow().language;
     if added > 0 {
         save_favorites(state);
@@ -11480,6 +10993,10 @@ fn initial_populate_async(window: &MainWindow, state: &AppState) {
         let folder_state = folder_state_now(state);
         let mut panels = state.panels.borrow_mut();
         for (i, p) in panels.iter_mut().enumerate() {
+            if p.tabs.group_page().is_some() {
+                p.pending_initial = false;
+                continue;
+            }
             p.pending_initial = true;
             let t = &p.tabs.tabs[p.tabs.active];
             jobs.push((
@@ -11492,12 +11009,15 @@ fn initial_populate_async(window: &MainWindow, state: &AppState) {
             ));
         }
     }
-    if active < jobs.len() {
-        let a = jobs.remove(active);
+    if let Some(index) = jobs.iter().position(|job| job.0 == active) {
+        let a = jobs.remove(index);
         jobs.insert(0, a);
     }
     // Empty panels pushed right away → the display no longer waits on the network.
     update_panels_ui(window, state);
+    if jobs.is_empty() {
+        return;
+    }
 
     // Delivery: the worker PUSHES (idx, path, sorted result, denied?) then
     // wakes the UI thread. The (pure) sort is done on the worker; the conversion
@@ -11611,6 +11131,7 @@ fn apply_initial_listing(
                         item_spacing,
                         group_mode: effective_group_mode(group_mode, manual_order),
                         annotations: &annotations_now(state),
+                        thumb_cache: Some(&state.thumb_cache),
                     },
                 );
                 folder_stats::remember_entries(state, p, &entries);
@@ -11733,7 +11254,7 @@ fn relist_panel(state: &AppState, i: usize) {
     let Some(panel) = panels.get_mut(i) else {
         return;
     };
-    if panel.search.is_some() {
+    if panel.search.is_some() || panel.tabs.group_page().is_some() {
         return;
     }
     panel.pending_initial = false; // fresher than the initial population
@@ -11784,9 +11305,11 @@ fn relist_panel(state: &AppState, i: usize) {
             );
             if manual_order {
                 apply_manual_order(state, &path, &mut entries, show_hidden);
-            } else {
-                apply_ext_filter(&mut entries, ext_on, &ext_txt);
             }
+            // After the manual order, which needs the complete listing to
+            // reconcile: filtering first would drop the hidden names from the
+            // stored order.
+            apply_ext_filter(&mut entries, ext_on, &ext_txt);
             let parent_display = path.display().to_string();
             let now = now_unix();
             let mut rows = entries_to_rows(
@@ -11802,6 +11325,7 @@ fn relist_panel(state: &AppState, i: usize) {
                     item_spacing,
                     group_mode: effective_group_mode(group_mode, manual_order),
                     annotations: &annotations_now(state),
+                    thumb_cache: Some(&state.thumb_cache),
                 },
             );
             for row in &mut rows {
@@ -11865,7 +11389,7 @@ fn recheck_unavailable_panels(window: &MainWindow, state: &AppState) {
         panels
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.unavailable)
+            .filter(|(_, p)| p.unavailable && p.tabs.group_page().is_none())
             .map(|(i, _)| i)
             .collect()
     };
@@ -11878,6 +11402,11 @@ fn recheck_unavailable_panels(window: &MainWindow, state: &AppState) {
 /// active panel's current path (the model rebinding is implicit,
 /// via update_panels_ui which pushes the updated PanelViews).
 fn switch_active_panel(window: &MainWindow, state: &AppState) {
+    if state.with_tabs(|book| book.group_page().is_some()) {
+        state.watcher_gen.fetch_add(1, Ordering::SeqCst);
+        update_panels_ui(window, state);
+        return;
+    }
     let path = state.with_tabs(|book| book.tabs[book.active].current_path.clone());
     let query = state.panels.borrow()[*state.active_panel.borrow()]
         .search
@@ -11983,6 +11512,16 @@ fn install_nav_callback(window: &MainWindow, state: &AppState, action: NavAction
 // ---------- Navigation and listing ----------
 
 fn load_directory(window: &MainWindow, state: &AppState, target: &Path, push_history: bool) {
+    let display = TabDisplayDefaults::from(&*state.config.borrow());
+    state.with_tabs_mut(|book| {
+        if book.group_page().is_some() {
+            // An explicit location opens a new tab instead of overwriting a
+            // retained folder that is not currently visible.
+            book.open(target.to_path_buf(), display);
+        } else {
+            book.select(book.active);
+        }
+    });
     search::clear(state, *state.active_panel.borrow());
     // Any navigation resets the active view's "type-ahead" filter.
     state.filter.borrow_mut().clear();
@@ -12086,41 +11625,6 @@ fn tear_off_view(state: &AppState, src: usize, at: (i32, i32)) -> bool {
     take_view(state, src).is_some()
 }
 
-/// Tab tear-off (browser-style tear-off): opens a NEW
-/// Favnyr instance on the folder of panel `src`'s `from` tab, then
-/// removes that tab from here. Refuses if it's the sole tab of the sole panel
-/// (otherwise the window would end up empty for a simple duplicate — Firefox
-/// behavior). The new instance is launched BEFORE the removal: on failure,
-/// the tab isn't lost. If the source panel becomes empty, it is closed (like
-/// a cross-view move). Returns `true` if the tab was torn off.
-fn tear_off_tab(state: &AppState, src: usize, from: usize, at: Option<(i32, i32)>) -> bool {
-    let (path, saved) = {
-        let panels = state.panels.borrow();
-        if src >= panels.len() || from >= panels[src].tabs.tabs.len() {
-            return false;
-        }
-        // Last tab of the only panel → don't empty the window.
-        if panels.len() == 1 && panels[src].tabs.tabs.len() == 1 {
-            return false;
-        }
-        let view = &panels[src];
-        let tab = &view.tabs.tabs[from];
-        let mut saved = panel_to_state(view);
-        saved.tabs = vec![tab_to_state(tab)];
-        saved.active_tab = 0;
-        (tab.current_path.clone(), saved)
-    };
-    if actions::spawn_detached_view(&saved, &[path], at).is_err() {
-        return false;
-    }
-    // The removal and pruning shared with the cross-instance transfer also
-    // handle re-indexing the active panel. The guard above forbids an
-    // empty instance.
-    let _ = remove_tab_pruning(state, src, from);
-    state.persist_workspace();
-    true
-}
-
 // Cross-INSTANCE tab transfer (Windows) ----------
 
 static SUPPRESS_WORKSPACE_PERSIST: std::sync::atomic::AtomicBool =
@@ -12185,6 +11689,7 @@ fn deserialize_tab(payload: &str) -> Option<(Tab, Option<(i32, i32)>)> {
     let tab = Tab::restored(
         PathBuf::from(p[0]),
         &TabState {
+            tab_group_id: None,
             path: p[0].into(),
             sort_column: column,
             sort_order: order,
@@ -12217,39 +11722,21 @@ fn deserialize_tab(payload: &str) -> Option<(Tab, Option<(i32, i32)>)> {
     Some((tab, drop))
 }
 
-/// Removes the `from` tab of panel `src` and prunes the panel if it empties out.
-/// Returns `true` — WITHOUT REMOVING ANYTHING — if it was the last tab of the last
-/// panel (empty instance): the caller quits. We NEVER leave an empty
-/// `TabBook` in the state: the event loop still processes a few events
-/// before stopping, and any `with_tabs` access would panic.
+/// Retains the last book until window closure; an empty live book is invalid.
 fn remove_tab_pruning(state: &AppState, src: usize, from: usize) -> bool {
     let mut panels = state.panels.borrow_mut();
-    if src >= panels.len() || from >= panels[src].tabs.tabs.len() {
+    let Some(batch) = panels
+        .get(src)
+        .and_then(|p| tabs::batch::Batch::single(&p.tabs, from))
+    else {
         return false;
-    }
-    if panels.len() == 1 && panels[src].tabs.tabs.len() == 1 {
-        return true; // empty instance → quit (the state stays consistent to the end)
-    }
-    panels[src].tabs.tabs.remove(from);
-    {
-        let b = &mut panels[src].tabs;
-        if !b.tabs.is_empty() && b.active >= b.tabs.len() {
-            b.active = b.tabs.len() - 1;
-        }
-    }
-    if panels[src].tabs.tabs.is_empty() && state.layout.borrow_mut().remove_view(src) {
-        panels.remove(src);
-        // Re-indexing the active panel (same rule as panel closing):
-        // clamp if the active one pointed past the end, decrement if it was AFTER `src`
-        // (the indices shifted by one).
-        let mut a = state.active_panel.borrow_mut();
-        if *a >= panels.len() {
-            *a = panels.len().saturating_sub(1);
-        } else if src < *a {
-            *a -= 1;
-        }
-    }
-    false
+    };
+    tabs::transfer::remove_batch(
+        &mut panels,
+        &mut state.layout.borrow_mut(),
+        &mut state.active_panel.borrow_mut(),
+        &batch,
+    ) == Some(tabs::transfer::Removal::LastView)
 }
 
 /// Outcome of a cross-instance tab transfer attempt.
@@ -12364,6 +11851,7 @@ fn locate_tab_drop(
     // Does the drop target the panel's TAB BAR (→ precise gap) or its
     // body (→ predictable insertion at the end)? The band depends on the mode.
     let in_bar = match mode {
+        3 => false,
         // Horizontal: gap 4 + panel padding 7 + toolbar padding 6 + strip 26,
         // + tolerance → 44 px below the TOP of the panel.
         0 => ly <= 44.0,
@@ -12396,18 +11884,10 @@ fn locate_tab_drop(
         0 => lx - 13.0 - panels[p].tabs_viewport_x,
         _ => ly - 48.0 - panels[p].tabs_viewport_x,
     };
-    let titles: Vec<String> = panels[p]
-        .tabs
-        .tabs
-        .iter()
-        .map(|t| tab_title(&t.current_path))
-        .collect();
-    let geo = tab_layout_for(mode, &titles);
-    let gap = geo
-        .iter()
-        .position(|(w, off)| strip_pos < off + w / 2.0)
-        .unwrap_or(geo.len());
-    (p, Some(gap))
+    let gap = panels[p]
+        .tab_presentation
+        .gap(&panels[p].tabs, strip_pos, None);
+    (p, Some(gap.index.max(0) as usize))
 }
 
 /// Cross-instance hover: simulates a LOCAL tab drag at the SCREEN point
@@ -12417,6 +11897,9 @@ fn locate_tab_drop(
 fn set_external_hover(window: &MainWindow, sx: i32, sy: i32) {
     // Physical screen → logical window (`drag-abs-x/y`'s frame of reference, see tab-drag-progress).
     let (wx, wy) = screen_to_window_logical(window, sx, sy);
+    window.set_external_tab_legacy(true);
+    window.set_tab_drag_count(1);
+    window.set_tab_drag_external_blocked(false);
     window.set_drag_source_panel(-1);
     window.set_drag_abs_x(wx);
     window.set_drag_abs_y(wy);
@@ -12428,6 +11911,7 @@ fn set_external_hover(window: &MainWindow, sx: i32, sy: i32) {
 fn clear_external_hover(window: &MainWindow) {
     if window.get_drag_active() && window.get_drag_source_panel() < 0 {
         window.set_drag_active(false);
+        window.set_external_tab_legacy(false);
     }
 }
 
@@ -12627,137 +12111,8 @@ fn on_tab_received(window: &MainWindow, state: &AppState, payload: &str) {
     state.persist_workspace();
 }
 
-fn move_tab_between(
-    state: &AppState,
-    src: usize,
-    from: usize,
-    mut target: usize,
-    insert_at: usize,
-) -> Option<usize> {
-    let mut panels = state.panels.borrow_mut();
-    let n = panels.len();
-    if src >= n || target >= n || src == target {
-        return None;
-    }
-    if from >= panels[src].tabs.tabs.len() {
-        return None;
-    }
-
-    // Extract the tab from the source.
-    let tab = panels[src].tabs.tabs.remove(from);
-    {
-        let b = &mut panels[src].tabs;
-        if !b.tabs.is_empty() && b.active >= b.tabs.len() {
-            b.active = b.tabs.len() - 1;
-        }
-    }
-    let src_empty = panels[src].tabs.tabs.is_empty();
-
-    // Insert into the target.
-    {
-        panels[target].tabs.insert_tab_at(insert_at, tab);
-    }
-
-    // Source emptied (it was its last tab) → close the source panel.
-    if src_empty && state.layout.borrow_mut().remove_view(src) {
-        panels.remove(src);
-        if src < target {
-            target -= 1;
-        }
-    }
-    Some(target.min(panels.len().saturating_sub(1)))
-}
-
-/// Dropping a tab on the EDGE of a panel: splits
-/// `target_panel` according to `dir` and places the `from_tab` tab (moved from
-/// `source_panel`) into the newly created panel. `new_first` = the new
-/// panel is the first child (west/north edge). If the source panel becomes
-/// empty, it is removed (merge). Returns `true` if the operation took place.
-fn split_with_tab(
-    state: &AppState,
-    source_panel: usize,
-    from_tab: usize,
-    target_panel: usize,
-    dir: SplitDir,
-    new_first: bool,
-) -> bool {
-    let mut panels = state.panels.borrow_mut();
-    let n = panels.len();
-    if source_panel >= n || target_panel >= n {
-        return false;
-    }
-    if from_tab >= panels[source_panel].tabs.tabs.len() {
-        return false;
-    }
-    // Splitting your own panel with its only tab doesn't make sense.
-    if target_panel == source_panel && panels[source_panel].tabs.tabs.len() <= 1 {
-        return false;
-    }
-    // Cap: a split creates +1 panel. But if the source then empties out
-    // (last tab → closes), the net change is zero → allowed even at 16.
-    let source_will_close =
-        target_panel != source_panel && panels[source_panel].tabs.tabs.len() == 1;
-    if n >= MAX_PANELS && !source_will_close {
-        return false;
-    }
-
-    // 1. Extract the tab from the source panel.
-    let tab = panels[source_panel].tabs.tabs.remove(from_tab);
-    {
-        let b = &mut panels[source_panel].tabs;
-        if !b.tabs.is_empty() && b.active >= b.tabs.len() {
-            b.active = b.tabs.len() - 1;
-        }
-    }
-    let source_empty = panels[source_panel].tabs.tabs.is_empty();
-
-    // 2. New panel containing the moved tab. It inherits the columns
-    //    and the tab bar position of the source view (visual
-    // consistency during a cross-view drag).
-    let new_idx = panels.len();
-    let inherited_cols = panels[source_panel].columns.clone();
-    let inherited_mode = panels[source_panel].tab_bar_mode;
-    let inherited_vbar = panels[source_panel].vbar_user_w;
-    panels.push(Panel::from_tab(
-        tab,
-        inherited_cols,
-        inherited_mode,
-        inherited_vbar,
-    ));
-
-    // 3. Split the target leaf in the tree.
-    let ok = state
-        .layout
-        .borrow_mut()
-        .split_leaf(target_panel, dir, new_idx, 0.5, new_first);
-    if !ok {
-        // Rollback: remove the created panel, put the tab back into the source.
-        if let Some(p) = panels.pop()
-            && let Some(t) = p.tabs.tabs.into_iter().next()
-        {
-            let dst = &mut panels[source_panel].tabs;
-            let at = from_tab.min(dst.tabs.len());
-            dst.tabs.insert(at, t);
-        }
-        return false;
-    }
-
-    // 4. Source emptied → remove the source panel (merge).
-    let mut final_active = new_idx;
-    if source_empty && state.layout.borrow_mut().remove_view(source_panel) {
-        panels.remove(source_panel);
-        if source_panel < final_active {
-            final_active -= 1;
-        }
-    }
-
-    *state.active_panel.borrow_mut() = final_active.min(panels.len().saturating_sub(1));
-    true
-}
-
-/// Splits a target view with a newly opened directory. Unlike
-/// `split_with_tab`, no source view is consumed: the panel count always grows
-/// by one, and the new view inherits the target chrome.
+/// Splits a target view with a newly opened directory. No source view is
+/// consumed, and the new view inherits the target chrome.
 fn split_with_path(
     state: &AppState,
     path: PathBuf,
@@ -12775,12 +12130,13 @@ fn split_with_path(
     let inherited_cols = panels[target_panel].columns.clone();
     let inherited_mode = panels[target_panel].tab_bar_mode;
     let inherited_vbar = panels[target_panel].vbar_user_w;
-    let panel = Panel::from_tab(
+    let mut panel = Panel::from_tab(
         Tab::new(path, default_display),
         inherited_cols,
         inherited_mode,
         inherited_vbar,
     );
+    panel.tab_bar_restore_mode = panels[target_panel].tab_bar_restore_mode;
     if !state
         .layout
         .borrow_mut()
@@ -13387,13 +12743,40 @@ fn push_op(
     });
 }
 
+/// Terminal cards keep their diagnostic independently of the transient notice.
+fn terminal_op_progress(id: i32, state: i32, title: String, detail: String) -> OpProgress {
+    OpProgress {
+        id,
+        state,
+        progress: 1.0,
+        indeterminate: false,
+        title: title.into(),
+        detail: detail.into(),
+        percent: if state == OP_SUCCESS {
+            "100 %".into()
+        } else {
+            SharedString::default()
+        },
+    }
+}
+
 /// Inserts or refreshes one operation's toast row, keyed by its id.
-fn upsert_op_row(state: &AppState, row: OpProgress) {
-    let model = &state.ops_model;
+fn upsert_op_row(model: &VecModel<OpProgress>, row: OpProgress) {
     let existing =
         (0..model.row_count()).find(|&i| model.row_data(i).map(|r| r.id) == Some(row.id));
     match existing {
-        Some(i) => model.set_row_data(i, row),
+        Some(i) => {
+            // A polled archive result may precede an already queued progress
+            // callback. Never replace its terminal diagnostic with that update.
+            if model
+                .row_data(i)
+                .is_some_and(|previous| previous.state >= OP_SUCCESS)
+                && row.state < OP_SUCCESS
+            {
+                return;
+            }
+            model.set_row_data(i, row);
+        }
         None => model.push(row),
     }
 }
@@ -13988,19 +13371,12 @@ fn run_heavy(work: Heavy, runtime: HeavyRuntime) {
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(w) = weak2.upgrade() {
             if final_visible {
-                w.invoke_op_progress(OpProgress {
-                    id: op_id,
-                    state: final_state,
-                    progress: 1.0,
-                    indeterminate: false,
-                    title: title.into(),
-                    detail: SharedString::default(),
-                    percent: if final_state == OP_SUCCESS {
-                        SharedString::from("100 %")
-                    } else {
-                        SharedString::default()
-                    },
-                });
+                w.invoke_op_progress(terminal_op_progress(
+                    op_id,
+                    final_state,
+                    title,
+                    failure_notice.clone().unwrap_or_default(),
+                ));
             } else {
                 // Finished below the appearance threshold: make sure no row lingers.
                 w.invoke_op_dismiss(op_id);
@@ -14047,6 +13423,10 @@ fn listing_denied(r: &Result<(Vec<Entry>, usize), favnyr_core::Error>) -> bool {
 /// proven synchronous path, limiting the behavior change to the only
 /// I/O likely to block for a long time (SMB, mapped drive, UNC).
 fn refresh_listing(window: &MainWindow, state: &AppState, path: &Path) {
+    if state.with_tabs(|book| book.group_page().is_some()) {
+        update_panels_ui(window, state);
+        return;
+    }
     if search::refresh(window, state, path) {
         return;
     }
@@ -14067,6 +13447,14 @@ fn request_async_panel_listing(
     name_filter: String,
     authenticate: bool,
 ) {
+    if state
+        .panels
+        .borrow()
+        .get(panel_idx)
+        .is_some_and(|p| p.tabs.group_page().is_some())
+    {
+        return;
+    }
     let path = path.to_path_buf();
     let lang = state.snapshot_config().language;
     let manual_order = folder_state_now(state).is_manual(&path);
@@ -14237,6 +13625,10 @@ fn apply_async_listing(window: &MainWindow, state: &AppState, delivery: AsyncLis
         let zoom = panel.tabs.tabs[active].zoom;
         let group_mode = panel.tabs.tabs[active].group_mode;
         let show_hidden = panel.tabs.tabs[active].show_hidden;
+        // Read from the borrow already held: the filters applied below cannot
+        // reach for the panels a second time without tripping over it.
+        let ext_on = panel.tabs.tabs[active].ext_filter_on;
+        let ext_txt = panel.tabs.tabs[active].ext_filter.clone();
         panel.pending_listing = false;
         panel.listing_failed = !succeeded;
         if succeeded {
@@ -14248,6 +13640,12 @@ fn apply_async_listing(window: &MainWindow, state: &AppState, delivery: AsyncLis
             Ok((mut entries, hidden_count)) => {
                 if manual_order {
                     apply_manual_order(state, &delivery.path, &mut entries, show_hidden);
+                    // The worker leaves a manual-order listing whole, so the
+                    // reconciliation above sees every name, hidden ones
+                    // included. Filtering therefore happens here instead, once
+                    // the stored order is out of reach.
+                    apply_name_filter(&mut entries, &state.filter.borrow());
+                    apply_ext_filter(&mut entries, ext_on, &ext_txt);
                 }
                 let parent_display = delivery.path.display().to_string();
                 let now = now_unix();
@@ -14264,6 +13662,7 @@ fn apply_async_listing(window: &MainWindow, state: &AppState, delivery: AsyncLis
                         item_spacing,
                         group_mode: effective_group_mode(group_mode, manual_order),
                         annotations: &annotations_now(state),
+                        thumb_cache: Some(&state.thumb_cache),
                     },
                 );
 
@@ -14470,10 +13869,9 @@ fn refresh_listing_sync(window: &MainWindow, state: &AppState, path: &Path) {
     }
 
     // Active view's "type-ahead" filter: searches for the fragment anywhere
-    // in the name (case-insensitive).
-    if !manual_order {
-        apply_name_filter(&mut entries, &state.filter.borrow());
-    }
+    // in the name (case-insensitive). It runs after the manual order has been
+    // reconciled, so hiding entries never reaches the stored order.
+    apply_name_filter(&mut entries, &state.filter.borrow());
     // Extension filter — orthogonal to type-ahead; doesn't touch
     // folders. Read from the active tab.
     {
@@ -14481,9 +13879,7 @@ fn refresh_listing_sync(window: &MainWindow, state: &AppState, path: &Path) {
             let a = book.active;
             (book.tabs[a].ext_filter_on, book.tabs[a].ext_filter.clone())
         });
-        if !manual_order {
-            apply_ext_filter(&mut entries, on, &txt);
-        }
+        apply_ext_filter(&mut entries, on, &txt);
     }
 
     let parent_display = path.display().to_string();
@@ -14501,6 +13897,7 @@ fn refresh_listing_sync(window: &MainWindow, state: &AppState, path: &Path) {
             item_spacing: cfg.view_item_spacing,
             group_mode: effective_group_mode(group_mode, manual_order),
             annotations: &annotations_now(state),
+            thumb_cache: Some(&state.thumb_cache),
         },
     );
 
@@ -14656,6 +14053,24 @@ const LAYOUT_GAP: f32 = 0.0;
 /// Flattens the current tree into [0,1] fractions of the container.
 fn current_geom(state: &AppState) -> Layout {
     state.layout.borrow().compute(UNIT_AREA, LAYOUT_GAP)
+}
+
+/// Resolve keyboard traversal from live geometry, then use normal activation.
+/// No navigation model is published or updated while resizing separators.
+fn install_panel_cycle(
+    window: &MainWindow,
+    layout: Rc<RefCell<LayoutNode>>,
+    active: Rc<RefCell<usize>>,
+) {
+    let weak = window.as_weak();
+    window.on_panel_cycle(move |previous| {
+        let Some(window) = weak.upgrade() else { return };
+        let geometry = layout.borrow().compute(UNIT_AREA, LAYOUT_GAP);
+        let current = *active.borrow();
+        if let Some(target) = geometry.adjacent_view(current, previous) {
+            window.invoke_panel_clicked(target as i32);
+        }
+    });
 }
 
 /// The ratios to put back if the way out of the last equalize still applies at
@@ -14838,31 +14253,8 @@ fn update_panels_ui(window: &MainWindow, state: &AppState) {
             } else {
                 i18n::footer_text(lang, total, selected, hidden).into()
             };
-            // Tabs: titles + FLAT geometry along the bar's main
-            // axis (imposed width + cumulative offset — not uniform in Y
-            // for a vertical bar). Source of truth for the drag on the Slint side.
-            let tabs_infos: Vec<TabInfo> = {
-                let titles: Vec<String> = p
-                    .tabs
-                    .tabs
-                    .iter()
-                    .map(|t| tab_title(&t.current_path))
-                    .collect();
-                let geo = tab_layout_for(p.tab_bar_mode, &titles);
-                titles
-                    .into_iter()
-                    .zip(geo)
-                    .zip(&p.tabs.tabs)
-                    .map(|((title, (width, offset)), t)| TabInfo {
-                        title: title.into(),
-                        folder_slot: i32::from(annotations.color_of(&t.current_path)),
-                        width,
-                        offset,
-                        // Full path → tooltip on hover.
-                        path: t.current_path.display().to_string().into(),
-                    })
-                    .collect()
-            };
+            p.tab_presentation
+                .update(&p.tabs, p.tab_bar_mode, &annotations);
             // Total width of VISIBLE columns (px) — precise (accounts for
             // visibility AND the fixed resolution/depth columns). Drives the
             // horizontal scroll on the Slint side (`content-width`).
@@ -14884,7 +14276,7 @@ fn update_panels_ui(window: &MainWindow, state: &AppState) {
                 rendered_rows: p.rendered_rows_model.clone(),
                 rows_revision: p.rows_revision.get(),
                 viewport_reset_gen: p.viewport_reset_gen.get(),
-                tabs: ModelRc::new(VecModel::from(tabs_infos)),
+                tabs: ModelRc::from(p.tab_presentation.model.clone()),
                 current_path: tab.current_path.display().to_string().into(),
                 total_count: total as i32,
                 can_go_back: tab.history.can_back(),
@@ -14897,7 +14289,6 @@ fn update_panels_ui(window: &MainWindow, state: &AppState) {
                     .secondary
                     .is_none_or(|s| matches!(s.order, SortOrder::Asc)),
                 group_dates_by_day: tab.sort.secondary.is_some_and(|s| s.group_dates_by_day),
-                active_tab_idx: p.tabs.active as i32,
                 title: format!("{prefix}{}{}{leaf}", i + 1, i18n::tr(lang, "separator_dot")).into(),
                 crumbs: ModelRc::new(VecModel::from(breadcrumbs(&tab.current_path))),
                 col_name_w: col_width(&p.columns, "name"),
@@ -14944,11 +14335,11 @@ fn update_panels_ui(window: &MainWindow, state: &AppState) {
                 cursor_row: tab.cursor,
                 scroll_gen: tab.scroll_gen,
                 unavailable: p.unavailable, // folder unreachable → banner
-                ext_filter_on: tab.ext_filter_on && !folder_state.is_manual(&tab.current_path),
+                ext_filter_on: tab.ext_filter_on,
                 ext_filter: tab.ext_filter.as_str().into(),
                 search_recursive: p.search.is_some(),
                 search_query: p.search.as_ref().map_or("", |s| s.query.as_str()).into(),
-                tab_bar_mode: p.tab_bar_mode as i32, // 0 top · 1 left · 2 right
+                tab_bar_mode: p.tab_bar_mode as i32, // 0 top, 1 left, 2 right, 3 hidden
                 vbar_user_w: p.vbar_user_w,          // handle width, 0 = auto
             };
             (view, footer)
@@ -14960,16 +14351,22 @@ fn update_panels_ui(window: &MainWindow, state: &AppState) {
     // routing (Backspace/Escape) on the Slint side, shared with type-ahead.
     let active_ext_on = panels
         .get(active as usize)
-        .map(|p| {
-            let tab = &p.tabs.tabs[p.tabs.active];
-            tab.ext_filter_on && !folder_state.is_manual(&tab.current_path)
-        })
-        .unwrap_or(false);
-    let active_manual = panels.get(active as usize).is_some_and(|panel| {
-        let tab = &panel.tabs.tabs[panel.tabs.active];
-        folder_state.is_manual(&tab.current_path)
-    });
+        .is_some_and(|p| p.tabs.tabs[p.tabs.active].ext_filter_on);
+    let tab_bars: Vec<_> = panels
+        .iter()
+        .map(|p| p.tab_presentation.state(&p.tabs))
+        .collect();
     drop(panels);
+    let existing_bars = window.get_tab_bars();
+    if existing_bars.row_count() == tab_bars.len() {
+        for (index, bar) in tab_bars.into_iter().enumerate() {
+            if existing_bars.row_data(index).as_ref() != Some(&bar) {
+                existing_bars.set_row_data(index, bar);
+            }
+        }
+    } else {
+        window.set_tab_bars(ModelRc::new(VecModel::from(tab_bars)));
+    }
     // IN-PLACE update if the number of panels is unchanged (active view
     // switch, refresh, sort, navigation…): each `PanelView` is mutated via
     // `set_row_data` instead of replacing the whole model. Otherwise `set_panels`
@@ -15010,11 +14407,9 @@ fn update_panels_ui(window: &MainWindow, state: &AppState) {
     push_equalize_state(window, state);
     window.set_active_panel_idx(active);
     window.set_active_ext_filter_on(active_ext_on);
-    window.set_active_filter(if active_manual {
-        SharedString::new()
-    } else {
-        state.filter.borrow().clone().into()
-    });
+    // Publish the same query the listing uses, including in manual mode.
+    // Hiding only its UI value would leave an invisible filter accepting input.
+    window.set_active_filter(state.filter.borrow().clone().into());
     window.set_can_add_panel(can_add);
     // Is there at least one "unavailable" panel? Drives the auto
     // re-check Timer on the Slint side.
@@ -15325,9 +14720,15 @@ fn push_active_footer(window: &MainWindow, state: &AppState, selected: i32) {
 struct ThumbJob {
     path: PathBuf,
     kind: FileKind,
+    /// Resolved on the UI thread so thumbnail workers only check the target's
+    /// availability and never initialize the shortcut resolver in MTA.
+    #[cfg(windows)]
+    link_target: Option<PathBuf>,
     /// SVGs are loaded by Slint (resvg) on the event loop; other
     /// formats go through `generate_thumb` on the worker.
     svg: bool,
+    /// A bounded classification read, not a request to decode preview pixels.
+    probe: Option<rfs::ambiguous::Rule>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15351,6 +14752,8 @@ struct ScheduledThumb {
 struct InFlightThumb {
     locations: Vec<ThumbLocation>,
     serial: i32,
+    /// A worker result waiting for the existing UI acknowledgment callback.
+    probe_result: Option<ambiguous::Resolution>,
 }
 
 struct ThumbWork {
@@ -15625,6 +15028,7 @@ impl ThumbScheduler {
                         InFlightThumb {
                             locations: scheduled.locations,
                             serial,
+                            probe_result: None,
                         },
                     );
                     return ThumbWork {
@@ -15649,6 +15053,7 @@ impl ThumbScheduler {
                     InFlightThumb {
                         locations: scheduled.locations,
                         serial,
+                        probe_result: None,
                     },
                 );
                 return Some(ThumbWork {
@@ -15696,6 +15101,30 @@ impl ThumbScheduler {
             .unwrap_or_default()
     }
 
+    fn set_probe_result(&self, path: &Path, serial: i32, result: ambiguous::Resolution) -> bool {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(work) = queue
+            .in_flight
+            .get_mut(path)
+            .filter(|work| work.serial == serial)
+        else {
+            return false;
+        };
+        work.probe_result = Some(result);
+        true
+    }
+
+    fn take_probe_result(&self, path: &Path, serial: i32) -> Option<ambiguous::Resolution> {
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .in_flight
+            .get_mut(path)
+            .filter(|work| work.serial == serial)?
+            .probe_result
+            .take()
+    }
+
     /// Drops queued/in-flight generations for paths whose contents changed.
     /// A worker may still finish an old decode, but its serial can no longer
     /// match a later request for the same path, so the UI safely discards it.
@@ -15727,7 +15156,11 @@ impl ThumbScheduler {
 struct ThumbLru {
     map: HashMap<String, Image>,
     order: VecDeque<String>,
+    // Failed decodes have a separate budget so they cannot evict textures.
+    failed: HashSet<String>,
+    failed_order: VecDeque<String>,
     cap: usize,
+    kinds: ambiguous::Cache,
 }
 
 impl ThumbLru {
@@ -15735,7 +15168,10 @@ impl ThumbLru {
         Self {
             map: HashMap::new(),
             order: VecDeque::new(),
+            failed: HashSet::new(),
+            failed_order: VecDeque::new(),
             cap,
+            kinds: ambiguous::Cache::new(cap),
         }
     }
     fn touch(&mut self, key: &str) {
@@ -15756,6 +15192,7 @@ impl ThumbLru {
         self.map.contains_key(key)
     }
     fn put(&mut self, key: String, img: Image) {
+        self.remove_failure(&key);
         if !self.map.contains_key(&key)
             && self.map.len() >= self.cap
             && let Some(old) = self.order.pop_front()
@@ -15766,8 +15203,31 @@ impl ThumbLru {
         self.touch(&key);
     }
 
+    fn mark_failed(&mut self, key: String) {
+        if self.failed.contains(&key) || self.map.contains_key(&key) || self.cap == 0 {
+            return;
+        }
+        if self.failed.len() >= self.cap
+            && let Some(old) = self.failed_order.pop_front()
+        {
+            self.failed.remove(&old);
+        }
+        self.failed.insert(key.clone());
+        self.failed_order.push_back(key);
+    }
+
+    fn remove_failure(&mut self, key: &str) {
+        if self.failed.remove(key)
+            && let Some(position) = self.failed_order.iter().position(|item| item == key)
+        {
+            self.failed_order.remove(position);
+        }
+    }
+
     fn remove_path(&mut self, path: &Path) {
+        self.kinds.remove(path);
         let key = path.to_string_lossy();
+        self.remove_failure(key.as_ref());
         self.map.remove(key.as_ref());
         if let Some(position) = self.order.iter().position(|item| item == key.as_ref()) {
             self.order.remove(position);
@@ -15816,7 +15276,11 @@ fn active_thumbnail_paths(state: &AppState) -> Vec<PathBuf> {
         .filter_map(|index| panel.rows_model.row_data(index))
         // `.lnk` rows can preview an image/audio/video/PDF target even though the
         // shortcut itself is not classified as preview-capable.
-        .filter(|row| row.preview_capable || row.ext.eq_ignore_ascii_case("lnk"))
+        .filter(|row| {
+            thumbnail_kind_for_row(row.kind, row.ext.as_str()).is_some()
+                || row.ext.eq_ignore_ascii_case("lnk")
+                || ambiguous::rule(row).is_some()
+        })
         .map(|row| row_path(&row))
         .collect()
 }
@@ -15835,7 +15299,14 @@ fn image_from_thumb(t: &Thumbnail) -> Image {
 /// previews use embedded images, optional 7-Zip decompression, or CPU mesh rendering.
 /// On **Linux**, everything goes through `thumbnail::generate` (images and
 /// MP3/FLAC covers are in-process; video/PDF use their best-effort CLIs).
-fn generate_thumb(path: &Path, kind: FileKind, max_px: u32) -> Option<Thumbnail> {
+fn generate_thumb(
+    path: &Path,
+    kind: FileKind,
+    max_px: u32,
+    link_target: Option<&Path>,
+) -> Option<Thumbnail> {
+    #[cfg(not(windows))]
+    let _ = link_target;
     #[cfg(windows)]
     {
         // A `.lnk` shortcut → the shell thumbnail API on the link itself: the
@@ -15846,6 +15317,18 @@ fn generate_thumb(path: &Path, kind: FileKind, max_px: u32) -> Option<Thumbnail>
             .map(|e| e.eq_ignore_ascii_case("lnk"))
             .unwrap_or(false)
         {
+            let target = link_target?;
+            if !crate::cloud_content_guard::may_read_automatically(target) {
+                return None;
+            }
+            if let Some(format) = target
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .and_then(rfs::ambiguous::rule_for_extension)
+                && ambiguous::probe(target, format).kind() != FileKind::Video
+            {
+                return None;
+            }
             return crate::winthumb::shell_thumbnail(path, max_px);
         }
         match kind {
@@ -15908,13 +15391,84 @@ fn spawn_thumb_worker(scheduler: Arc<ThumbScheduler>, weak: slint::Weak<MainWind
             let weak_for_ui = weak.clone();
             let scheduler_for_ui = scheduler.clone();
 
+            if let Some(format) = job.probe {
+                let resolution = ambiguous::probe(&job.path, format);
+                if !scheduler.set_probe_result(&wait_path, serial, resolution) {
+                    continue;
+                }
+                let completion_path = wait_path.clone();
+                let posted = slint::invoke_from_event_loop(move || {
+                    if let Some(w) = weak_for_ui.upgrade() {
+                        w.invoke_thumb_ready(path_str.into(), serial, Image::default(), false);
+                    } else {
+                        scheduler_for_ui.complete(&completion_path, serial);
+                    }
+                });
+                if posted.is_err() {
+                    scheduler.complete(&wait_path, serial);
+                } else {
+                    scheduler.wait_until_complete(&wait_path, serial);
+                }
+                continue;
+            }
+
+            match crate::cloud_content_guard::automatic_content_status(&job.path) {
+                #[cfg(windows)]
+                crate::cloud_content_guard::ContentStatus::Remote => {
+                    let completion_path = wait_path.clone();
+                    let posted = slint::invoke_from_event_loop(move || {
+                        if let Some(w) = weak_for_ui.upgrade() {
+                            w.invoke_thumb_ready(path_str.into(), serial, Image::default(), true);
+                        } else {
+                            scheduler_for_ui.complete(&completion_path, serial);
+                        }
+                    });
+                    if posted.is_err() {
+                        scheduler.complete(&wait_path, serial);
+                    } else {
+                        scheduler.wait_until_complete(&wait_path, serial);
+                    }
+                    continue;
+                }
+                #[cfg(windows)]
+                crate::cloud_content_guard::ContentStatus::Unavailable => {
+                    scheduler.complete(&wait_path, serial);
+                    continue;
+                }
+                crate::cloud_content_guard::ContentStatus::Local => {}
+            }
+
             if job.svg {
                 let ui_path = job.path;
                 let posted = slint::invoke_from_event_loop(move || {
                     if let Some(w) = weak_for_ui.upgrade() {
-                        match Image::load_from_path(&ui_path) {
-                            Ok(img) => w.invoke_thumb_ready(path_str.into(), serial, img),
-                            Err(_) => scheduler_for_ui.complete(&ui_path, serial),
+                        match crate::cloud_content_guard::automatic_content_status(&ui_path) {
+                            crate::cloud_content_guard::ContentStatus::Local => {
+                                match Image::load_from_path(&ui_path) {
+                                    Ok(img) => {
+                                        w.invoke_thumb_ready(path_str.into(), serial, img, false)
+                                    }
+                                    Err(_) => w.invoke_thumb_ready(
+                                        path_str.into(),
+                                        serial,
+                                        Image::default(),
+                                        false,
+                                    ),
+                                }
+                            }
+                            #[cfg(windows)]
+                            crate::cloud_content_guard::ContentStatus::Remote => {
+                                w.invoke_thumb_ready(
+                                    path_str.into(),
+                                    serial,
+                                    Image::default(),
+                                    true,
+                                );
+                            }
+                            #[cfg(windows)]
+                            crate::cloud_content_guard::ContentStatus::Unavailable => {
+                                scheduler_for_ui.complete(&ui_path, serial);
+                            }
                         }
                     } else {
                         scheduler_for_ui.complete(&ui_path, serial);
@@ -15928,14 +15482,20 @@ fn spawn_thumb_worker(scheduler: Arc<ThumbScheduler>, weak: slint::Weak<MainWind
                 continue;
             }
 
-            let Some(thumb) = generate_thumb(&job.path, job.kind, MAX_PX) else {
-                scheduler.complete(&wait_path, serial);
-                continue;
-            };
+            #[cfg(windows)]
+            let link_target = job.link_target.as_deref();
+            #[cfg(not(windows))]
+            let link_target = None;
+            let thumb = generate_thumb(&job.path, job.kind, MAX_PX, link_target);
             let completion_path = wait_path.clone();
             let posted = slint::invoke_from_event_loop(move || {
                 if let Some(w) = weak_for_ui.upgrade() {
-                    w.invoke_thumb_ready(path_str.into(), serial, image_from_thumb(&thumb));
+                    w.invoke_thumb_ready(
+                        path_str.into(),
+                        serial,
+                        thumb.as_ref().map(image_from_thumb).unwrap_or_default(),
+                        false,
+                    );
                 } else {
                     scheduler_for_ui.complete(&completion_path, serial);
                 }
@@ -15949,9 +15509,8 @@ fn spawn_thumb_worker(scheduler: Arc<ThumbScheduler>, weak: slint::Weak<MainWind
     });
 }
 
-/// For each panel in preview mode: applies the cached thumbnails to
-/// image/audio-cover/video/PDF/SVG/model rows, then atomically replaces the request for the
-/// missing ones. To be called after a (re)population of fresh rows.
+/// Candidates include image formats that an optional native provider may handle.
+/// Eligibility does not reserve space until a reader is known or a preview exists.
 fn thumbnail_kind_for_row(kind: i32, ext: &str) -> Option<(FileKind, bool)> {
     let svg = kind == 6 && ext.eq_ignore_ascii_case("svg");
     let file_kind = match kind {
@@ -15965,6 +15524,98 @@ fn thumbnail_kind_for_row(kind: i32, ext: &str) -> Option<(FileKind, bool)> {
     Some((file_kind, svg))
 }
 
+fn reserves_preview_space(kind: i32, ext: &str) -> bool {
+    match thumbnail_kind_for_row(kind, ext) {
+        Some((FileKind::Image, svg)) => svg || thumbnail::is_image_preview_extension(ext),
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// Optional providers only enlarge rows after producing actual pixels. Batch
+/// these rare changes and reuse the same bands for rendering and hit-testing.
+fn promote_panel_previews(panel: &Panel, cache: &RefCell<ThumbLru>, config: &Config) {
+    let promoted: Vec<usize> = {
+        let cache = cache.borrow();
+        panel
+            .rows_model
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                !row.content_remote
+                    && !row.preview_capable
+                    && ambiguous::can_promote(row)
+                    && cache.contains(row_path(row).to_string_lossy().as_ref())
+            })
+            .map(|(index, _)| index)
+            .collect()
+    };
+    if promoted.is_empty() {
+        return;
+    }
+    let tab = &panel.tabs.tabs[panel.tabs.active];
+    let relayout = tab.item_arrangement == ItemArrangement::List
+        && tab.preview
+        && config.compact_icon_rows_in_preview
+        && tab.zoom >= THUMB_ZOOM;
+    if !relayout {
+        for index in promoted {
+            if let Some(mut row) = panel.rows_model.row_data(index) {
+                row.preview_capable = true;
+                panel.rows_model.set_row_data(index, row);
+            }
+        }
+        return;
+    }
+    let mut rows: Vec<_> = panel.rows_model.iter().collect();
+    for index in promoted {
+        rows[index].preview_capable = true;
+    }
+    relayout_preview_rows(panel, rows, config);
+}
+
+/// Preview promotions and conservative type demotions share the same anchor.
+fn relayout_changed_previews(panel: &Panel, config: &Config) {
+    let tab = &panel.tabs.tabs[panel.tabs.active];
+    if tab.preview
+        && tab.item_arrangement == ItemArrangement::List
+        && config.compact_icon_rows_in_preview
+        && tab.zoom >= THUMB_ZOOM
+    {
+        relayout_preview_rows(panel, panel.rows_model.iter().collect(), config);
+    }
+}
+
+fn relayout_preview_rows(panel: &Panel, mut rows: Vec<FileRow>, config: &Config) {
+    let tab = &panel.tabs.tabs[panel.tabs.active];
+    let old_top = panel
+        .thumbnail_restore_top
+        .get()
+        .unwrap_or(panel.viewport_top.get());
+    let height = panel.viewport_height.get();
+    let anchor = slice_geometry(&rows).capture_anchor(old_top, height, 0.0, None);
+    layout_rows(&mut rows, tab.zoom, true, config.view_item_spacing);
+    let top = restore_zoom_viewport_top(&rows, anchor, old_top, height);
+    mark_render_window(&mut rows, top, height, None);
+    for row in &mut rows {
+        if !row.rendered {
+            row.thumbnail = Image::default();
+        }
+    }
+    panel.thumbnail_restore_top.set(Some(top));
+    panel.viewport_top.set(top);
+    panel.replace_rows(rows);
+}
+
+fn promote_cached_previews(state: &AppState) {
+    let panels = state.panels.borrow();
+    for panel in panels.iter() {
+        if panel.tabs.tabs[panel.tabs.active].preview {
+            promote_panel_previews(panel, &state.thumb_cache, &state.config.borrow());
+        }
+    }
+}
+
 /// Merges a local request before touching the shared scheduler. The same
 /// image can appear in several panels; all its locations are
 /// kept, but the decoding stays unique.
@@ -15973,8 +15624,11 @@ fn push_thumbnail_request(
     path: PathBuf,
     kind: FileKind,
     svg: bool,
+    link_target: Option<PathBuf>,
     location: ThumbLocation,
 ) {
+    #[cfg(not(windows))]
+    let _ = &link_target;
     if let Some(existing) = requests.get_mut(&path) {
         if !existing.locations.contains(&location) {
             existing.locations.push(location);
@@ -15983,26 +15637,83 @@ fn push_thumbnail_request(
         requests.insert(
             path.clone(),
             ThumbRequest {
-                job: ThumbJob { path, kind, svg },
+                job: ThumbJob {
+                    path,
+                    kind,
+                    svg,
+                    probe: None,
+                    #[cfg(windows)]
+                    link_target,
+                },
                 locations: vec![location],
             },
         );
     }
 }
 
+/// Reuses cached previews and replaces missing requests after rebuilding rows.
 fn request_thumbnails(state: &AppState) {
     let mut requests: HashMap<PathBuf, ThumbRequest> = HashMap::new();
     let panels = state.panels.borrow();
     for (panel_idx, panel) in panels.iter().enumerate() {
         let tab = &panel.tabs.tabs[panel.tabs.active];
-        if !tab.preview {
+        if !tab.preview && !panel.has_ambiguous_files.get() {
             continue;
         }
         let model = &panel.rows_model;
-        for i in 0..model.row_count() {
+        let range = if tab.preview {
+            0..model.row_count()
+        } else {
+            panel.rendered_first.get()..panel.rendered_end.get().min(model.row_count())
+        };
+        let visible = arranged_model_geometry(&**model, panel.item_grid.get()).visible_range(
+            panel.viewport_top.get(),
+            panel.viewport_top.get() + panel.viewport_height.get(),
+        );
+        let mut needs_layout = false;
+        let mut changed_preview_height = false;
+        for i in range {
             let Some(mut row) = model.row_data(i) else {
                 continue;
             };
+            if row.content_remote {
+                let full = row_path(&row);
+                state.thumb_cache.borrow_mut().remove_path(&full);
+                if row.thumbnail.size().width > 0 {
+                    row.thumbnail = Image::default();
+                    model.set_row_data(i, row);
+                }
+                continue;
+            }
+            if panel.has_ambiguous_files.get() && ambiguous::rule(&row).is_some() {
+                let previous_kind = row.kind;
+                let previous_preview = row.preview_capable;
+                let previous_thumbnail = row.thumbnail.size().width;
+                let probing = ambiguous::prepare(
+                    &state.thumb_cache,
+                    &mut row,
+                    visible.contains(&i),
+                    ThumbLocation {
+                        panel: panel_idx,
+                        row: i,
+                        row_count: model.row_count(),
+                    },
+                    &mut requests,
+                );
+                changed_preview_height |= row.preview_capable != previous_preview;
+                if row.kind != previous_kind
+                    || row.preview_capable != previous_preview
+                    || row.thumbnail.size().width != previous_thumbnail
+                {
+                    model.set_row_data(i, row.clone());
+                }
+                if probing {
+                    continue;
+                }
+            }
+            if !tab.preview {
+                continue;
+            }
             // Search can return thousands of entries from a large tree. Decode
             // only its render window; viewport changes request newly seen rows.
             if panel.search.is_some() && !row.rendered {
@@ -16020,42 +15731,57 @@ fn request_thumbnails(state: &AppState) {
             }
             let full = row_path(&row);
             let key = full.to_string_lossy().to_string();
-
-            // Shared source of truth with the row geometry: only these
-            // types are capable of receiving a content texture.
-            let (kind, svg) = match thumbnail_kind_for_row(row.kind, row.ext.as_str()) {
-                Some(k) => k,
-                // A `.lnk` to an image/audio/video/PDF previews the TARGET (the shell
-                // thumbnail API resolves the link). Only `.lnk` rows pay the lookup.
-                None if row.ext.eq_ignore_ascii_case("lnk") => match lnk_thumbnail_kind(&full) {
-                    Some(kind) => (kind, false),
-                    None => continue,
-                },
-                None => continue,
-            };
+            if thumbnail_kind_for_row(row.kind, row.ext.as_str()).is_none()
+                && !row.ext.eq_ignore_ascii_case("lnk")
+            {
+                continue;
+            }
+            if state.thumb_cache.borrow().failed.contains(&key) {
+                continue;
+            }
             if row.rendered {
                 if let Some(img) = state.thumb_cache.borrow_mut().get(&key) {
+                    needs_layout |= ambiguous::can_promote(&row) && !row.preview_capable;
                     row.thumbnail = img;
                     model.set_row_data(i, row);
                     continue;
                 }
             } else if state.thumb_cache.borrow().contains(&key) {
+                needs_layout |= ambiguous::can_promote(&row) && !row.preview_capable;
                 // Don't clone/promote every off-screen image: they
                 // remain available, but LRU recency reflects only the actually
                 // visible usages. Above all, no unnecessary re-decoding.
                 continue;
             }
+            // Resolve a shortcut only when a new thumbnail is needed. A cached
+            // texture does not need to touch the link or its target again.
+            let (kind, svg, link_target) = match thumbnail_kind_for_row(row.kind, row.ext.as_str())
+            {
+                Some((kind, svg)) => (kind, svg, None),
+                None if row.ext.eq_ignore_ascii_case("lnk") => match lnk_thumbnail_kind(&full) {
+                    Some((kind, target)) => (kind, false, Some(target)),
+                    None => continue,
+                },
+                None => continue,
+            };
             push_thumbnail_request(
                 &mut requests,
                 full,
                 kind,
                 svg,
+                link_target,
                 ThumbLocation {
                     panel: panel_idx,
                     row: i,
                     row_count: model.row_count(),
                 },
             );
+        }
+        if needs_layout {
+            promote_panel_previews(panel, &state.thumb_cache, &state.config.borrow());
+        }
+        if changed_preview_height {
+            relayout_changed_previews(panel, &state.config.borrow());
         }
     }
     drop(panels);
@@ -16075,7 +15801,7 @@ fn update_panel_render_window(
 ) -> (i32, i32) {
     let top = top.max(0.0);
     let height = height.max(0.0);
-    let Some((model, preview, old_first, old_end, new_first, new_end, visible)) =
+    let Some((model, preview, has_ambiguous, old_first, old_end, new_first, new_end, visible)) =
         state.panels.try_borrow().ok().and_then(|panels| {
             let panel = panels.get(panel_idx)?;
             panel.viewport_top.set(top);
@@ -16098,6 +15824,7 @@ fn update_panel_render_window(
             Some((
                 panel.rows_model.clone(),
                 panel.tabs.tabs[panel.tabs.active].preview,
+                panel.has_ambiguous_files.get(),
                 old_first,
                 old_end,
                 new_first,
@@ -16126,6 +15853,8 @@ fn update_panel_render_window(
 
     let row_count = model.row_count();
     let mut requests: HashMap<PathBuf, ThumbRequest> = HashMap::new();
+    let mut needs_layout = false;
+    let mut changed_preview_height = false;
     for index in inspected {
         if index >= row_count {
             continue;
@@ -16139,6 +15868,27 @@ fn update_panel_render_window(
             row.rendered = should_render;
             row_changed = true;
         }
+        let mut probing = false;
+        if should_render && has_ambiguous && ambiguous::rule(&row).is_some() {
+            let previous_kind = row.kind;
+            let previous_preview = row.preview_capable;
+            let previous_thumbnail = row.thumbnail.size().width;
+            probing = ambiguous::prepare(
+                &state.thumb_cache,
+                &mut row,
+                index >= visible.0 && index < visible.1,
+                ThumbLocation {
+                    panel: panel_idx,
+                    row: index,
+                    row_count,
+                },
+                &mut requests,
+            );
+            changed_preview_height |= row.preview_capable != previous_preview;
+            row_changed |= row.kind != previous_kind
+                || row.preview_capable != previous_preview
+                || row.thumbnail.size().width != previous_thumbnail;
+        }
 
         if !should_render {
             // The texture stays in the LRU, not in the thousands of off-screen
@@ -16147,18 +15897,27 @@ fn update_panel_render_window(
                 row.thumbnail = Image::default();
                 row_changed = true;
             }
-        } else if preview && row.preview_capable && row.thumbnail.size().width == 0 {
+        } else if preview
+            && !probing
+            && thumbnail_kind_for_row(row.kind, row.ext.as_str()).is_some()
+            && !row.content_remote
+            && row.thumbnail.size().width == 0
+        {
             let full = row_path(&row);
             let key = full.to_string_lossy().to_string();
             if let Some(img) = state.thumb_cache.borrow_mut().get(&key) {
+                needs_layout |= ambiguous::can_promote(&row) && !row.preview_capable;
                 row.thumbnail = img;
                 row_changed = true;
-            } else if let Some((kind, svg)) = thumbnail_kind_for_row(row.kind, row.ext.as_str()) {
+            } else if !state.thumb_cache.borrow().failed.contains(&key)
+                && let Some((kind, svg)) = thumbnail_kind_for_row(row.kind, row.ext.as_str())
+            {
                 push_thumbnail_request(
                     &mut requests,
                     full,
                     kind,
                     svg,
+                    None,
                     ThumbLocation {
                         panel: panel_idx,
                         row: index,
@@ -16169,6 +15928,15 @@ fn update_panel_render_window(
         }
         if row_changed {
             model.set_row_data(index, row);
+        }
+    }
+    if (needs_layout || changed_preview_height)
+        && let Ok(panels) = state.panels.try_borrow()
+        && let Some(panel) = panels.get(panel_idx)
+    {
+        promote_panel_previews(panel, &state.thumb_cache, &state.config.borrow());
+        if changed_preview_height {
+            relayout_changed_previews(panel, &state.config.borrow());
         }
     }
     if !requests.is_empty() {
@@ -16238,6 +16006,9 @@ fn spawn_imgmeta_worker(
             if job.r#gen != r#gen.load(Ordering::Relaxed) {
                 continue;
             }
+            if !crate::cloud_content_guard::may_read_automatically(&job.path) {
+                continue;
+            }
             let Some((w, h, bits, alpha)) = thumbnail::image_meta(&job.path) else {
                 continue;
             };
@@ -16247,7 +16018,12 @@ fn spawn_imgmeta_worker(
             let panel = job.panel as i32;
             let row = job.row as i32;
             let weak = weak.clone();
+            let generation = r#gen.clone();
+            let expected_generation = job.r#gen;
             let _ = slint::invoke_from_event_loop(move || {
+                if generation.load(Ordering::Relaxed) != expected_generation {
+                    return;
+                }
                 if let Some(win) = weak.upgrade() {
                     win.invoke_imgmeta_ready(
                         panel,
@@ -16380,6 +16156,7 @@ fn zoom_grid(
     if zoom == old_zoom {
         return top;
     }
+    panel.thumbnail_restore_top.set(None);
     let Some(old) = panel.item_grid.get() else {
         return top;
     };
@@ -16583,6 +16360,7 @@ fn zoom_panel_visuals(
     crossed_mode: bool,
     viewport: ZoomViewport,
 ) -> f32 {
+    panel.thumbnail_restore_top.set(None);
     let mut rows: Vec<FileRow> = (0..panel.rows_model.row_count())
         .filter_map(|index| panel.rows_model.row_data(index))
         .collect();
@@ -16620,6 +16398,7 @@ fn refresh_rows_visuals(rows: &mut [FileRow], preview: bool, compact_icon_rows: 
             row.name.as_str(),
             row.ext.as_str(),
             row.is_dir,
+            row.content_remote,
             use_large_icon,
         );
         row.app_icon = app_icon;
@@ -16637,6 +16416,7 @@ fn refresh_panel_visuals(
     compact_icon_rows: bool,
     item_spacing: i32,
 ) {
+    panel.thumbnail_restore_top.set(None);
     let mut rows: Vec<FileRow> = (0..panel.rows_model.row_count())
         .filter_map(|index| panel.rows_model.row_data(index))
         .collect();
@@ -16792,6 +16572,9 @@ fn cached_path_icon(path: &Path, big: bool) -> Option<Image> {
     if let Some(v) = cached {
         return v;
     }
+    if !crate::cloud_content_guard::may_read_automatically(path) {
+        return None;
+    }
     let img = openwith::icon_rgba_for_path(&key.0, big).map(|(rgba, w, h)| {
         Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
             &rgba, w, h,
@@ -16836,12 +16619,68 @@ fn cached_desktop_icon(path: &Path) -> Option<Image> {
     image
 }
 
+#[cfg(windows)]
+#[derive(Clone)]
+struct LinkTarget {
+    path: PathBuf,
+    is_dir: bool,
+    ext: String,
+}
+
+#[cfg(windows)]
+struct CachedLinkTarget {
+    len: u64,
+    modified: std::time::SystemTime,
+    target: Option<LinkTarget>,
+}
+
+#[cfg(windows)]
 thread_local! {
-    /// Cache of `.lnk` shortcut targets by PATH → `(target_is_folder,
-    /// target_extension)`, or `None` if unresolved. Avoids a COM call + a `stat`
-    /// per `.lnk` on EVERY (re)listing (sort, filter, timezone change…).
-    static LNK_TARGET_CACHE: RefCell<HashMap<String, Option<(bool, String)>>> =
+    /// Cache of resolved shortcut targets by link path. The target path is kept
+    /// so its current availability can be checked before Shell extraction.
+    static LNK_TARGET_CACHE: RefCell<HashMap<PathBuf, CachedLinkTarget>> =
         RefCell::new(HashMap::new());
+}
+
+#[cfg(windows)]
+fn cached_link_target(path: &Path) -> Option<LinkTarget> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok();
+    let len = metadata.len();
+    if let Some(cached) = modified.and_then(|modified| {
+        LNK_TARGET_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            cache.get(path).and_then(|entry| {
+                (entry.len == len && entry.modified == modified).then(|| entry.target.clone())
+            })
+        })
+    }) {
+        return cached;
+    }
+    if !crate::cloud_content_guard::may_read_automatically(path) {
+        return None;
+    }
+    let target = openwith::resolve_shortcut(path).map(|target_path| LinkTarget {
+        is_dir: target_path.is_dir(),
+        ext: target_path
+            .extension()
+            .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default(),
+        path: target_path,
+    });
+    if let Some(modified) = modified {
+        LNK_TARGET_CACHE.with(|cache| {
+            cache.borrow_mut().insert(
+                path.to_path_buf(),
+                CachedLinkTarget {
+                    len,
+                    modified,
+                    target: target.clone(),
+                },
+            )
+        });
+    }
+    target
 }
 
 /// Icon of a `.lnk` shortcut. For a file target (or an unresolved one), the LINK's
@@ -16849,36 +16688,23 @@ thread_local! {
 /// possibly stored in the shortcut and the target's own icon. Manual
 /// resolution now only serves the historical "folder + arrow" rendering
 /// and the extension fallback if the Shell renders nothing.
-/// `None` = link and target unresolved (→ generic `.lnk` icon) or non-Windows.
+/// `None` = unresolved or unavailable link (generic `.lnk` icon), or non-Windows.
 fn resolve_lnk_icon(parent_display: &str, name: &str, big: bool) -> Option<(Image, bool)> {
     #[cfg(windows)]
     {
         let path = std::path::PathBuf::from(parent_display).join(name);
-        let key = path.display().to_string();
-        let cached = LNK_TARGET_CACHE.with(|c| c.borrow().get(&key).cloned());
-        let resolved = match cached {
-            Some(v) => v,
-            None => {
-                let v = openwith::resolve_shortcut(&path).map(|t| {
-                    let ext = t
-                        .extension()
-                        .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                        .unwrap_or_default();
-                    (t.is_dir(), ext)
-                });
-                LNK_TARGET_CACHE.with(|c| c.borrow_mut().insert(key, v.clone()));
-                v
-            }
-        };
-        match resolved {
+        match cached_link_target(&path) {
             // Keeps the explicit historical "folder + arrow" rendering: a
             // non-empty Shell image would take priority over this SVG in Slint.
-            Some((true, _)) => Some((Image::default(), true)),
-            Some((false, ext)) => Some((
-                cached_path_icon(&path, big).unwrap_or_else(|| ext_app_icon(&ext, big)),
+            Some(LinkTarget { is_dir: true, .. }) => Some((Image::default(), true)),
+            Some(target) => Some((
+                crate::cloud_content_guard::may_read_automatically(&target.path)
+                    .then(|| cached_path_icon(&path, big))
+                    .flatten()
+                    .unwrap_or_else(|| ext_app_icon(&target.ext, big)),
                 false,
             )),
-            None => cached_path_icon(&path, big).map(|icon| (icon, false)),
+            None => None,
         }
     }
     #[cfg(not(windows))]
@@ -16893,30 +16719,21 @@ fn resolve_lnk_icon(parent_display: &str, name: &str, big: bool) -> Option<(Imag
 /// shortcut previews the image, like Explorer. Reuses the icon path's
 /// `LNK_TARGET_CACHE`, so it adds no COM call the icon didn't already make.
 /// `None` on non-Windows, for a folder target, or a non-previewable one.
-fn lnk_thumbnail_kind(lnk_path: &Path) -> Option<FileKind> {
+fn lnk_thumbnail_kind(lnk_path: &Path) -> Option<(FileKind, PathBuf)> {
     #[cfg(windows)]
     {
-        let key = lnk_path.display().to_string();
-        let cached = LNK_TARGET_CACHE.with(|c| c.borrow().get(&key).cloned());
-        let (is_dir, ext) = match cached {
-            Some(v) => v?,
-            None => {
-                let resolved = openwith::resolve_shortcut(lnk_path).map(|t| {
-                    let e = t
-                        .extension()
-                        .map(|x| x.to_string_lossy().to_ascii_lowercase())
-                        .unwrap_or_default();
-                    (t.is_dir(), e)
-                });
-                LNK_TARGET_CACHE.with(|c| c.borrow_mut().insert(key, resolved.clone()));
-                resolved?
-            }
-        };
-        if is_dir {
+        let target = cached_link_target(lnk_path)?;
+        if target.is_dir || !crate::cloud_content_guard::may_read_automatically(&target.path) {
             return None;
         }
-        thumbnail_kind_for_row(rfs::classify_kind(Some(&ext), false).as_i32(), &ext)
-            .map(|(kind, _)| kind)
+        if rfs::ambiguous::rule_for_extension(&target.ext).is_some() {
+            return Some((FileKind::File, target.path));
+        }
+        thumbnail_kind_for_row(
+            rfs::classify_kind(Some(&target.ext), false).as_i32(),
+            &target.ext,
+        )
+        .map(|(kind, _)| (kind, target.path))
     }
     #[cfg(not(windows))]
     {
@@ -16933,10 +16750,14 @@ fn row_app_icon(
     name: &str,
     ext: &str,
     is_dir: bool,
+    content_remote: bool,
     big: bool,
 ) -> (Image, bool) {
     if is_dir {
         return (Image::default(), false);
+    }
+    if content_remote {
+        return (ext_app_icon(ext, big), false);
     }
     // A launcher shows the application it starts, like everywhere else on the
     // desktop — a row of identical generic icons says nothing about which game
@@ -17055,6 +16876,7 @@ struct RowContext<'a> {
     item_spacing: i32,
     group_mode: GroupMode,
     annotations: &'a favnyr_core::annotations::AnnotationStore,
+    thumb_cache: Option<&'a RefCell<ThumbLru>>,
 }
 
 fn entry_to_row(e: &Entry, parent_display: &str, ctx: &RowContext) -> FileRow {
@@ -17122,16 +16944,38 @@ fn entry_to_row(e: &Entry, parent_display: &str, ctx: &RowContext) -> FileRow {
     // 0777, files copied from Windows): an image/video/document… is NOT
     // a program, so no "launch with these files" (see can_be_program).
     #[cfg(not(windows))]
-    let drop_runnable = !e.is_dir && e.executable && e.kind.can_be_program();
-    let preview_capable = thumbnail_kind_for_row(e.kind.as_i32(), &ext_raw).is_some();
+    let drop_runnable =
+        !e.is_dir && e.executable && e.kind.can_be_program_with_extension(Some(&ext_raw));
+    // Rebuilt rows keep confirmed preview geometry while the pixels remain
+    // cached. Release the borrow before any native application-icon lookup.
+    let ambiguous_extension =
+        e.kind == FileKind::File && rfs::ambiguous::rule_for_extension(&ext_raw).is_some();
+    let kind = if ambiguous_extension {
+        ctx.thumb_cache
+            .map_or(e.kind, |cache| ambiguous::entry_kind(e, cache))
+    } else {
+        e.kind
+    };
+    let preview_capable = !ambiguous_extension && reserves_preview_space(kind.as_i32(), &ext_raw)
+        || !e.content_remote
+            && (kind == FileKind::Image || ambiguous_extension && kind == FileKind::Video)
+            && ctx
+                .thumb_cache
+                .is_some_and(|cache| cache.borrow().contains(e.path.to_string_lossy().as_ref()));
     // Actual OS app icon for this extension — empty for a folder
     // or if unavailable (falls back to the view's type icon). Cached.
     // Resolution suited to the mode: 256 px in previews (enlarged), 32 px in list.
     // For `.lnk` shortcuts: we resolve the target → target app icon
     // (file) OR "folder + arrow" marker (folder) via `link_folder`.
     let use_large_icon = grid || big_icon && (!compact_icon_rows || preview_capable);
-    let (app_icon, link_folder) =
-        row_app_icon(parent_display, &e.name, &ext_raw, e.is_dir, use_large_icon);
+    let (app_icon, link_folder) = row_app_icon(
+        parent_display,
+        &e.name,
+        &ext_raw,
+        e.is_dir,
+        e.content_remote,
+        use_large_icon,
+    );
     FileRow {
         name: e.name.clone().into(),
         name_base: name_base.into(),
@@ -17143,12 +16987,13 @@ fn entry_to_row(e: &Entry, parent_display: &str, ctx: &RowContext) -> FileRow {
         created: created.into(),
         is_dir: e.is_dir,
         is_symlink: e.is_symlink,
+        content_remote: e.content_remote,
         is_share: e.is_share,
         // Only consulted for folders, so a stray slot on a file costs nothing.
         folder_slot: i32::from(annotations.color_of(&e.path)),
         comment: annotations.note_of(&e.path).into(),
         drop_runnable,
-        kind: e.kind.as_i32(),
+        kind: kind.as_i32(),
         selected: false,
         cut: false,
         hidden: e.hidden,
@@ -17400,6 +17245,41 @@ fn focus_entry_by_name(window: &MainWindow, state: &AppState, name: &str) {
     push_active_footer(window, state, count);
 }
 
+/// All creation paths reveal the completed entry through the same listing,
+/// selection and manual-order rules. Network listings apply selection later.
+fn reveal_created_entry(window: &MainWindow, state: &AppState, parent: &Path, name: &str) {
+    let current = || {
+        state.with_tabs(|book| {
+            book.group_page().is_none()
+                && ops::paths_equal(&book.tabs[book.active].current_path, parent)
+        })
+    };
+    if current() && name.starts_with('.') {
+        state.with_tabs_mut(|book| book.tabs[book.active].show_hidden = true);
+    }
+    let path = parent.join(name);
+    append_paths_to_manual_order(state, std::slice::from_ref(&path));
+    invalidate_thumbnail_paths(state, &[path]);
+    window.invoke_refresh_all();
+    if current() && !defer_entry_focus(state, parent, name) {
+        focus_entry_by_name(window, state, name);
+    }
+}
+
+fn defer_entry_focus(state: &AppState, parent: &Path, name: &str) -> bool {
+    let active = *state.active_panel.borrow();
+    let mut panels = state.panels.borrow_mut();
+    if let Some(panel) = panels.get_mut(active)
+        && panel.pending_listing
+        && panel.tabs.group_page().is_none()
+        && ops::paths_equal(&panel.tabs.tabs[panel.tabs.active].current_path, parent)
+    {
+        panel.pending_select = Some(name.to_owned());
+        return true;
+    }
+    false
+}
+
 /// Reveals an entry on the next UI turn. Navigation publishes both a viewport
 /// reset and a new row model; deferring the reveal guarantees that the reset is
 /// applied first instead of racing the `scroll-gen` update. The directory guard
@@ -17460,23 +17340,7 @@ fn select_child_from(window: &MainWindow, state: &AppState, target: &Path, left:
     if let Some(name) = upward_navigation_child_name(target, left) {
         // On network, the listing is still on the worker: remember the target
         // and apply it atomically along with the delivered rows.
-        let active = *state.active_panel.borrow();
-        let deferred = {
-            let mut panels = state.panels.borrow_mut();
-            if let Some(panel) = panels.get_mut(active) {
-                if panel.pending_listing
-                    && panel.tabs.tabs[panel.tabs.active].current_path == target
-                {
-                    panel.pending_select = Some(name.clone());
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
-        if deferred {
+        if defer_entry_focus(state, target, &name) {
             return;
         }
         schedule_focus_entry_by_name(window, state, target.to_path_buf(), name);
@@ -17506,12 +17370,7 @@ fn row_path(row: &FileRow) -> PathBuf {
 
 /// Absolute paths of the active panel's selected rows.
 fn selected_paths(state: &AppState) -> Vec<PathBuf> {
-    let rows = state.active_rows_model();
-    (0..rows.row_count())
-        .filter_map(|i| rows.row_data(i))
-        .filter(|r| r.selected)
-        .map(|r| row_path(&r))
-        .collect()
+    panel_selected_paths(state, *state.active_panel.borrow())
 }
 
 /// Current folder of a given panel (by index). Empty if the index is invalid.
@@ -17519,6 +17378,7 @@ fn panel_dir(state: &AppState, panel: usize) -> PathBuf {
     let panels = state.panels.borrow();
     panels
         .get(panel)
+        .filter(|p| p.tabs.group_page().is_none())
         .map(|p| p.tabs.tabs[p.tabs.active].current_path.clone())
         .unwrap_or_default()
 }
@@ -17529,6 +17389,9 @@ fn panel_dir(state: &AppState, panel: usize) -> PathBuf {
 fn panel_folder_at_row(state: &AppState, panel: usize, row: usize) -> Option<PathBuf> {
     let panels = state.panels.borrow();
     let p = panels.get(panel)?;
+    if p.tabs.group_page().is_some() {
+        return None;
+    }
     let r = p.rows_model.row_data(row)?;
     if !r.is_dir {
         return None;
@@ -17540,6 +17403,9 @@ fn panel_folder_at_row(state: &AppState, panel: usize, row: usize) -> Option<Pat
 fn panel_path_at_row(state: &AppState, panel: usize, row: usize) -> Option<PathBuf> {
     let panels = state.panels.borrow();
     let p = panels.get(panel)?;
+    if p.tabs.group_page().is_some() {
+        return None;
+    }
     let r = p.rows_model.row_data(row)?;
     Some(row_path(&r))
 }
@@ -17551,6 +17417,9 @@ fn panel_selected_paths(state: &AppState, panel: usize) -> Vec<PathBuf> {
     let Some(p) = panels.get(panel) else {
         return Vec::new();
     };
+    if p.tabs.group_page().is_some() {
+        return Vec::new();
+    }
     (0..p.rows_model.row_count())
         .filter_map(|i| p.rows_model.row_data(i))
         .filter(|r| r.selected)
@@ -17627,27 +17496,14 @@ fn move_selected_names(
     selected: &HashSet<String>,
     gap: usize,
 ) -> Option<Vec<String>> {
-    let gap = gap.min(names.len());
-    let moved: Vec<String> = names
+    let indices: Vec<_> = names
         .iter()
-        .filter(|name| selected.contains(name.as_str()))
-        .cloned()
+        .enumerate()
+        .filter_map(|(i, name)| selected.contains(name.as_str()).then_some(i))
         .collect();
-    if moved.is_empty() {
-        return None;
-    }
-    let removed_before = names[..gap]
-        .iter()
-        .filter(|name| selected.contains(name.as_str()))
-        .count();
-    let mut remaining: Vec<String> = names
-        .iter()
-        .filter(|name| !selected.contains(name.as_str()))
-        .cloned()
-        .collect();
-    let insert_at = gap.saturating_sub(removed_before).min(remaining.len());
-    remaining.splice(insert_at..insert_at, moved);
-    (remaining != names).then_some(remaining)
+    let plan = reorder::MovePlan::new(names.len(), &indices, gap)?;
+    let reordered: Vec<_> = plan.sources().iter().map(|&i| names[i].clone()).collect();
+    (reordered != names).then_some(reordered)
 }
 
 fn manual_reorder_would_be_noop(state: &AppState, panel: usize, gap: usize) -> bool {
@@ -17699,6 +17555,12 @@ fn perform_manual_reorder(
         panel.tabs.tabs[panel.tabs.active].current_path.clone()
     };
     if !folder_state_now(state).is_manual(&directory) {
+        return false;
+    }
+    // Checked before the panels are borrowed for writing, and kept even though
+    // the view stops offering the gesture: a stale drop must not rearrange the
+    // part of the order the filter happens to show.
+    if state.panel_filter_active(panel_index) {
         return false;
     }
     let changed = {
@@ -17790,6 +17652,19 @@ fn paths_conflict_with_drop_target(
 
 /// Lightweight validation called only when the hovered row changes.
 fn file_drop_target_invalid(state: &AppState, src_panel: i32, target_panel: i32, row: i32) -> bool {
+    if usize::try_from(target_panel)
+        .ok()
+        .and_then(|i| {
+            state
+                .panels
+                .borrow()
+                .get(i)
+                .map(|p| p.tabs.group_page().is_some())
+        })
+        .unwrap_or(false)
+    {
+        return true;
+    }
     if let Ok(target) = usize::try_from(target_panel)
         && state
             .panels
@@ -18098,10 +17973,10 @@ fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(std::env::temp_dir)
 }
 
-/// Builds `(panels, stretches, active_panel)` from a `WorkspaceState`.
+/// Builds `(panels, layout, active_panel)` from a `WorkspaceState`.
 /// Shared by `from_workspace` (creation) and `replace_with_workspace`
-/// (in-place loading). Validates the paths (fallback `$HOME`).
-fn build_panels(ws: WorkspaceState) -> (Vec<Panel>, LayoutNode, usize) {
+/// (in-place loading). Only empty paths fall back to the home directory.
+fn build_panels(ws: WorkspaceState, group_name: &str) -> (Vec<Panel>, LayoutNode, usize) {
     let ws = ws.sanitized();
     // `sanitized()` guarantees a valid tree covering exactly the panels.
     let layout = ws.layout_tree();
@@ -18114,12 +17989,23 @@ fn build_panels(ws: WorkspaceState) -> (Vec<Panel>, LayoutNode, usize) {
         }
         // `tabs` guaranteed non-empty (sanitized removes empty panels).
         let active = ps.active_tab.min(tabs.len() - 1);
-        panels.push(Panel::from_book(
-            TabBook { tabs, active },
+        let mut panel = Panel::from_book(
+            TabBook {
+                identity: Default::default(),
+                selection: Default::default(),
+                focused_group: None,
+                active_group: None,
+                groups: ps.tab_groups.clone(),
+                tabs,
+                active,
+            },
             ps.columns.clone(),
             ps.tab_bar_mode,
             ps.vbar_width,
-        ));
+        );
+        panel.tab_bar_restore_mode = ps.tab_bar_restore_mode.min(2);
+        panel.repair_group_names(group_name);
+        panels.push(panel);
     }
     let active_panel = ws.active_panel.min(panels.len() - 1);
     (panels, layout, active_panel)
@@ -18258,87 +18144,9 @@ fn breadcrumbs(path: &Path) -> Vec<Crumb> {
     out
 }
 
-/// Imposed width of a tab, in logical pixels, estimated from its title.
-/// The bridge is the bar's geometric source of truth: widths and
-/// offsets are provided as plain values to the Slint model (`TabInfo`). The
-/// drop-point computation therefore stays independent of the reactive layout and shares
-/// the rendering's geometry. The estimate targets an 11 px sans-serif
-/// interface font; a wider title is simply elided by the `TabItem`.
-fn estimate_tab_width(title: &str) -> f32 {
-    // TabItem's fixed chrome: padding-left 10 + spacing 6 + "×" slot 18 +
-    // padding-right 4 = 38 px.
-    const CHROME: f32 = 38.0;
-    let text: f32 = title
-        .chars()
-        .map(|c| match c {
-            'i' | 'l' | 'j' | 't' | 'f' | 'r' | '.' | ',' | '\'' | '!' | ':' | ';' | '|' | ' ' => {
-                3.4
-            }
-            'm' | 'w' | 'M' | 'W' | '@' => 10.0,
-            c if c.is_ascii_uppercase() || c.is_ascii_digit() => 7.2,
-            // CJK / full-width.
-            c if (c as u32) >= 0x2E80 => 11.5,
-            _ => 6.0,
-        })
-        .sum();
-    // Design bounds (e.g. TabItem's min/max-width).
-    (CHROME + text).clamp(90.0, 180.0)
-}
-
-/// (width, offset) of each tab in `tabs-row` (2 px spacing), in logical
-/// px — the PLAIN values pushed into `TabInfo`.
-fn tab_layout(titles: &[String]) -> Vec<(f32, f32)> {
-    const SPACING: f32 = 2.0; // MUST == tabs-row.spacing (slint)
-    let mut off = 0.0_f32;
-    titles
-        .iter()
-        .map(|t| {
-            let w = estimate_tab_width(t);
-            let cur = (w, off);
-            off += w + SPACING;
-            cur
-        })
-        .collect()
-}
-
-/// Height of a VERTICAL bar tab + spacing.
-/// MUST == `TabItem.height` / `vtabs-col.spacing` on the Slint side.
-const VTAB_EXTENT: f32 = 26.0;
-const VTAB_SPACING: f32 = 2.0;
-
-/// (extent, offset) of the tabs on the panel bar's **main axis**:
-/// horizontal → widths estimated from the title (`tab_layout`);
-/// vertical → UNIFORM step (fixed height), the offset is in Y. Same `TabInfo`
-/// contract in both cases — the gap claim (Slint) and the
-/// hit-tests (bridge) share this single source of truth.
-fn tab_layout_for(mode: u8, titles: &[String]) -> Vec<(f32, f32)> {
-    if mode == 0 {
-        return tab_layout(titles);
-    }
-    (0..titles.len())
-        .map(|i| (VTAB_EXTENT, i as f32 * (VTAB_EXTENT + VTAB_SPACING)))
-        .collect()
-}
-
-/// Width, in logical pixels, of the vertical tab bar.
-/// Uses the user-chosen width if positive, otherwise 40% of the
-/// panel with a 180 px cap. The result stays between 110 px
-/// and 60% of the panel. This computation must match `vbar-w` on the Slint side.
-fn vbar_width(panel_w: f32, user_w: f32) -> f32 {
-    let base = if user_w > 0.0 {
-        user_w
-    } else {
-        (panel_w * 0.40).min(180.0)
-    };
-    base.clamp(110.0, (panel_w * 0.60).max(110.0))
-}
-
-/// Scroll target of the tab bar (px, `content-x` ≤ 0) to PROPERLY reveal
-/// a tab — rather than an arbitrary distance jump. The
-/// geometry (same widths/offsets as the `TabInfo` model) is recomputed here
-/// (the bridge has loops, unlike Slint). `idx >= 0` → reveal
-/// tab `idx` (wheel); `idx < 0` → step "tab by tab" in direction
-/// `forward` (chevrons). `viewport_x`/`view_w` come from the Flickable on the Slint side.
+/// Uses cached visible geometry to reveal a logical tab index. A negative
+/// index steps toward the next hidden entry in the requested direction.
+/// The viewport offset and extent come from the bar's Flickable.
 fn tab_scroll_target(
     state: &AppState,
     panel: usize,
@@ -18351,51 +18159,17 @@ fn tab_scroll_target(
     let Some(p) = panels.get(panel) else {
         return viewport_x;
     };
-    let titles: Vec<String> = p
-        .tabs
-        .tabs
-        .iter()
-        .map(|t| tab_title(&t.current_path))
-        .collect();
-    // (extent, offset) on the bar's main axis — the rest of the computation is
-    // agnostic to orientation (`view_w` = the same axis's visible extent).
-    let geo = tab_layout_for(p.tab_bar_mode, &titles);
-    let Some(&(lw, lo)) = geo.last() else {
-        return viewport_x;
+    p.tab_presentation.scroll(idx, forward, viewport_x, view_w)
+}
+
+/// Navigation destination over a panel's bar. A folded group uses its first
+/// logical index as its header's address, without activating a member.
+fn tab_step(state: &AppState, panel: usize, forward: bool) -> i32 {
+    let panels = state.panels.borrow();
+    let Some(p) = panels.get(panel) else {
+        return 0;
     };
-    let content_w = lo + lw;
-    if content_w <= view_w + 0.5 {
-        return 0.0; // no overflow
-    }
-    let max_scroll = view_w - content_w; // < 0 (right end)
-    let vleft = -viewport_x; // visible left edge (content coords)
-    let target = if idx >= 0 {
-        // Reveal tab `idx`: overflowing right edge → align right; hidden
-        // left edge → align left; otherwise already visible (unchanged).
-        match geo.get(idx as usize) {
-            Some(&(w, off)) if off + w > vleft + view_w => view_w - (off + w),
-            Some(&(_w, off)) if off < vleft => -off,
-            _ => viewport_x,
-        }
-    } else if forward {
-        // 1st tab not entirely visible on the right → align its right edge.
-        geo.iter()
-            .find(|(w, off)| off + w > vleft + view_w + 0.5)
-            .map(|(w, off)| view_w - (off + w))
-            .unwrap_or(max_scroll)
-    } else {
-        // Last tab hidden on the left (just before the visible zone) → left edge.
-        let mut t = 0.0_f32;
-        for &(_w, off) in &geo {
-            if off < vleft - 0.5 {
-                t = -off;
-            } else {
-                break;
-            }
-        }
-        t
-    };
-    target.clamp(max_scroll, 0.0)
+    p.tab_presentation.step(&p.tabs, forward)
 }
 
 /// Tab title from a path. Prefers the last segment; special-cased
@@ -18595,6 +18369,121 @@ mod tests {
     use super::*;
 
     #[test]
+    fn operation_failure_survives_late_progress_and_keeps_its_detail() {
+        let model = VecModel::default();
+        let failure = terminal_op_progress(
+            1,
+            OP_ERROR,
+            "Failure".into(),
+            "my_file.bin: access denied".into(),
+        );
+        upsert_op_row(&model, failure.clone());
+        upsert_op_row(
+            &model,
+            OpProgress {
+                id: 1,
+                state: OP_RUNNING,
+                detail: "50 %".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(model.row_count(), 1);
+        assert_eq!(model.row_data(0), Some(failure));
+        upsert_op_row(
+            &model,
+            terminal_op_progress(2, OP_SUCCESS, "Done".into(), String::new()),
+        );
+        assert_eq!(model.row_count(), 2);
+        assert_eq!(model.row_data(1).unwrap().percent, "100 %");
+    }
+
+    #[test]
+    fn view_navigation_shortcuts_share_activation_and_read_live_layout() {
+        use slint::platform::{Key, WindowEvent};
+
+        crate::test_support::run(|| {
+            for rebound in [false, true] {
+                let window = MainWindow::new().unwrap();
+                let layout = Rc::new(RefCell::new(LayoutNode::Split {
+                    dir: SplitDir::Row,
+                    ratio: 0.5,
+                    first: Box::new(LayoutNode::Split {
+                        dir: SplitDir::Column,
+                        ratio: 0.5,
+                        first: Box::new(LayoutNode::Leaf { panel: 2 }),
+                        second: Box::new(LayoutNode::Leaf { panel: 0 }),
+                    }),
+                    second: Box::new(LayoutNode::Leaf { panel: 1 }),
+                }));
+                let active = Rc::new(RefCell::new(2));
+                install_panel_cycle(&window, layout.clone(), active.clone());
+                let activations = Rc::new(Cell::new(0));
+                let output = activations.clone();
+                let target = active.clone();
+                let weak = window.as_weak();
+                window.on_panel_clicked(move |index| {
+                    *target.borrow_mut() = index as usize;
+                    output.set(output.get() + 1);
+                    weak.upgrade().unwrap().set_active_panel_idx(index);
+                });
+                let overrides = if rebound {
+                    [
+                        ("view-next".into(), "F6".into()),
+                        ("view-prev".into(), "F7".into()),
+                    ]
+                    .into_iter()
+                    .collect()
+                } else {
+                    Default::default()
+                };
+                let keymap = shortcuts::Keymap::build(&overrides);
+                window.on_match_action(move |key, control, alt, shift, _| {
+                    Chord::from_event(&key, control, alt, shift)
+                        .and_then(|chord| keymap.action_for(&chord))
+                        .unwrap_or("")
+                        .into()
+                });
+                window.set_active_panel_idx(2);
+                window.show().unwrap();
+                let press = |key: Key| {
+                    let text: SharedString = key.into();
+                    window
+                        .window()
+                        .dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+                    window
+                        .window()
+                        .dispatch_event(WindowEvent::KeyReleased { text });
+                };
+                let next = if rebound { Key::F6 } else { Key::Tab };
+                let previous = if rebound { Key::F7 } else { Key::Backtab };
+                press(next);
+                assert_eq!(*active.borrow(), 1);
+                press(next);
+                assert_eq!(*active.borrow(), 0);
+                press(next);
+                assert_eq!(*active.borrow(), 2);
+                press(previous);
+                assert_eq!(*active.borrow(), 0);
+                assert!(layout.borrow_mut().swap_views(1, 0));
+                press(previous);
+                assert_eq!(*active.borrow(), 2);
+                press(next);
+                assert_eq!(*active.borrow(), 0);
+                assert_eq!(activations.get(), 6);
+                window.set_exit_warning_open(true);
+                press(next);
+                assert_eq!(activations.get(), 6);
+                window.set_exit_warning_open(false);
+                *layout.borrow_mut() = LayoutNode::Leaf { panel: 0 };
+                press(next);
+                press(previous);
+                assert_eq!(activations.get(), 6);
+                window.hide().unwrap();
+            }
+        });
+    }
+
+    #[test]
     fn workspace_shortcut_settings_show_effective_bindings() {
         let defaults = shortcuts::Keymap::build(&Default::default());
         assert_eq!(
@@ -18683,6 +18572,11 @@ mod tests {
             ItemArrangement::List
         );
         let mut book = TabBook {
+            identity: Default::default(),
+            selection: Default::default(),
+            focused_group: None,
+            active_group: None,
+            groups: Default::default(),
             tabs: vec![tab],
             active: 0,
         };
@@ -19521,6 +19415,11 @@ mod tests {
     #[test]
     fn contextual_open_and_duplicate_share_adjacent_tab_insertion() {
         let mut book = TabBook {
+            identity: Default::default(),
+            selection: Default::default(),
+            focused_group: None,
+            active_group: None,
+            groups: Default::default(),
             tabs: vec![Tab::new(PathBuf::from("A"), false)],
             active: 0,
         };
@@ -19553,6 +19452,11 @@ mod tests {
     #[test]
     fn an_external_location_is_inserted_at_the_claimed_tab_gap() {
         let mut book = TabBook {
+            identity: Default::default(),
+            selection: Default::default(),
+            focused_group: None,
+            active_group: None,
+            groups: Default::default(),
             tabs: vec![Tab::new(PathBuf::from("A"), false)],
             active: 0,
         };
@@ -19674,13 +19578,12 @@ mod tests {
         };
         let panels: ModelRc<PanelView> = ModelRc::new(VecModel::from(
             (0..2)
-                .map(|active_tab_idx| PanelView {
+                .map(|_| PanelView {
                     rows: ModelRc::new(VecModel::from(vec![original_row.clone()])),
                     tabs: ModelRc::new(VecModel::from(vec![
                         TabInfo::default(),
                         original_tab.clone(),
                     ])),
-                    active_tab_idx,
                     // The listing still displays the previous path during navigation.
                     current_path: "directory_c".into(),
                     rows_revision: 7,
@@ -20011,6 +19914,9 @@ mod tests {
                 path: PathBuf::from(path),
                 kind: FileKind::Image,
                 svg: false,
+                probe: None,
+                #[cfg(windows)]
+                link_target: None,
             },
             locations: vec![ThumbLocation {
                 panel,
@@ -20418,24 +20324,6 @@ mod tests {
         );
     }
 
-    // Tab geometry -----
-
-    #[test]
-    fn tab_width_is_clamped_and_monotonic() {
-        // Short title → min bound (90); very long → max bound (180).
-        assert_eq!(estimate_tab_width("~"), 90.0);
-        assert_eq!(
-            estimate_tab_width("a-really-endless-folder-name-that-keeps-going"),
-            180.0
-        );
-        // A longer title is never NARROWER (monotonicity).
-        let w1 = estimate_tab_width("Documents");
-        let w2 = estimate_tab_width("Documents-2024");
-        assert!(w2 >= w1, "{w2} >= {w1}");
-        // Intermediate zone: well within the bounds.
-        assert!(w1 > 90.0 && w1 < 180.0, "{w1}");
-    }
-
     #[test]
     fn own_icon_only_for_self_iconed_types() {
         // Executables & co: EMBEDDED icon → "by path" route.
@@ -20449,7 +20337,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_capability_and_compact_height_share_the_same_rules() {
+    fn thumbnail_candidates_and_compact_height_keep_their_existing_modes() {
         assert_eq!(
             thumbnail_kind_for_row(FileKind::Image.as_i32(), "svg"),
             Some((FileKind::Image, true))
@@ -21276,20 +21164,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn tab_layout_accumulates_offsets_with_spacing() {
-        let titles = vec!["~".to_string(), "src".to_string(), "target".to_string()];
-        let geo = tab_layout(&titles);
-        assert_eq!(geo.len(), 3);
-        // First tab at offset 0.
-        assert_eq!(geo[0].1, 0.0);
-        // Each offset = previous offset + previous width + 2 spacing.
-        assert_eq!(geo[1].1, geo[0].1 + geo[0].0 + 2.0);
-        assert_eq!(geo[2].1, geo[1].1 + geo[1].0 + 2.0);
-        // All widths within the design bounds.
-        assert!(geo.iter().all(|(w, _)| (90.0..=180.0).contains(w)));
-    }
-
     // Workspace "modified" detection -----
 
     #[test]
@@ -21342,6 +21216,11 @@ mod tests {
                 original.cursor = 7;
                 original.selection_anchor = 4;
                 let mut book = TabBook {
+                    identity: Default::default(),
+                    selection: Default::default(),
+                    focused_group: None,
+                    active_group: None,
+                    groups: Default::default(),
                     tabs: vec![original],
                     active: 0,
                 };
@@ -21353,7 +21232,7 @@ mod tests {
                 let closed = tab_to_state(&book.close(1).unwrap());
                 assert_eq!(tab_to_state(&tab_from_state(closed)), saved);
                 let workspace = ws(vec![panel(vec![saved.clone()])]);
-                let (panels, _, _) = build_panels(workspace.clone());
+                let (panels, _, _) = build_panels(workspace.clone(), "Group");
                 assert_eq!(tab_to_state(&panels[0].tabs.tabs[0]), saved);
                 let captured = ws(panels.iter().map(panel_to_state).collect());
                 assert!(!workspaces_differ(&workspace, &captured));
@@ -21440,7 +21319,7 @@ mod tests {
         let dirs = vec![PathBuf::from("folder01"), PathBuf::from("folder02")];
         let arguments = crate::detached_view::arguments(&saved, &dirs, None).unwrap();
         let packet = crate::detached_view::parse(arguments.into_iter().skip(1)).unwrap();
-        let restored = Panel::from_detached(&packet.view, &packet.dirs).unwrap();
+        let restored = Panel::from_detached(&packet.view, &packet.dirs, "Group").unwrap();
         assert_eq!(restored.tabs.active, 1);
         assert_eq!(restored.displayed_path, dirs[1]);
         assert_eq!(restored.tab_bar_mode, 2);
@@ -21452,12 +21331,13 @@ mod tests {
             tab.path = path.display().to_string();
         }
         assert_eq!(panel_to_state(&restored), saved);
-        assert!(Panel::from_detached(&saved, &[]).is_none());
-        assert!(Panel::from_detached(&saved, &dirs[..1]).is_none());
+        assert!(Panel::from_detached(&saved, &[], "Group").is_none());
+        assert!(Panel::from_detached(&saved, &dirs[..1], "Group").is_none());
     }
 
     fn tab(path: &str) -> TabState {
         TabState {
+            tab_group_id: None,
             path: path.into(),
             sort_column: SortColumn::Name,
             sort_order: SortOrder::Asc,
@@ -21473,13 +21353,50 @@ mod tests {
 
     fn panel(tabs: Vec<TabState>) -> ViewState {
         ViewState {
+            tab_groups: Default::default(),
             stretch: 1.0,
             active_tab: 0,
             tabs,
             columns: columns::default_columns(),
             tab_bar_mode: 0,
+            tab_bar_restore_mode: 0,
             vbar_width: 0.0,
         }
+    }
+
+    #[test]
+    fn hidden_tab_bar_preserves_tabs_and_restores_its_position_after_serialization() {
+        for mode in 0..=2 {
+            let mut panel =
+                Panel::with_mode("folder01".into(), columns::default_columns(), mode, false);
+            panel.tabs.tabs.push(Tab::new("folder02".into(), false));
+            panel.tabs.active = 1;
+            panel.tabs_viewport_x = -80.0;
+            assert!(panel.set_tab_bar_mode(-1));
+            assert_eq!(panel.tab_bar_mode, 3);
+            assert_eq!(panel.tabs_viewport_x, 0.0);
+            let saved = panel_to_state(&panel);
+            let text = toml::to_string(&saved).unwrap();
+            let mut restored: ViewState = toml::from_str(&text).unwrap();
+            restored.sanitize();
+            assert_eq!(restored, saved);
+            let dirs = [PathBuf::from("folder01"), PathBuf::from("folder02")];
+            let mut panel = Panel::from_detached(&restored, &dirs, "Group").unwrap();
+            assert_eq!(panel.tabs.active, 1);
+            assert_eq!(panel.tabs.tabs.len(), 2);
+            assert!(panel.set_tab_bar_mode(-1));
+            assert_eq!(panel.tab_bar_mode, mode);
+            assert!(!panel.set_tab_bar_mode(i32::from(mode)));
+        }
+        let mut old: ViewState =
+            toml::from_str("tab_bar_mode = 2\n[[tabs]]\npath = 'folder01'").unwrap();
+        old.sanitize();
+        assert_eq!(old.tab_bar_mode, 2);
+        assert_eq!(old.tab_bar_restore_mode, 0);
+        old.tab_bar_mode = 255;
+        old.tab_bar_restore_mode = 255;
+        old.sanitize();
+        assert_eq!((old.tab_bar_mode, old.tab_bar_restore_mode), (0, 0));
     }
 
     fn ws(panels: Vec<ViewState>) -> WorkspaceState {

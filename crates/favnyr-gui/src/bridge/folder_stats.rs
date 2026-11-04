@@ -409,6 +409,7 @@ mod tests {
             },
             hidden: false,
             is_symlink: false,
+            content_remote: false,
             is_share: false,
             executable: false,
         })

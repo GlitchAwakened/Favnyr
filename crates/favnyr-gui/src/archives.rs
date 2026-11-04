@@ -238,14 +238,14 @@ pub enum Outcome {
     Ready(Output),
     PasswordRequired,
     Cancelled,
-    Failed,
+    Failed(Failure),
 }
 
 enum ProcessOutcome {
     Success,
     PasswordRequired,
     Cancelled,
-    Failed,
+    Failed(Failure),
 }
 
 pub fn valid_password(password: &str) -> bool {
@@ -276,43 +276,9 @@ fn read_pipe(mut pipe: impl Read + Send + 'static, tx: mpsc::SyncSender<Vec<u8>>
     });
 }
 
-#[derive(Default)]
-struct Diagnostics {
-    line: Vec<u8>,
-    password_prompt: bool,
-    wrong_password: bool,
-    progress: Option<u8>,
-}
-
-impl Diagnostics {
-    fn feed(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            if matches!(byte, b'\r' | b'\n' | 8) {
-                self.inspect();
-                self.line.clear();
-            } else if self.line.len() < 8192 {
-                self.line.push(byte);
-            }
-        }
-        // Password prompts have no terminating newline before stdin is read.
-        self.inspect();
-    }
-
-    fn inspect(&mut self) {
-        let line = String::from_utf8_lossy(&self.line).to_ascii_lowercase();
-        self.password_prompt |= line.contains("enter password");
-        self.wrong_password |=
-            line.contains("wrong password") || line.contains("password is incorrect");
-        // Progress records start with an integer percentage. Names later in
-        // the record are deliberately not parsed as progress.
-        if let Some((number, _)) = line.trim_start().split_once('%')
-            && let Ok(value) = number.parse::<u8>()
-            && value <= 100
-        {
-            self.progress = Some(value);
-        }
-    }
-}
+mod diagnostics;
+use diagnostics::Diagnostics;
+pub use diagnostics::Failure;
 
 /// The password travels over stdin, never in argv, a config file or a log.
 /// Both stdout and stderr are drained until EOF after the child is reaped.
@@ -415,7 +381,16 @@ fn execute(
         return Ok(ProcessOutcome::PasswordRequired);
     }
     tracing::warn!(code = ?status.code(), "7-Zip operation failed");
-    Ok(ProcessOutcome::Failed)
+    let stderr = err.finish(cwd);
+    let stdout = out.finish(cwd);
+    let failure = if stderr.as_ref().is_some_and(|f| f.path.is_some()) {
+        stderr
+    } else if stdout.as_ref().is_some_and(|f| f.path.is_some()) {
+        stdout
+    } else {
+        stderr.or(stdout)
+    };
+    Ok(ProcessOutcome::Failed(failure.unwrap_or_default()))
 }
 
 /// Extensions 7-Zip opens as a single-stream compressor, which is its own
@@ -515,7 +490,7 @@ pub fn run(
             return Ok(Outcome::Cancelled);
         }
         if !valid_password(password) {
-            return Ok(Outcome::Failed);
+            return Ok(Outcome::Failed(Failure::default()));
         }
         let first = job
             .inputs
@@ -552,7 +527,7 @@ pub fn run(
                 level,
             } => {
                 let Some(output_name) = output_name(name, *format, *tar_compression) else {
-                    return Ok(Outcome::Failed);
+                    return Ok(Outcome::Failed(Failure::default()));
                 };
                 if output_name != *name
                     || (*format == Format::Zip && !valid_zip_password(password))
@@ -564,7 +539,7 @@ pub fn run(
                         .iter()
                         .any(|p| p.parent() != Some(destination.as_path()))
                 {
-                    return Ok(Outcome::Failed);
+                    return Ok(Outcome::Failed(Failure::default()));
                 }
                 let archive = payload.join(&output_name);
                 args.insert(0, "a".into());
@@ -610,9 +585,10 @@ pub fn run(
                     match execute(job, &args, &destination, "", cancel, &mut first_half)? {
                         ProcessOutcome::Success => {}
                         ProcessOutcome::Cancelled => return Ok(Outcome::Cancelled),
-                        ProcessOutcome::PasswordRequired | ProcessOutcome::Failed => {
-                            return Ok(Outcome::Failed);
+                        ProcessOutcome::PasswordRequired => {
+                            return Ok(Outcome::Failed(Failure::default()));
                         }
+                        ProcessOutcome::Failed(failure) => return Ok(Outcome::Failed(failure)),
                     }
                     args = base_args();
                     args.insert(0, "a".into());
@@ -702,7 +678,7 @@ pub fn run(
             ProcessOutcome::Success => {}
             ProcessOutcome::PasswordRequired => return Ok(Outcome::PasswordRequired),
             ProcessOutcome::Cancelled => return Ok(Outcome::Cancelled),
-            ProcessOutcome::Failed => return Ok(Outcome::Failed),
+            ProcessOutcome::Failed(failure) => return Ok(Outcome::Failed(failure)),
         }
         if let Some(path) = intermediate_tar {
             std::fs::remove_file(path)?;
@@ -742,7 +718,7 @@ pub fn run(
                     let _ = std::fs::remove_file(&tar);
                 }
                 ProcessOutcome::Cancelled => return Ok(Outcome::Cancelled),
-                ProcessOutcome::PasswordRequired | ProcessOutcome::Failed => {}
+                ProcessOutcome::PasswordRequired | ProcessOutcome::Failed(_) => {}
             }
         }
         validate_tree(&publish_root, cancel)?;
@@ -769,7 +745,10 @@ pub fn run(
             if cancel.load(Ordering::Relaxed) {
                 Outcome::Cancelled
             } else {
-                Outcome::Failed
+                Outcome::Failed(Failure {
+                    path: None,
+                    kind: Some(error.kind()),
+                })
             }
         }
     }
@@ -918,7 +897,7 @@ mod tests {
         };
         assert!(matches!(
             run(&job, "", &AtomicBool::new(false), |_| {}),
-            Outcome::Failed
+            Outcome::Failed(_)
         ));
     }
 
@@ -1186,7 +1165,7 @@ mod tests {
                     // TAR must fail instead of silently dropping encryption.
                     assert!(matches!(
                         run(&job, password, &cancel, |_| {}),
-                        Outcome::Failed
+                        Outcome::Failed(_)
                     ));
                     continue;
                 }
@@ -1277,7 +1256,7 @@ mod tests {
             inputs: vec![archive],
             kind: Kind::Extract { folder: false },
         };
-        assert!(matches!(run(&job, "", &cancel, |_| {}), Outcome::Failed));
+        assert!(matches!(run(&job, "", &cancel, |_| {}), Outcome::Failed(_)));
         let input = fixture.0.join("file01.bin");
         std::fs::write(&input, vec![42; 16 * 1024 * 1024]).unwrap();
         job.inputs = vec![input.clone()];

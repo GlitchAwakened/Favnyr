@@ -8,6 +8,7 @@ import { DeferredLineEditFocus, EditLineEdit, NavIconButton } from "controls.sli
 
 export component ColumnHeader inherits Rectangle {
     callback clicked();
+    callback interaction-start();
     /// Resize in progress: new width (the parent applies it to the right
     /// property via `set-col-width` → no two-way binding, `for`-compatible).
     callback resized(length);
@@ -102,7 +103,10 @@ export component ColumnHeader inherits Rectangle {
         pointer-event(ev) => {
             // LEFT click on a header closes context menus; right-click
             // (column menu) does not bump → it can teleport the menu.
-            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) { Dismiss.serial += 1; }
+            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                Dismiss.serial += 1;
+                root.interaction-start();
+            }
             if (ev.button == PointerEventButton.left) {
                 if (ev.kind == PointerEventKind.down) {
                     root.press-x = self.absolute-position.x + self.mouse-x;
@@ -204,6 +208,7 @@ export component ColumnHeader inherits Rectangle {
                 if (ev.kind == PointerEventKind.down
                         && ev.button == PointerEventButton.left) {
                     Dismiss.serial += 1;
+                    root.interaction-start();
                     root.drag-start-x = self.absolute-position.x + self.mouse-x;
                     root.drag-start-w = root.column-width;
                 }
@@ -239,6 +244,7 @@ component FileItemVisual inherits Rectangle {
     in property <float> hidden-content-alpha;
     in property <bool> link-folder;
     in property <bool> is-symlink;
+    in property <bool> content-remote;
     in property <bool> is-share;
     in property <int> kind;
     in property <int> folder-slot;
@@ -361,6 +367,139 @@ component FileItemVisual inherits Rectangle {
         y: (root.show-thumb ? parent.height
             : (parent.height + root.icon-size) / 2 + root.emblem-dy) - self.height;
     }
+    if root.content-remote : Image {
+        property <ItemRect> emblem-rect: Tokens.cloud-emblem-rect(
+            parent.width, parent.height, root.icon-size, root.emblem-size,
+            root.emblem-dx, root.emblem-dy, root.show-thumb);
+        source: @image-url("../../assets/icons/cloud-remote-emblem.svg");
+        image-fit: contain;
+        opacity: root.hidden-content-alpha;
+        width: root.emblem-size;
+        height: self.width;
+        x: self.emblem-rect.left;
+        y: self.emblem-rect.top;
+    }
+}
+
+// Passive view messages share the viewport's stable pointer handling.
+export component ViewStatusMessage inherits Rectangle {
+    in property <string> heading;
+    in property <string> detail;
+    in property <string> hint;
+    in property <image> icon;
+    in property <brush> icon-color: Tokens.danger;
+    background: Theme.background;
+    VerticalLayout {
+        alignment: center;
+        spacing: 7px;
+        padding-left: 22px; padding-right: 22px;
+        padding-top: 24px; padding-bottom: 24px;
+        HorizontalLayout {
+            alignment: start;
+            Image { source: root.icon; width: 24px; height: 24px; colorize: root.icon-color; }
+        }
+        Text {
+            text: root.heading; font-size: 14px; font-weight: 700;
+            color: Theme.foreground; horizontal-alignment: left; wrap: word-wrap;
+        }
+        Text {
+            text: root.detail; font-size: 12px;
+            color: Theme.foreground.with-alpha(0.65);
+            horizontal-alignment: left; overflow: elide;
+        }
+        Text {
+            text: root.hint; font-size: 11px;
+            color: Theme.foreground.with-alpha(0.5);
+            horizontal-alignment: left; wrap: word-wrap;
+        }
+    }
+}
+
+// List names keep their natural width up to the available space. The extension
+// follows the stem directly instead of occupying the far edge of a stretched cell.
+export component FileItemName inherits Rectangle {
+    in property <string> base;
+    in property <string> extension;
+    in property <length> font-size: 13px;
+    in property <brush> foreground;
+    in property <brush> extension-foreground;
+    // Multiline captions use the same reserved extension width as list names.
+    in property <bool> multiline;
+    stem := Text {
+        x: 0px; y: 0px;
+        width: min(self.preferred-width, max(0px, root.width - suffix.width));
+        height: root.height;
+        // A truncated paragraph fills both lines before its reserved tail.
+        // Non-breaking spaces retain their appearance and allow the native
+        // long-word fallback to cut at character boundaries instead of words.
+        text: root.multiline ? root.base.replace-all(" ", "\u{00a0}") : root.base;
+        font-size: root.font-size;
+        color: root.foreground;
+        wrap: root.multiline ? word-wrap : no-wrap;
+        max-lines: root.multiline ? 2 : 0;
+        overflow: root.multiline ? clip : elide;
+        horizontal-alignment: left;
+        vertical-alignment: root.multiline ? top : center;
+    }
+    suffix := Text {
+        x: stem.width;
+        y: root.multiline ? max(0px, min(stem.preferred-height, root.height) - self.height) : 0px;
+        width: min(self.preferred-width, max(0px, root.width));
+        height: root.multiline ? min(self.preferred-height, root.height) : root.height;
+        text: root.extension;
+        font-size: root.font-size;
+        color: root.extension-foreground;
+        overflow: elide;
+        horizontal-alignment: left;
+        vertical-alignment: center;
+    }
+}
+
+// Complete captions flow inline. Overflowing captions reserve the same tail
+// as list names so clipping the stem cannot hide the file extension.
+export component GridItemName inherits Rectangle {
+    in property <string> base;
+    in property <string> extension;
+    in property <length> font-size: 13px;
+    in property <brush> foreground;
+    in property <color> extension-foreground;
+    clip: true;
+    property <bool> truncated: measured.preferred-height > min(root.height, line-height.preferred-height * 2) + 0.5px;
+    // Native measurements follow the current font and width. They are lazy
+    // bindings, with no callbacks, timers or dependencies on pointer motion.
+    measured := Text {
+        x: 0px; y: 0px; width: root.width;
+        height: self.preferred-height;
+        text: root.base + root.extension;
+        font-size: root.font-size;
+        wrap: word-wrap;
+        visible: false;
+        accessible-role: none;
+    }
+    line-height := Text {
+        x: 0px; y: 0px;
+        text: "M"; font-size: root.font-size;
+        visible: false;
+        accessible-role: none;
+    }
+    if !root.truncated : StyledText {
+        x: 0px; y: 0px; width: root.width; height: root.height;
+        // Interpolation keeps filename characters literal, including markup.
+        text: @markdown("\{root.base}<font color='\{root.extension-foreground}'>\{root.extension}</font>");
+        default-font-size: root.font-size;
+        default-color: root.foreground;
+        horizontal-alignment: center;
+        vertical-alignment: top;
+        max-lines: 2;
+    }
+    if root.truncated : FileItemName {
+        x: 0px; y: 0px; width: root.width; height: root.height;
+        base: root.base; extension: "…" + root.extension;
+        font-size: root.font-size;
+        foreground: root.foreground;
+        extension-foreground: root.extension == "" ? root.foreground : root.extension-foreground;
+        multiline: true;
+    }
 }
 
 export component FileItemView inherits Rectangle {
@@ -373,6 +512,7 @@ export component FileItemView inherits Rectangle {
     in property <string> created;
     in property <bool> is-dir;
     in property <bool> is-symlink;        // symbolic link / junction
+    in property <bool> content-remote;
     in property <bool> is-share;          // root of a network share
     in property <int> folder-slot;        // assigned folder colour, 0 = default
     in property <string> comment;         // note attached to the entry, "" = none
@@ -556,41 +696,20 @@ export component FileItemView inherits Rectangle {
                     hidden-content-alpha: root.hidden-content-alpha;
                     link-folder: root.link-folder;
                     is-symlink: root.is-symlink;
+                    content-remote: root.content-remote;
                     is-share: root.is-share;
                     kind: root.kind;
                     folder-slot: root.folder-slot;
                     comment: root.comment;
                 }
-                // Name = stem + colored extension, JOINED (spacing 0, no
-                // gap) → natural "file.ext" rendering. The stem is bounded to
-                // (available width − extension width) and elides if too long;
-                // the extension therefore always stays visible and attached to the stem.
-                HorizontalLayout {
+                FileItemName {
                     horizontal-stretch: 1;
-                    spacing: 0px;
-                    alignment: start;
-                    Text {
-                        text: root.name-base;
-                        font-size: root.name-font-size;
-                        color: Theme.foreground.with-alpha(root.hidden-content-alpha);
-                        vertical-alignment: center;
-                        overflow: elide;
-                        // Width bounded to the available space of the "name" cell
-                        // (col-name-width − icon slot − spacing − extension).
-                        // We reference the COLUMN width (explicit, driven
-                        // by the bridge) and not `parent.width` (= this layout) →
-                        // no binding loop; the stem elides, the extension
-                        // stays visible and attached.
-                        width: min(
-                            self.preferred-width,
-                            root.col-name-width - root.icon-slot - 8px - ext-txt.preferred-width);
-                    }
-                    ext-txt := Text {
-                        text: root.name-ext;
-                        font-size: root.name-font-size;
-                        color: Tokens.ext.with-alpha(root.hidden-content-alpha);
-                        vertical-alignment: center;
-                    }
+                    width: max(0px, root.col-name-width - root.icon-slot - 8px);
+                    height: parent.height;
+                    base: root.name-base; extension: root.name-ext;
+                    font-size: root.name-font-size;
+                    foreground: Theme.foreground.with-alpha(root.hidden-content-alpha);
+                    extension-foreground: Tokens.ext.with-alpha(root.hidden-content-alpha);
                 }
             }
 
@@ -659,37 +778,21 @@ export component FileItemView inherits Rectangle {
             hidden-content-alpha: root.hidden-content-alpha;
             link-folder: root.link-folder;
             is-symlink: root.is-symlink;
+            content-remote: root.content-remote;
             is-share: root.is-share;
             kind: root.kind;
             folder-slot: root.folder-slot;
             comment: root.comment;
         }
-        HorizontalLayout {
+        GridItemName {
             x: parent.caption.left;
             y: parent.caption.top;
             width: parent.caption.width;
             height: parent.caption.height;
-            spacing: 0px;
-            alignment: center;
-            Text {
-                text: root.name-base;
-                font-size: root.name-font-size;
-                color: Theme.foreground.with-alpha(root.hidden-content-alpha);
-                wrap: word-wrap;
-                overflow: elide;
-                vertical-alignment: center;
-                horizontal-alignment: center;
-                min-width: 0px;
-                horizontal-stretch: 1;
-            }
-            if root.name-ext != "" : Text {
-                text: root.name-ext;
-                font-size: root.name-font-size;
-                color: Theme.foreground.with-alpha(0.65 * root.hidden-content-alpha);
-                vertical-alignment: center;
-                overflow: elide;
-                max-width: parent.width * 0.45;
-            }
+            base: root.name-base; extension: root.name-ext;
+            font-size: root.name-font-size;
+            foreground: Theme.foreground.with-alpha(root.hidden-content-alpha);
+            extension-foreground: Theme.foreground.with-alpha(0.65 * root.hidden-content-alpha);
         }
     }
 

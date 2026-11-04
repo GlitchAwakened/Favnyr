@@ -16,6 +16,7 @@ pub(super) struct Session {
     receiver: Option<mpsc::Receiver<Delivery>>,
     entries: Vec<Entry>,
     pending: VecDeque<Entry>,
+    selection_to_restore: HashSet<PathBuf>,
     pub finished: bool,
     skipped: usize,
     limited: bool,
@@ -162,6 +163,9 @@ pub(super) fn active(state: &AppState) -> bool {
 }
 
 pub(super) fn reject_ambiguous_destination(window: &MainWindow, state: &AppState) -> bool {
+    if state.with_tabs(|book| book.group_page().is_some()) {
+        return true;
+    }
     if !active(state) {
         return false;
     }
@@ -199,7 +203,7 @@ pub(super) fn install(window: &MainWindow, state: &AppState) {
         if active(&st) {
             clear(&st, index);
             refresh_listing(&window, &st, &st.current_path());
-        } else if !st.active_manual_order() && !st.active_ext_filter_on() {
+        } else if !st.active_ext_filter_on() {
             let query = st.filter.borrow().clone();
             if !query.is_empty() {
                 start(&window, &st, index, query);
@@ -242,6 +246,7 @@ pub(super) fn start(window: &MainWindow, state: &AppState, index: usize, query: 
             receiver: None,
             entries: Vec::new(),
             pending: VecDeque::new(),
+            selection_to_restore: HashSet::new(),
             finished: false,
             skipped: 0,
             limited: false,
@@ -301,7 +306,7 @@ pub(super) fn restart(window: &MainWindow, state: &AppState, index: usize) -> bo
             return false;
         };
         let tab = &panel.tabs.tabs[panel.tabs.active];
-        if tab.ext_filter_on || folder_state_now(state).is_manual(&tab.current_path) {
+        if panel.tabs.group_page().is_some() || tab.ext_filter_on {
             None
         } else {
             panel.search.as_ref().map(|s| s.query.clone())
@@ -311,7 +316,16 @@ pub(super) fn restart(window: &MainWindow, state: &AppState, index: usize) -> bo
         clear(state, index);
     }
     if let Some(query) = query {
+        let selected = state.panels.borrow()[index]
+            .rows_model
+            .iter()
+            .filter(|row| row.selected)
+            .map(|row| row_path(&row))
+            .collect();
         start(window, state, index, query);
+        if let Some(session) = state.panels.borrow_mut()[index].search.as_mut() {
+            session.selection_to_restore = selected;
+        }
         true
     } else {
         false
@@ -341,11 +355,7 @@ pub(super) fn refresh(window: &MainWindow, state: &AppState, path: &Path) -> boo
             return false;
         };
         let tab = &panel.tabs.tabs[panel.tabs.active];
-        if session.root != path
-            || query.is_empty()
-            || tab.ext_filter_on
-            || folder_state_now(state).is_manual(path)
-        {
+        if session.root != path || query.is_empty() || tab.ext_filter_on {
             0
         } else if query != session.query || tab.show_hidden != session.show_hidden {
             1
@@ -413,6 +423,7 @@ fn poll(window: &MainWindow, state: &AppState, id: u64) {
                     session.skipped = skipped;
                     session.limited = limited;
                     session.receiver = None;
+                    session.selection_to_restore.clear();
                 }
                 reorder(state, index);
                 publish(window, state, index);
@@ -469,6 +480,7 @@ fn append(state: &AppState, index: usize) {
         item_spacing: config.view_item_spacing,
         group_mode: GroupMode::Mixed,
         annotations: &annotations,
+        thumb_cache: Some(&state.thumb_cache),
     };
     // Shell icon lookups can be expensive. Yield between entries instead of
     // turning one delivery into a long, uninterrupted UI-thread conversion.
@@ -506,6 +518,12 @@ fn append_rows(panel: &Panel, mut rows: Vec<FileRow>) {
         .and_then(|i| panel.rows_model.row_data(i))
         .map_or(0.0, |r| r.visual_y + r.visual_h);
     for row in &mut rows {
+        if panel.search.as_ref().is_some_and(|session| {
+            !session.selection_to_restore.is_empty()
+                && session.selection_to_restore.contains(&row_path(row))
+        }) {
+            row.selected = true;
+        }
         row.model_index += count as i32;
         row.visual_y += offset;
     }
@@ -527,6 +545,9 @@ fn append_rows(panel: &Panel, mut rows: Vec<FileRow>) {
     }
     panel.rendered_first.set(range.start);
     panel.rendered_end.set(range.end);
+    if !panel.has_ambiguous_files.get() && rows.iter().any(|row| ambiguous::rule(row).is_some()) {
+        panel.has_ambiguous_files.set(true);
+    }
     panel.rows_model.extend(rows);
     panel.bump_rows_revision();
 }
@@ -741,6 +762,20 @@ mod tests {
     }
 
     #[test]
+    fn recursive_search_finds_nested_folder_from_each_ancestor() {
+        let tree = Tree::new();
+        tree.file("Folder01/Folder02/Folder03/File01.txt");
+        for relative_root in ["", "Folder01", "Folder01/Folder02"] {
+            let (entries, skipped, limited) =
+                collect(&tree.0.join(relative_root), "Folder03", false, 100, 100);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].path, tree.0.join("Folder01/Folder02/Folder03"));
+            assert_eq!(skipped, 0);
+            assert!(!limited);
+        }
+    }
+
+    #[test]
     fn recursive_search_matches_names_and_keeps_homonyms_distinct() {
         let tree = Tree::new();
         tree.file("folder01/report.txt");
@@ -872,6 +907,7 @@ mod tests {
             receiver: None,
             entries,
             pending: VecDeque::new(),
+            selection_to_restore: HashSet::new(),
             finished: true,
             skipped: 0,
             limited: false,
@@ -919,6 +955,30 @@ mod tests {
     }
 
     #[test]
+    fn recursive_refresh_restores_selection_by_full_path_across_batches() {
+        let root = PathBuf::from("Folder01");
+        let selected = root.join("Folder02").join("File01.txt");
+        let other = root.join("Folder03").join("File01.txt");
+        let mut panel = Panel::with_mode(root.clone(), columns::default_columns(), 0, false);
+        let mut search = session(&root, Vec::new());
+        search.selection_to_restore.insert(selected.clone());
+        panel.search = Some(search);
+        for path in [other, selected] {
+            append_rows(
+                &panel,
+                vec![FileRow {
+                    path: path.parent().unwrap().to_string_lossy().as_ref().into(),
+                    name: "File01.txt".into(),
+                    visual_h: 30.,
+                    ..Default::default()
+                }],
+            );
+        }
+        assert!(!panel.rows_model.row_data(0).unwrap().selected);
+        assert!(panel.rows_model.row_data(1).unwrap().selected);
+    }
+
+    #[test]
     fn recursive_search_rows_preserve_descendant_and_share_paths() {
         let annotations = favnyr_core::annotations::AnnotationStore::default();
         let context = RowContext {
@@ -931,6 +991,7 @@ mod tests {
             item_spacing: 0,
             group_mode: GroupMode::Mixed,
             annotations: &annotations,
+            thumb_cache: None,
         };
         // A slice rather than an array literal: the second case is compiled
         // on Windows only, which would otherwise leave a one-element array
@@ -951,6 +1012,7 @@ mod tests {
                 kind: FileKind::Folder,
                 hidden: false,
                 is_symlink: false,
+                content_remote: false,
                 is_share: false,
                 executable: false,
             };
@@ -979,6 +1041,7 @@ mod tests {
                 kind: FileKind::File,
                 hidden: false,
                 is_symlink: false,
+                content_remote: false,
                 is_share: false,
                 executable: false,
             })

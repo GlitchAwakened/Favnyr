@@ -1,0 +1,486 @@
+import { Button, CheckBox, ComboBox, ScrollView, SpinBox } from "widgets.slint";
+import { ScrollHandle } from "widgets/scroll.slint";
+import { ListView } from "std-widgets.slint";
+import { EditLineEdit, DeferredLineEditFocus } from "controls.slint";
+import { Strings } from "strings.slint";
+import { Theme } from "theme.slint";
+
+export struct BulkRenameOptions {
+    common-enabled: bool, common-name: string,
+    replace-enabled: bool, find: string, replacement: string, case-sensitive: bool, replace-all: bool,
+    affixes-enabled: bool, prefix: string, suffix: string,
+    numbering-enabled: bool, start: int, increment: int, digits: int, position: int, separator: string,
+    case-mode: int, extension-enabled: bool, extension: string,
+}
+export global BulkRenameInputs {
+    in-out property <bool> common-enabled;
+    in-out property <string> common-name;
+    in-out property <bool> replace-enabled;
+    in-out property <string> find;
+    in-out property <string> replacement;
+    in-out property <bool> case-sensitive: true;
+    in-out property <bool> replace-all: true;
+    in-out property <bool> affixes-enabled;
+    in-out property <string> prefix;
+    in-out property <string> suffix;
+    in-out property <bool> numbering-enabled;
+    in-out property <int> start: 1;
+    in-out property <int> increment: 1;
+    in-out property <int> digits: 2;
+    in-out property <int> position: 1;
+    in-out property <string> separator: "_";
+    in-out property <int> case-mode;
+    in-out property <bool> extension-enabled;
+    in-out property <string> extension;
+
+    public function reset() {
+        common-enabled = false;
+        common-name = "";
+        replace-enabled = false;
+        find = "";
+        replacement = "";
+        case-sensitive = true;
+        replace-all = true;
+        affixes-enabled = false;
+        prefix = "";
+        suffix = "";
+        numbering-enabled = false;
+        start = 1;
+        increment = 1;
+        digits = 2;
+        position = 1;
+        separator = "_";
+        case-mode = 0;
+        extension-enabled = false;
+        extension = "";
+    }
+}
+export struct BulkRenameRow {
+    original: string, proposed: string, parent-path: string, status: string, error: bool,
+}
+component Caption inherits Text {
+    color: Theme.foreground; font-size: 12px; vertical-alignment: center;
+}
+
+component OptionFields inherits Rectangle {
+    in property <bool> expanded;
+    visible: root.expanded;
+    height: root.expanded ? content.preferred-height : 0px;
+    content := VerticalLayout { spacing: 10px; @children }
+}
+
+export component BulkRenamePreviewRow inherits Rectangle {
+    in property <BulkRenameRow> entry;
+    in property <bool> alternate;
+    height: content.preferred-height;
+    background: root.alternate ? Theme.surface : transparent;
+    content := VerticalLayout {
+        padding: 12px; spacing: 6px;
+        HorizontalLayout {
+            spacing: 20px;
+            Caption {
+                text: root.entry.original; wrap: word-wrap; vertical-alignment: top;
+                min-width: 0px; preferred-width: 0px; horizontal-stretch: 1;
+            }
+            Caption {
+                text: root.entry.proposed; wrap: word-wrap; vertical-alignment: top;
+                min-width: 0px; preferred-width: 0px; horizontal-stretch: 1;
+            }
+        }
+        Caption { text: root.entry.parent-path; wrap: word-wrap; font-size: 11px; opacity: 0.7; }
+        if root.entry.status != "": Caption {
+            text: root.entry.status; wrap: word-wrap; font-size: 11px;
+            color: root.entry.error ? Theme.danger : Theme.foreground;
+        }
+    }
+}
+
+export component BulkRenamePreview inherits Rectangle {
+    in property <[BulkRenameRow]> rows;
+    in-out property <length> content-y <=> viewport.content-y;
+    out property <length> content-height: viewport.content-height;
+    property <bool> end-anchored;
+    property <length> scroll-limit: max(0px, root.content-height - viewport.visible-height);
+    // The virtual list refines its estimated extent as wrapped rows become visible.
+    // Keep an explicit scrollbar request for the end anchored during that refinement.
+    changed scroll-limit => {
+        viewport.content-y = root.end-anchored
+            ? -root.scroll-limit
+            : clamp(viewport.content-y, -root.scroll-limit, 0px);
+    }
+    changed rows => { root.end-anchored = false; }
+    public function scroll-to(offset: length) {
+        root.end-anchored = root.content-height > viewport.visible-height
+            && offset <= viewport.visible-height - root.content-height;
+        viewport.content-y = offset;
+    }
+    min-height: 110px; vertical-stretch: 1;
+    viewport := ListView {
+        x: 0px; y: 0px; width: root.width; height: root.height;
+        content-width: self.visible-width;
+        horizontal-scrollbar-policy: always-off;
+        vertical-scrollbar-policy: always-off;
+        mouse-drag-pan-enabled: false;
+        scrolled => { root.end-anchored = false; }
+        // These read-only rows need no index-to-pixel hit testing.
+        for entry[index] in root.rows: BulkRenamePreviewRow {
+            width: viewport.visible-width - 16px;
+            entry: entry; alternate: mod(index, 2) == 0;
+        }
+    }
+    ScrollHandle {
+        x: parent.width - self.width; y: 0px; width: 14px; height: parent.height;
+        visible: viewport.content-height > viewport.visible-height;
+        extent: viewport.content-height; page: viewport.visible-height;
+        offset <=> viewport.content-y;
+        scrolled => { root.scroll-to(self.offset); }
+    }
+}
+
+export component BulkRenameDialog inherits Rectangle {
+    in property <bool> open;
+    in property <[BulkRenameRow]> rows;
+    in property <string> summary;
+    in property <bool> ready;
+    in property <bool> running;
+    in property <bool> finished;
+    in property <bool> blocked;
+    callback edited();
+    callback submit();
+    callback cancel();
+    background: Theme.background; border-width: 1px; border-color: Theme.border; border-radius: 8px;
+    property <bool> focus-armed: true;
+    property <int> focus-state: !root.open || root.blocked ? 0 : root.running || root.finished ? 2 : 1;
+    property <length> options-scroll-limit: max(0px, controls.content-height - controls.visible-height);
+    changed options-scroll-limit => {
+        controls.content-y = clamp(controls.content-y, -root.options-scroll-limit, 0px);
+    }
+    changed focus-state => {
+        if root.focus-state == 1 { root.focus-armed = true; }
+        else if root.focus-state == 2 { cancel-button.focus(); }
+    }
+    // Disabled controls can retain a local focus flag after the focus has moved.
+    out property <int> focused-index: entry-focus.has-focus ? -1 : root.running || root.finished
+        ? (cancel-button.has-focus ? 19 : -1)
+        : common-toggle.enabled && common-toggle.has-focus ? 0 :
+        common-edit.enabled && common-edit.has-focus ? 1 :
+        replace-toggle.enabled && replace-toggle.has-focus ? 2 :
+        find-edit.enabled && find-edit.has-focus ? 3 :
+        with-edit.enabled && with-edit.has-focus ? 4 :
+        sensitive.enabled && sensitive.has-focus ? 5 :
+        replace-all.enabled && replace-all.has-focus ? 6 :
+        affix-toggle.enabled && affix-toggle.has-focus ? 7 :
+        prefix-edit.enabled && prefix-edit.has-focus ? 8 :
+        suffix-edit.enabled && suffix-edit.has-focus ? 9 :
+        number-toggle.enabled && number-toggle.has-focus ? 10 :
+        start.enabled && start.has-focus ? 11 :
+        increment.enabled && increment.has-focus ? 12 :
+        digits.enabled && digits.has-focus ? 13 :
+        position.enabled && position.has-focus ? 14 :
+        separator.enabled && separator.has-focus ? 15 :
+        case-choice.enabled && case-choice.has-focus ? 16 :
+        extension-toggle.enabled && extension-toggle.has-focus ? 17 :
+        extension-edit.enabled && extension-edit.has-focus ? 18 :
+        cancel-button.enabled && cancel-button.has-focus ? 19 :
+        submit-button.enabled && submit-button.has-focus ? 20 :
+        -1;
+    function focus-control(index: int) {
+        if index == 0 { common-toggle.focus(); root.reveal(common-toggle.absolute-position.y, common-toggle.height); return; }
+        if index == 1 { common-edit.focus(); root.reveal(common-edit.absolute-position.y, common-edit.height); return; }
+        if index == 2 { replace-toggle.focus(); root.reveal(replace-toggle.absolute-position.y, replace-toggle.height); return; }
+        if index == 3 { find-edit.focus(); root.reveal(find-edit.absolute-position.y, find-edit.height); return; }
+        if index == 4 { with-edit.focus(); root.reveal(with-edit.absolute-position.y, with-edit.height); return; }
+        if index == 5 { sensitive.focus(); root.reveal(sensitive.absolute-position.y, sensitive.height); return; }
+        if index == 6 { replace-all.focus(); root.reveal(replace-all.absolute-position.y, replace-all.height); return; }
+        if index == 7 { affix-toggle.focus(); root.reveal(affix-toggle.absolute-position.y, affix-toggle.height); return; }
+        if index == 8 { prefix-edit.focus(); root.reveal(prefix-edit.absolute-position.y, prefix-edit.height); return; }
+        if index == 9 { suffix-edit.focus(); root.reveal(suffix-edit.absolute-position.y, suffix-edit.height); return; }
+        if index == 10 { number-toggle.focus(); root.reveal(number-toggle.absolute-position.y, number-toggle.height); return; }
+        if index == 11 { start.focus(); root.reveal(start.absolute-position.y, start.height); return; }
+        if index == 12 { increment.focus(); root.reveal(increment.absolute-position.y, increment.height); return; }
+        if index == 13 { digits.focus(); root.reveal(digits.absolute-position.y, digits.height); return; }
+        if index == 14 { position.focus(); root.reveal(position.absolute-position.y, position.height); return; }
+        if index == 15 { separator.focus(); root.reveal(separator.absolute-position.y, separator.height); return; }
+        if index == 16 { case-choice.focus(); root.reveal(case-choice.absolute-position.y, case-choice.height); return; }
+        if index == 17 { extension-toggle.focus(); root.reveal(extension-toggle.absolute-position.y, extension-toggle.height); return; }
+        if index == 18 { extension-edit.focus(); root.reveal(extension-edit.absolute-position.y, extension-edit.height); return; }
+        if index == 19 { cancel-button.focus(); return; }
+        if index == 20 { submit-button.focus(); return; }
+    }
+    function reveal(y: length, height: length) {
+        let top = y - controls.absolute-position.y;
+        if top < 0px { controls.content-y -= top; }
+        else if top + height > controls.visible-height { controls.content-y -= top + height - controls.visible-height; }
+    }
+    DeferredLineEditFocus {
+        armed <=> root.focus-armed; blocked: root.blocked || !root.open;
+        apply-focus => {
+            if root.running || root.finished { cancel-button.focus(); }
+            else { entry-focus.focus(); }
+        }
+    }
+    dialog-focus := FocusScope {
+        entry-focus := FocusScope { x: 0px; y: 0px; width: 0px; height: 0px; }
+        key-pressed(e) => {
+            if root.blocked { return reject; }
+            if e.text == Key.Escape { root.cancel(); return accept; }
+            if e.text == Key.Tab || e.text == Key.Backtab {
+                if root.running || root.finished { cancel-button.focus(); return accept; }
+                let back = e.modifiers.shift || e.text == Key.Backtab;
+                if root.focused-index < 0 {
+                    root.focus-control(back ? (root.ready ? 20 : 19) : 0);
+                    return accept;
+                }
+                let next = mod(root.focused-index + (back ? 20 : 1), 21);
+                if back {
+                    if next == 20 && !root.ready { root.focus-control(19); return accept; }
+                    if next == 18 && !BulkRenameInputs.extension-enabled { root.focus-control(17); return accept; }
+                    if next >= 11 && next <= 15 && !BulkRenameInputs.numbering-enabled { root.focus-control(10); return accept; }
+                    if next >= 8 && next <= 9 && !BulkRenameInputs.affixes-enabled { root.focus-control(7); return accept; }
+                    if next >= 3 && next <= 6 && !BulkRenameInputs.replace-enabled { root.focus-control(2); return accept; }
+                    if next == 1 && !BulkRenameInputs.common-enabled { root.focus-control(0); return accept; }
+                } else {
+                    if next == 1 && !BulkRenameInputs.common-enabled { root.focus-control(2); return accept; }
+                    if next >= 3 && next <= 6 && !BulkRenameInputs.replace-enabled { root.focus-control(7); return accept; }
+                    if next >= 8 && next <= 9 && !BulkRenameInputs.affixes-enabled { root.focus-control(10); return accept; }
+                    if next >= 11 && next <= 15 && !BulkRenameInputs.numbering-enabled { root.focus-control(16); return accept; }
+                    if next == 18 && !BulkRenameInputs.extension-enabled { root.focus-control(19); return accept; }
+                    if next == 20 && !root.ready { root.focus-control(0); return accept; }
+                }
+                root.focus-control(next);
+                return accept;
+            }
+            return accept;
+        }
+        VerticalLayout {
+            padding: 22px; spacing: 16px;
+            VerticalLayout {
+                spacing: 6px;
+                Caption { text: Strings.bulk-title; font-size: 16px; font-weight: 700; }
+                Caption { text: Strings.bulk-hint; wrap: word-wrap; opacity: 0.8; }
+            }
+            Rectangle {
+                visible: !root.finished;
+                height: root.finished ? 0px : min(min(340px, root.height * 0.45),
+                    options-layout.preferred-height + options-heading.preferred-height + 40px);
+                background: Theme.surface; border-width: 1px; border-color: Theme.border; border-radius: 6px;
+                VerticalLayout {
+                    padding: 14px; spacing: 12px;
+                    options-heading := Caption { text: Strings.bulk-options; font-weight: 600; }
+                    controls := ScrollView {
+                        horizontal-scrollbar-policy: always-off;
+                        content-width: self.visible-width;
+                        content-height: options-layout.preferred-height;
+                        options-layout := VerticalLayout {
+                            x: 0px; y: 0px; width: controls.content-width - 16px;
+                            spacing: 10px;
+                            VerticalLayout {
+                                spacing: BulkRenameInputs.common-enabled ? 8px : 0px;
+                                common-toggle := CheckBox {
+                                    text: Strings.bulk-common; checked <=> BulkRenameInputs.common-enabled;
+                                    enabled: !root.running; toggled => { root.edited(); }
+                                }
+                                OptionFields {
+                                    expanded: BulkRenameInputs.common-enabled;
+                                    common-edit := EditLineEdit {
+                                        enabled: BulkRenameInputs.common-enabled && !root.running;
+                                        text <=> BulkRenameInputs.common-name;
+                                        placeholder-text: Strings.create-placeholder; edited(t) => { root.edited(); }
+                                    }
+                                }
+                            }
+                            VerticalLayout {
+                                spacing: BulkRenameInputs.replace-enabled ? 8px : 0px;
+                                replace-toggle := CheckBox {
+                                    text: Strings.bulk-replace; checked <=> BulkRenameInputs.replace-enabled;
+                                    enabled: !root.running; toggled => { root.edited(); }
+                                }
+                                OptionFields {
+                                    expanded: BulkRenameInputs.replace-enabled;
+                                    HorizontalLayout {
+                                        spacing: 16px;
+                                        VerticalLayout {
+                                            spacing: 6px;
+                                            Caption { text: Strings.bulk-find; }
+                                            find-edit := EditLineEdit {
+                                                min-width: 0px; preferred-width: 0px; horizontal-stretch: 1;
+                                                enabled: BulkRenameInputs.replace-enabled && !root.running;
+                                                text <=> BulkRenameInputs.find; edited(t) => { root.edited(); }
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            spacing: 6px;
+                                            Caption { text: Strings.bulk-with; }
+                                            with-edit := EditLineEdit {
+                                                min-width: 0px; preferred-width: 0px; horizontal-stretch: 1;
+                                                enabled: BulkRenameInputs.replace-enabled && !root.running;
+                                                text <=> BulkRenameInputs.replacement; edited(t) => { root.edited(); }
+                                            }
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 16px;
+                                        sensitive := CheckBox {
+                                            text: Strings.bulk-sensitive; checked <=> BulkRenameInputs.case-sensitive;
+                                            enabled: BulkRenameInputs.replace-enabled && !root.running; toggled => { root.edited(); }
+                                        }
+                                        replace-all := CheckBox {
+                                            text: Strings.bulk-all; checked <=> BulkRenameInputs.replace-all;
+                                            enabled: BulkRenameInputs.replace-enabled && !root.running; toggled => { root.edited(); }
+                                        }
+                                    }
+                                }
+                            }
+                            VerticalLayout {
+                                spacing: BulkRenameInputs.affixes-enabled ? 8px : 0px;
+                                affix-toggle := CheckBox {
+                                    text: Strings.bulk-affixes; checked <=> BulkRenameInputs.affixes-enabled;
+                                    enabled: !root.running; toggled => { root.edited(); }
+                                }
+                                OptionFields {
+                                    expanded: BulkRenameInputs.affixes-enabled;
+                                    HorizontalLayout {
+                                        spacing: 16px;
+                                        VerticalLayout {
+                                            spacing: 6px;
+                                            Caption { text: Strings.bulk-prefix; }
+                                            prefix-edit := EditLineEdit {
+                                                min-width: 0px; preferred-width: 0px; horizontal-stretch: 1;
+                                                enabled: BulkRenameInputs.affixes-enabled && !root.running;
+                                                text <=> BulkRenameInputs.prefix; edited(t) => { root.edited(); }
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            spacing: 6px;
+                                            Caption { text: Strings.bulk-suffix; }
+                                            suffix-edit := EditLineEdit {
+                                                min-width: 0px; preferred-width: 0px; horizontal-stretch: 1;
+                                                enabled: BulkRenameInputs.affixes-enabled && !root.running;
+                                                text <=> BulkRenameInputs.suffix; edited(t) => { root.edited(); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            VerticalLayout {
+                                spacing: BulkRenameInputs.numbering-enabled ? 8px : 0px;
+                                number-toggle := CheckBox {
+                                    text: Strings.bulk-numbering; checked <=> BulkRenameInputs.numbering-enabled;
+                                    enabled: !root.running; toggled => { root.edited(); }
+                                }
+                                OptionFields {
+                                    expanded: BulkRenameInputs.numbering-enabled;
+                                    HorizontalLayout {
+                                        spacing: 16px;
+                                        VerticalLayout {
+                                            spacing: 6px;
+                                            Caption { text: Strings.bulk-start; }
+                                            start := SpinBox {
+                                                min-width: 0px; preferred-width: 0px; horizontal-stretch: 1;
+                                                enabled: BulkRenameInputs.numbering-enabled && !root.running;
+                                                value <=> BulkRenameInputs.start; minimum: 0; maximum: 1000000000;
+                                                edited(v) => { root.edited(); }
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            spacing: 6px;
+                                            Caption { text: Strings.bulk-increment; }
+                                            increment := SpinBox {
+                                                min-width: 0px; preferred-width: 0px; horizontal-stretch: 1;
+                                                enabled: BulkRenameInputs.numbering-enabled && !root.running;
+                                                value <=> BulkRenameInputs.increment; minimum: 1; maximum: 1000000;
+                                                edited(v) => { root.edited(); }
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            spacing: 6px;
+                                            Caption { text: Strings.bulk-digits; }
+                                            digits := SpinBox {
+                                                min-width: 0px; preferred-width: 0px; horizontal-stretch: 1;
+                                                enabled: BulkRenameInputs.numbering-enabled && !root.running;
+                                                value <=> BulkRenameInputs.digits; minimum: 1; maximum: 12;
+                                                edited(v) => { root.edited(); }
+                                            }
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 16px; alignment: LayoutAlignment.start;
+                                        position := ComboBox {
+                                            enabled: BulkRenameInputs.numbering-enabled && !root.running;
+                                            model: [Strings.bulk-before, Strings.bulk-after];
+                                            current-index <=> BulkRenameInputs.position; selected(v) => { root.edited(); }
+                                        }
+                                        Caption { text: Strings.bulk-separator; }
+                                        separator := EditLineEdit {
+                                            min-width: 0px; preferred-width: 100px;
+                                            enabled: BulkRenameInputs.numbering-enabled && !root.running;
+                                            text <=> BulkRenameInputs.separator; edited(t) => { root.edited(); }
+                                        }
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 16px;
+                                Caption { text: Strings.bulk-case; }
+                                case-choice := ComboBox {
+                                    enabled: !root.running;
+                                    model: [Strings.bulk-keep, Strings.bulk-lower, Strings.bulk-upper];
+                                    current-index <=> BulkRenameInputs.case-mode; selected(v) => { root.edited(); }
+                                }
+                            }
+                            VerticalLayout {
+                                spacing: BulkRenameInputs.extension-enabled ? 8px : 0px;
+                                extension-toggle := CheckBox {
+                                    text: Strings.bulk-extension; checked <=> BulkRenameInputs.extension-enabled;
+                                    enabled: !root.running; toggled => { root.edited(); }
+                                }
+                                OptionFields {
+                                    expanded: BulkRenameInputs.extension-enabled;
+                                    extension-edit := EditLineEdit {
+                                        enabled: BulkRenameInputs.extension-enabled && !root.running;
+                                        text <=> BulkRenameInputs.extension; edited(t) => { root.edited(); }
+                                    }
+                                    Caption { text: Strings.bulk-extension-hint; wrap: word-wrap; opacity: 0.7; }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Rectangle { height: 1px; background: Theme.border; }
+            VerticalLayout {
+                spacing: 12px; vertical-stretch: 1;
+                Caption { text: Strings.bulk-preview; font-weight: 600; }
+                HorizontalLayout {
+                    padding-left: 12px; padding-right: 28px; spacing: 20px;
+                    Caption { text: Strings.bulk-original; min-width: 0px; preferred-width: 0px; horizontal-stretch: 1; opacity: 0.7; }
+                    Caption { text: root.finished ? Strings.bulk-current : Strings.bulk-proposed; min-width: 0px; preferred-width: 0px; horizontal-stretch: 1; opacity: 0.7; }
+                }
+                BulkRenamePreview { rows: root.rows; }
+            }
+            Rectangle { height: 1px; background: Theme.border; }
+            summary-area := ScrollView {
+                height: min(80px, summary-text.preferred-height);
+                content-width: self.visible-width; content-height: summary-text.preferred-height;
+                horizontal-scrollbar-policy: always-off;
+                summary-text := Caption {
+                    x: 0px; y: 0px; width: summary-area.visible-width - 16px;
+                    text: root.summary; wrap: word-wrap;
+                }
+            }
+            HorizontalLayout {
+                spacing: 12px;
+                Rectangle { horizontal-stretch: 1; }
+                cancel-button := Button {
+                    text: root.finished ? Strings.bulk-close : Strings.btn-cancel;
+                    clicked => { root.cancel(); }
+                }
+                submit-button := Button {
+                    visible: !root.finished; text: Strings.rename-confirm;
+                    primary: true; enabled: root.ready && !root.running;
+                    clicked => { root.submit(); }
+                }
+            }
+        }
+    }
+}

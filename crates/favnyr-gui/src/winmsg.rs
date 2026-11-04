@@ -1,17 +1,10 @@
-//! Cross-instance IPC for Favnyr (Windows) — **tab transfer via
-//! drag-and-drop between two Favnyr windows**. No dependency added:
-//! raw FFI to `user32` / `comctl32` (system DLLs), like `places.rs`.
+//! Windows tab transport using system window messages.
 //!
-//! Principle: each instance MARKS its window (`SetPropW`) and SUBCLASSES it
-//! (`SetWindowSubclass`) to intercept `WM_COPYDATA`. On drop, the SOURCE
-//! instance finds the Favnyr window under the cursor (`WindowFromPoint`) and
-//! sends it the serialized tab (`SendMessageW(WM_COPYDATA)`). The target
-//! extracts the payload in its subclassed procedure, then processes it on the
-//! Slint UI thread (`invoke_from_event_loop`).
-//!
-//! `WM_COPYDATA` is SYNCHRONOUS: the subclassed procedure just COPIES the
-//! payload and schedules its processing (immediate return → the source
-//! doesn't block).
+//! Each instance marks and subclasses its main window. WM_COPYDATA copies a
+//! bounded payload into owned memory before deferring UI work to Slint.
+//! V1 retains the legacy single-tab wire format. V2 separates native delivery
+//! from acceptance: the source waits for a reply before removing its tabs.
+//! Synchronous sends have a timeout; hover previews use asynchronous messages.
 
 #[cfg(windows)]
 mod imp {
@@ -42,6 +35,20 @@ mod imp {
         bottom: i32,
     }
 
+    #[repr(C)]
+    #[derive(Default)]
+    struct GuiThreadInfo {
+        size: u32,
+        flags: u32,
+        active: Hwnd,
+        focus: Hwnd,
+        capture: Hwnd,
+        menu_owner: Hwnd,
+        move_size: Hwnd,
+        caret: Hwnd,
+        caret_rect: Rect,
+    }
+
     /// Largest visible ownerless window found on the UI thread so far.
     struct MainWindowPick {
         hwnd: Hwnd,
@@ -54,10 +61,8 @@ mod imp {
         fn GetAncestor(hwnd: Hwnd, flags: u32) -> Hwnd;
         fn SetPropW(hwnd: Hwnd, s: *const u16, data: isize) -> i32;
         fn GetPropW(hwnd: Hwnd, s: *const u16) -> isize;
-        // Sending WITH TIMEOUT: if the target is frozen, we don't wait
-        // indefinitely (SendMessageW would block), and we can verify it
-        // actually PROCESSED the message (LRESULT) before removing the tab on
-        // the source side.
+        // Bound native delivery time. A positive return only acknowledges
+        // receipt by the window procedure, not insertion into the target view.
         fn SendMessageTimeoutW(
             hwnd: Hwnd,
             msg: u32,
@@ -70,6 +75,11 @@ mod imp {
         fn SetForegroundWindow(hwnd: Hwnd) -> i32;
         fn GetForegroundWindow() -> Hwnd;
         fn SetFocus(hwnd: Hwnd) -> Hwnd;
+        fn GetGUIThreadInfo(thread: u32, info: *mut GuiThreadInfo) -> i32;
+        fn GetWindowThreadProcessId(hwnd: Hwnd, process: *mut u32) -> u32;
+        fn GetAsyncKeyState(key: i32) -> i16;
+        fn GetCapture() -> Hwnd;
+        fn ReleaseCapture() -> i32;
         fn ClientToScreen(hwnd: Hwnd, point: *mut Point) -> i32;
         fn ScreenToClient(hwnd: Hwnd, point: *mut Point) -> i32;
         fn EnumThreadWindows(
@@ -131,15 +141,10 @@ mod imp {
     /// Four bytes, so the value also fits a 32-bit `usize`: the identity does
     /// not depend on the pointer width the application is built for.
     const SUBCLASS_ID: usize = 0x46_56_4E_52; // "FVNR", for FAVNYR
-    /// Protocol tag/version (`dwData` field of the COPYDATASTRUCT): identifies
-    /// a "Favnyr tab" payload — any other WM_COPYDATA (from another app) is
-    /// ignored. Same ASCII spelling as the subclass id, plus the version.
-    ///
-    /// Changing this value makes instances built before the change and after
-    /// it unable to hand tabs to each other: the tag no longer matches, so the
-    /// message is ignored. Nothing crashes, and mismatched builds are not
-    /// expected to run side by side.
+    /// Wire tags remain distinct so older windows can still receive compatible
+    /// single tabs. The window property advertises batch support separately.
     const PROTO_TAB_V1: usize = 0x46_56_4E_01; // "FVN", for FAVNYR, + version 1
+    const PROTO_BATCH_V2: usize = 0x46_56_4E_02;
     const SMTO_BLOCK: u32 = 0x0001;
     const SMTO_ABORTIFHUNG: u32 = 0x0002;
     const SEND_TIMEOUT_MS: u32 = 2000;
@@ -157,11 +162,16 @@ mod imp {
     // across all Favnyr instances for a given string). Resolved at init.
     static WM_HOVER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static WM_HOVER_END: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static WM_BATCH_BEGIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static WM_BATCH_HOVER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static HOVER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
     /// Incoming message: from another Favnyr instance, or from the system.
     pub enum Incoming {
         /// Tab DROPPED (serialized payload) → insert it.
         Transfer(String),
+        Batch(isize, String),
+        BatchHover(i32, i32, usize),
         /// HOVER in progress at SCREEN point `(x, y)` (physical) → insertion preview.
         Hover(i32, i32),
         /// End of hover (cursor left / drag ended elsewhere) → clear the preview.
@@ -193,19 +203,20 @@ mod imp {
     }
 
     /// Posts (UI thread) an `Incoming` variant to the handler, deferred.
-    fn dispatch(incoming: Incoming) {
+    fn dispatch(incoming: Incoming) -> bool {
         // We're already on the UI thread (WndProc), but we DEFER to avoid
         // re-entering Slint from the message loop (consistent with the
         // transfer, and safe for a synchronous WM_COPYDATA).
         // `invoke_from_event_loop` requires `Send` → `Incoming` only captures
         // `Send` types.
-        let _ = slint::invoke_from_event_loop(move || {
+        slint::invoke_from_event_loop(move || {
             HANDLER.with(|h| {
                 if let Some(f) = h.borrow().as_ref() {
                     f(incoming);
                 }
             });
-        });
+        })
+        .is_ok()
     }
 
     /// EnumThreadWindows already excludes child windows. Restrict its results
@@ -315,6 +326,21 @@ mod imp {
     ) -> isize {
         unsafe {
             // Hover (async PostMessage): SCREEN coords packed into wparam/lparam.
+            if msg != 0 && msg == WM_BATCH_BEGIN.load(Ordering::Relaxed) {
+                HOVER_COUNT.store(
+                    wparam.clamp(1, crate::tab_transfer::MAX_TABS),
+                    Ordering::Relaxed,
+                );
+                return 0;
+            }
+            if msg != 0 && msg == WM_BATCH_HOVER.load(Ordering::Relaxed) {
+                dispatch(Incoming::BatchHover(
+                    wparam as i32,
+                    lparam as i32,
+                    HOVER_COUNT.load(Ordering::Relaxed),
+                ));
+                return 0;
+            }
             let hover = WM_HOVER.load(Ordering::Relaxed);
             let hover_end = WM_HOVER_END.load(Ordering::Relaxed);
             if hover != 0 && msg == hover {
@@ -341,14 +367,38 @@ mod imp {
                 return DefSubclassProc(hwnd, msg, wparam, lparam);
             }
             if msg == WM_COPYDATA {
+                if lparam == 0 {
+                    return 0;
+                }
                 let cds = &*(lparam as *const CopyDataStruct);
+                if cds.dw_data == PROTO_BATCH_V2 {
+                    if !supports_batch(wparam as isize)
+                        || cds.lp_data.is_null()
+                        || cds.cb_data == 0
+                        || cds.cb_data as usize > crate::tab_transfer::MAX_BYTES
+                    {
+                        return 0;
+                    }
+                    let bytes =
+                        std::slice::from_raw_parts(cds.lp_data as *const u8, cds.cb_data as usize);
+                    let Ok(payload) = std::str::from_utf8(bytes) else {
+                        return 0;
+                    };
+                    return isize::from(dispatch(Incoming::Batch(
+                        wparam as isize,
+                        payload.to_owned(),
+                    )));
+                }
                 // Only payloads marked with OUR protocol are processed: a
                 // WM_COPYDATA from a third-party application passes through to
                 // DefSubclassProc.
                 if cds.dw_data != PROTO_TAB_V1 {
                     return DefSubclassProc(hwnd, msg, wparam, lparam);
                 }
-                if !cds.lp_data.is_null() && cds.cb_data > 0 {
+                if !cds.lp_data.is_null()
+                    && cds.cb_data > 0
+                    && cds.cb_data as usize <= crate::tab_transfer::MAX_BYTES
+                {
                     let bytes =
                         std::slice::from_raw_parts(cds.lp_data as *const u8, cds.cb_data as usize);
                     let s = String::from_utf8_lossy(bytes).into_owned();
@@ -380,7 +430,25 @@ mod imp {
             if SetWindowSubclass(hwnd, subclass_proc, SUBCLASS_ID, 0) == 0 {
                 return false; // subclassing refused → IPC inactive, retryable
             }
-            SetPropW(hwnd, prop_name().as_ptr(), 1);
+            SetPropW(hwnd, prop_name().as_ptr(), 2);
+            WM_BATCH_BEGIN.store(
+                RegisterWindowMessageW(
+                    "FavnyrBatchHoverBegin\0"
+                        .encode_utf16()
+                        .collect::<Vec<_>>()
+                        .as_ptr(),
+                ),
+                Ordering::SeqCst,
+            );
+            WM_BATCH_HOVER.store(
+                RegisterWindowMessageW(
+                    "FavnyrBatchHover\0"
+                        .encode_utf16()
+                        .collect::<Vec<_>>()
+                        .as_ptr(),
+                ),
+                Ordering::SeqCst,
+            );
             WM_HOVER.store(
                 RegisterWindowMessageW(hover_msg_name().as_ptr()),
                 Ordering::SeqCst,
@@ -410,6 +478,24 @@ mod imp {
         let msg = WM_HOVER_END.load(Ordering::SeqCst);
         if msg != 0 {
             unsafe { PostMessageW(target, msg, 0, 0) };
+        }
+    }
+
+    pub fn supports_batch(target: isize) -> bool {
+        target != 0 && unsafe { GetPropW(target, prop_name().as_ptr()) >= 2 }
+    }
+
+    pub fn begin_batch_hover(target: isize, count: usize) {
+        let msg = WM_BATCH_BEGIN.load(Ordering::SeqCst);
+        if msg != 0 {
+            unsafe { PostMessageW(target, msg, count, 0) };
+        }
+    }
+
+    pub fn batch_hover(target: isize, x: i32, y: i32) {
+        let msg = WM_BATCH_HOVER.load(Ordering::SeqCst);
+        if msg != 0 {
+            unsafe { PostMessageW(target, msg, x as isize as usize, y as isize) };
         }
     }
 
@@ -478,15 +564,71 @@ mod imp {
         }
     }
 
-    /// Sends the payload (UTF-8) to the target window and brings it to the
-    /// foreground. `true` ONLY if the target PROCESSED the message (LRESULT of
-    /// our subclassed proc) — the caller only removes the source tab in that
-    /// case (otherwise it would be lost). Bounded timeout: a frozen target
-    /// doesn't block the source.
-    pub fn send(target: isize, payload: &str) -> bool {
+    pub fn left_button_down() -> bool {
+        unsafe { GetAsyncKeyState(1) < 0 }
+    }
+
+    /// Remember the source before activation changes the foreground thread.
+    pub fn drop_source_thread() -> u32 {
+        unsafe { GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut()) }
+    }
+
+    fn native_drop_released(source: u32) -> bool {
+        unsafe {
+            if [1, 2, 4].iter().any(|key| GetAsyncKeyState(*key) < 0) {
+                return false;
+            }
+            let own = SELF_HWND.load(Ordering::SeqCst);
+            for thread in [source, 0] {
+                let mut info = GuiThreadInfo {
+                    size: std::mem::size_of::<GuiThreadInfo>() as u32,
+                    ..Default::default()
+                };
+                if GetGUIThreadInfo(thread, &mut info) != 0
+                    && info.capture != 0
+                    && GetAncestor(info.capture, GA_ROOT) != own
+                {
+                    return false;
+                }
+            }
+            // Only release capture owned by this window, after all buttons are
+            // up. ReleaseCapture cannot release another thread's OLE capture.
+            let capture = GetCapture();
+            if own != 0 && capture != 0 && GetAncestor(capture, GA_ROOT) == own {
+                ReleaseCapture();
+            }
+            true
+        }
+    }
+
+    /// OLE can pump timers before its source unwinds. Retry only for this drop;
+    /// no native polling remains after delivery or the bounded timeout.
+    pub fn after_native_drop(source: u32, delivery: impl FnOnce(bool) + 'static) {
+        fn schedule(source: u32, attempts: u8, delivery: Box<dyn FnOnce(bool)>) {
+            slint::Timer::single_shot(std::time::Duration::from_millis(16), move || {
+                if native_drop_released(source) {
+                    focus_self();
+                    delivery(true);
+                } else if attempts > 1 {
+                    schedule(source, attempts - 1, delivery);
+                } else {
+                    tracing::warn!(source_thread = source, "native drop input did not settle");
+                    delivery(false);
+                }
+            });
+        }
+        schedule(source, 60, Box::new(delivery));
+    }
+
+    /// Delivers owned UTF-8 bytes with a bounded wait for the native handler.
+    /// A positive result alone never proves that the target inserted any tabs.
+    fn send_message(target: isize, payload: &str, protocol: usize) -> bool {
+        if payload.is_empty() || payload.len() > crate::tab_transfer::MAX_BYTES {
+            return false;
+        }
         let bytes = payload.as_bytes();
         let cds = CopyDataStruct {
-            dw_data: PROTO_TAB_V1,
+            dw_data: protocol,
             cb_data: bytes.len() as u32,
             lp_data: bytes.as_ptr() as *const core::ffi::c_void,
         };
@@ -505,9 +647,21 @@ mod imp {
             if rc == 0 || lresult != 1 {
                 return false; // target frozen / gone / message not handled
             }
-            SetForegroundWindow(target);
         }
         true
+    }
+
+    pub fn send(target: isize, payload: &str) -> bool {
+        let sent = send_message(target, payload, PROTO_TAB_V1);
+        if sent {
+            unsafe { SetForegroundWindow(target) };
+        }
+        sent
+    }
+
+    /// A positive result means queued, not accepted. Only a V2 reply commits removal.
+    pub fn send_batch(target: isize, payload: &str) -> bool {
+        supports_batch(target) && send_message(target, payload, PROTO_BATCH_V2)
     }
 }
 
@@ -519,6 +673,8 @@ mod imp {
     #[allow(dead_code)]
     pub enum Incoming {
         Transfer(String),
+        Batch(isize, String),
+        BatchHover(i32, i32, usize),
         Hover(i32, i32),
         HoverEnd,
         DevicesChanged,
@@ -535,6 +691,14 @@ mod imp {
     pub fn send(_target: isize, _payload: &str) -> bool {
         false
     }
+    pub fn supports_batch(_target: isize) -> bool {
+        false
+    }
+    pub fn send_batch(_target: isize, _payload: &str) -> bool {
+        false
+    }
+    pub fn begin_batch_hover(_target: isize, _count: usize) {}
+    pub fn batch_hover(_target: isize, _x: i32, _y: i32) {}
     pub fn hover(_target: isize, _x: i32, _y: i32) {}
     pub fn hover_end(_target: isize) {}
     // `self_hwnd` / `client_to_screen` / `screen_to_client` / `focus_self`: no
@@ -544,6 +708,12 @@ mod imp {
     // as the fallback directly in the bridge (`window_logical_to_screen`, etc.).
 }
 
-pub use imp::{Incoming, hover, hover_end, init, send, target_at};
+pub use imp::{
+    Incoming, batch_hover, begin_batch_hover, hover, hover_end, init, send, send_batch,
+    supports_batch, target_at,
+};
 #[cfg(windows)]
-pub use imp::{client_to_screen, focus_self, screen_to_client, self_hwnd};
+pub use imp::{
+    after_native_drop, client_to_screen, drop_source_thread, focus_self, left_button_down,
+    screen_to_client, self_hwnd,
+};

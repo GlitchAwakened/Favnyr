@@ -1,0 +1,76 @@
+import { Button } from "widgets.slint";
+import { EditLineEdit, DeferredLineEditFocus } from "controls.slint";
+import { FolderSwatchRow } from "menus.slint";
+import { Strings } from "strings.slint";
+import { Theme, Tokens } from "theme.slint";
+
+export component TabGroupEditor inherits Rectangle {
+    in property <bool> creating;
+    in property <bool> blocked;
+    in-out property <string> name;
+    in-out property <int> color-slot;
+    in-out property <string> error;
+    callback cancel();
+    callback submit();
+    width: 420px;
+    height: 250px;
+    background: Theme.background;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border;
+    property <bool> focus-armed: true;
+    public function focus-name() {
+        name-edit.focus();
+        name-edit.select-all();
+    }
+    DeferredLineEditFocus {
+        armed <=> root.focus-armed;
+        blocked: root.blocked;
+        apply-focus => { root.focus-name(); }
+    }
+    FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape) { root.cancel(); return accept; }
+            if (e.text == Key.Tab || e.text == Key.Backtab) {
+                let back = e.modifiers.shift || e.text == Key.Backtab;
+                if (name-edit.has-focus) { if (back) { confirm.focus(); } else { palette.focus(); } }
+                else if (palette.has-focus) { if (back) { name-edit.focus(); } else { cancel.focus(); } }
+                else if (cancel.has-focus) { if (back) { palette.focus(); } else { confirm.focus(); } }
+                else { if (back) { cancel.focus(); } else { name-edit.focus(); } }
+                return accept;
+            }
+            return reject;
+        }
+        VerticalLayout {
+            padding: 18px; spacing: 10px;
+            Text {
+                text: root.creating ? Strings.tab-group-new : Strings.tab-group-edit;
+                color: Theme.foreground; font-size: 16px; font-weight: 700;
+            }
+            name-edit := EditLineEdit {
+                text <=> root.name;
+                placeholder-text: Strings.create-placeholder;
+                edited(t) => { root.error = ""; }
+                accepted(t) => { root.submit(); }
+            }
+            Text { text: Strings.tab-group-color; color: Theme.foreground; font-size: 12px; }
+            palette := FolderSwatchRow {
+                width: 232px; horizontal-stretch: 0;
+                current: root.color-slot; neutral-color: Theme.foreground;
+                picked(slot) => { root.color-slot = slot; }
+            }
+            Text { text: root.error; color: Tokens.danger; font-size: 11px;
+                wrap: word-wrap; vertical-stretch: 1; }
+            HorizontalLayout {
+                spacing: 8px;
+                Rectangle { horizontal-stretch: 1; }
+                cancel := Button { text: Strings.btn-cancel; clicked => { root.cancel(); } }
+                confirm := Button {
+                    text: root.creating ? Strings.create-confirm : Strings.ws-save-btn;
+                    primary: true;
+                    clicked => { root.submit(); }
+                }
+            }
+        }
+    }
+}

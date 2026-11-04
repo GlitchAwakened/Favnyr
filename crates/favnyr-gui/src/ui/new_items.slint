@@ -1,0 +1,87 @@
+import { ScrollView } from "widgets.slint";
+import { MenuItem, ShellMenuRow } from "menus.slint";
+import { ShellCtxEntry } from "types.slint";
+import { CtxNav } from "globals.slint";
+import { Strings } from "strings.slint";
+import { Theme, Tokens } from "theme.slint";
+
+// Creation commands share one scrollable column and one keyboard level.
+export component NewItemMenu inherits Rectangle {
+    in property <bool> windows;
+    in property <[ShellCtxEntry]> documents;
+    in property <int> nav-level;
+    in property <length> available-height;
+    out property <bool> hovered: surface.has-hover;
+    callback create(int);
+    callback document(int);
+    property <length> content-height: (root.windows ? 3 : 2) * 26px
+        + (root.documents.length > 0 ? 24px + root.documents.length * 26px : 0px);
+    width: root.documents.length > 0 ? 280px : 200px;
+    height: min(root.available-height, 8px + root.content-height);
+    background: Theme.background;
+    border-radius: Tokens.radius-overlay;
+    border-width: 1px;
+    border-color: Theme.border;
+    drop-shadow-blur: 18px;
+    drop-shadow-color: Theme.shadow.with-alpha(0.25);
+    drop-shadow-offset-y: 4px;
+
+    surface := TouchArea {
+        scroll := ScrollView {
+            x: 4px; y: 4px;
+            width: parent.width - 8px; height: parent.height - 8px;
+            content-width: self.width;
+            content-height: root.content-height;
+            horizontal-scrollbar-policy: always-off;
+            property <length> navigation-y: CtxNav.sub-y;
+            changed navigation-y => {
+                if (root.nav-level == 2 && CtxNav.keyboard-holds) {
+                    let top = -self.content-y;
+                    let wanted = self.navigation-y < top ? self.navigation-y
+                        : (self.navigation-y + 26px > top + self.height
+                            ? self.navigation-y + 26px - self.height : top);
+                    self.content-y = -clamp(wanted, 0px, max(0px, self.content-height - self.height));
+                }
+            }
+            VerticalLayout {
+                x: 0px; y: 0px;
+                width: scroll.width - (root.content-height > scroll.height ? 14px : 0px);
+                height: root.content-height;
+                padding: 0px; spacing: 0px;
+                MenuItem {
+                    nav-level: root.nav-level;
+                    label: Strings.ctx-new-folder;
+                    clicked => { root.create(0); }
+                }
+                MenuItem {
+                    nav-level: root.nav-level;
+                    label: Strings.ctx-new-file;
+                    clicked => { root.create(1); }
+                }
+                if root.windows : MenuItem {
+                    nav-level: root.nav-level;
+                    label: Strings.ctx-new-shortcut;
+                    clicked => { root.create(2); }
+                }
+                if root.documents.length > 0 : Rectangle {
+                    height: 24px;
+                    Rectangle {
+                        x: 8px; y: 3px; width: parent.width - 16px;
+                        height: 1px; background: Tokens.hairline;
+                    }
+                    Text {
+                        x: 10px; y: 6px; width: parent.width - 20px; height: 18px;
+                        text: Strings.ctx-new-registered;
+                        font-size: 10px; color: Theme.foreground.with-alpha(0.55);
+                        vertical-alignment: center; overflow: elide;
+                    }
+                }
+                for row in root.documents : ShellMenuRow {
+                    nav-level: root.nav-level;
+                    entry: row;
+                    run(id) => { root.document(id); }
+                }
+            }
+        }
+    }
+}

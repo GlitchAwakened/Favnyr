@@ -1,7 +1,7 @@
 // Small reusable controls: text fields with explicit editing shortcuts, icon
 // and text buttons, the modal backdrop, drag auto-scroll and the progress toast.
 
-import { LineEdit } from "widgets.slint";
+import { LineEdit, ScrollView } from "widgets.slint";
 import { Dismiss, KeyAdapter, Tip } from "globals.slint";
 import { Theme, Tokens } from "theme.slint";
 
@@ -161,7 +161,7 @@ export component EditLineEdit inherits LineEdit {
                 }
             }
         }
-        if (root.list-behind && !root.claims-key(ev)) {
+        if (root.list-behind && !root.composing && !root.claims-key(ev)) {
             return root.app-key(ev) ? accept : reject;
         }
         return reject;
@@ -173,7 +173,13 @@ export component EditLineEdit inherits LineEdit {
 export component SearchField inherits Rectangle {
     in property <string> placeholder-text;
     in-out property <string> text;
+    in property <bool> enabled: true;
+    in property <bool> list-behind: false;
+    out property <bool> has-focus: search-input.has-focus;
+    out property <bool> composing: search-input.composing;
     callback edited(string);
+    callback app-key(KeyEvent) -> bool;
+    forward-focus: search-input;
 
     height: 32px;
     border-radius: 6px;
@@ -192,10 +198,13 @@ export component SearchField inherits Rectangle {
             colorize: Theme.foreground.with-alpha(0.5);
         }
         search-input := EditLineEdit {
+            enabled: root.enabled;
+            list-behind: root.list-behind;
             placeholder-text: root.placeholder-text;
             horizontal-stretch: 1;
             text <=> root.text;
             edited(value) => { root.edited(value); }
+            app-key(event) => { root.app-key(event) }
         }
     }
 }
@@ -493,6 +502,13 @@ export component WsIconBtn inherits Rectangle {
 // Non-blocking floating card (no backdrop) anchored bottom-right.
 // 6px bar, progress measured in bytes or items, animation in
 // indeterminate mode, and a Cancel or Close button depending on the state.
+export global ProgressToastLayout {
+    public pure function card-height(state: int, has-detail: bool, stack-height: length) -> length {
+        // Reserve room for three cards, their gaps, outer margins and the overflow chip.
+        return state == 4 && has-detail ? min(160px, max(88px, (stack-height - 88px) / 3)) : 88px;
+    }
+}
+
 export component ProgressToast inherits Rectangle {
     in property <int> op-state;          // 1 running,2 scan,3 success,4 error,5 cancelled
     in property <float> progress;        // 0..1
@@ -501,11 +517,12 @@ export component ProgressToast inherits Rectangle {
     in property <string> detail;
     in property <string> percent;
     in property <string> cancel-label;
+    in property <length> stack-height: 600px;
     callback cancel();
     callback dismiss();
 
     width: 360px;
-    height: 88px;
+    height: ProgressToastLayout.card-height(root.op-state, root.detail != "", root.stack-height);
     background: Theme.background;
     border-radius: Tokens.radius-overlay;
     border-width: 1px;
@@ -594,13 +611,27 @@ export component ProgressToast inherits Rectangle {
         // Detail can include a second line for throughput and remaining time.
         HorizontalLayout {
             spacing: 8px;
-            Text {
+            if root.op-state != 4 : Text {
                 text: root.detail;
                 font-size: 11px;
                 color: Theme.foreground.with-alpha(0.6);
                 vertical-alignment: center;
                 horizontal-stretch: 1;
                 overflow: elide;
+            }
+            if root.op-state == 4 : ScrollView {
+                horizontal-stretch: 1;
+                horizontal-scrollbar-policy: always-off;
+                content-width: self.width;
+                VerticalLayout {
+                    padding: 0px;
+                    Text {
+                        text: root.detail;
+                        font-size: 11px;
+                        color: Theme.foreground.with-alpha(0.85);
+                        wrap: word-wrap;
+                    }
+                }
             }
             if !root.terminal : Rectangle {
                 width: 78px;

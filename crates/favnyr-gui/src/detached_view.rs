@@ -9,6 +9,32 @@ use favnyr_core::workspace::ViewState;
 
 pub const MARKER: &str = "--detached-view-state";
 
+/// Conservative native argument budget, including quoting on Windows.
+/// Oversized batches stay in their source window instead of spawning partially.
+pub fn validate_command(exe: &std::path::Path, args: &[OsString]) -> Result<()> {
+    #[cfg(windows)]
+    fn units(value: &std::ffi::OsStr) -> usize {
+        use std::os::windows::ffi::OsStrExt;
+        value
+            .encode_wide()
+            .count()
+            .saturating_mul(2)
+            .saturating_add(3)
+    }
+    #[cfg(not(windows))]
+    fn units(value: &std::ffi::OsStr) -> usize {
+        value.as_encoded_bytes().len().saturating_add(1)
+    }
+    let size = args.iter().fold(units(exe.as_os_str()), |n, arg| {
+        n.saturating_add(units(arg))
+    });
+    let limit = if cfg!(windows) { 32_767 } else { 65_536 };
+    if size >= limit {
+        bail!("detached view exceeds the native argument budget");
+    }
+    Ok(())
+}
+
 #[derive(Debug, PartialEq)]
 pub struct DetachedView {
     pub view: ViewState,
@@ -76,6 +102,14 @@ pub fn parse(mut args: impl Iterator<Item = OsString>) -> Option<DetachedView> {
 mod tests {
     use super::*;
     use favnyr_core::workspace::ItemArrangement;
+
+    #[test]
+    fn argument_budget_rejects_oversized_batches_without_lossy_path_conversion() {
+        let exe = std::path::Path::new("app");
+        assert!(validate_command(exe, &["folder01".into(), "folder02".into()]).is_ok());
+        assert!(validate_command(exe, &["x".repeat(65_536).into()]).is_err());
+        assert!(validate_command(exe, &vec!["folder01".into(); 10_000]).is_err());
+    }
 
     fn sample() -> ViewState {
         toml::from_str(

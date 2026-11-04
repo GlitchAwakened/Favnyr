@@ -333,6 +333,7 @@ export component FavPanel inherits Rectangle {
     callback row-context(string, bool, bool, bool, int, string, length, length);
     callback row-drag-move(int, length, length, length); // row, abs-x, cur-y, row-top
     callback row-drag-drop(int, length, length, length, bool); // final bool: in visible tree
+    callback empty-left-pressed();
     callback new-container();
     callback collapse-all();
     callback expand-all();
@@ -399,6 +400,7 @@ export component FavPanel inherits Rectangle {
                     pointer-event(ev) => {
                         if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
                             Dismiss.serial += 1;
+                            root.empty-left-pressed();
                         }
                     }
                 }

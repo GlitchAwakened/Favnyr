@@ -5,6 +5,7 @@
 //! (copy / move / trash / properties) live in the
 //! [`ops`] submodule.
 
+pub mod ambiguous;
 pub mod ops;
 
 use std::path::{Path, PathBuf};
@@ -79,6 +80,13 @@ impl FileKind {
     pub fn can_be_program(self) -> bool {
         matches!(self, FileKind::Application | FileKind::File)
     }
+
+    /// An unresolved ambiguous extension must not gain executable treatment
+    /// merely because its conservative presentation category is generic.
+    pub fn can_be_program_with_extension(self, extension: Option<&str>) -> bool {
+        self.can_be_program()
+            && extension.is_none_or(|extension| ambiguous::rule_for_extension(extension).is_none())
+    }
 }
 
 /// An entry listed in a folder.
@@ -98,6 +106,9 @@ pub struct Entry {
     /// this flag is used for the visual marker — a "folder + arrow" icon for
     /// a folder-link, to distinguish it from a real folder.
     pub is_symlink: bool,
+    /// File content is known to require a remote recall before it can be read.
+    /// The flag comes from attributes already returned by directory listing.
+    pub content_remote: bool,
     /// Folder that is the root of a network share: a share of a remote
     /// server, a remote filesystem mounted here, or a folder this machine
     /// shares. Drives a dedicated icon, since such a folder may not accept
@@ -141,8 +152,9 @@ pub fn classify_kind(extension: Option<&str>, is_dir: bool) -> FileKind {
         | "key" => FileKind::Document,
 
         // Video
-        "mp4" | "mkv" | "mov" | "avi" | "webm" | "wmv" | "flv" | "m4v" | "mpg" | "mpeg" | "ts"
-        | "3gp" => FileKind::Video,
+        "mp4" | "mkv" | "mov" | "avi" | "webm" | "wmv" | "flv" | "m4v" | "mpg" | "mpeg" | "3gp" => {
+            FileKind::Video
+        }
 
         // Configuration / structured data
         "toml" | "yaml" | "yml" | "json" | "json5" | "ini" | "cfg" | "conf" | "config" | "xml"
@@ -160,6 +172,24 @@ fn is_hidden_attr(md: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0000_0002;
     md.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0
+}
+#[cfg(windows)]
+pub fn content_is_remote_attributes(attributes: u32) -> bool {
+    const OFFLINE: u32 = 0x0000_1000;
+    const RECALL_ON_OPEN: u32 = 0x0004_0000;
+    const RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+    attributes & (OFFLINE | RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS) != 0
+}
+
+#[cfg(windows)]
+fn is_remote_content_attr(md: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    content_is_remote_attributes(md.file_attributes())
+}
+
+#[cfg(not(windows))]
+fn is_remote_content_attr(_md: &std::fs::Metadata) -> bool {
+    false
 }
 #[cfg(not(windows))]
 fn is_hidden_attr(_md: &std::fs::Metadata) -> bool {
@@ -413,6 +443,7 @@ fn list_server_shares(server: &str) -> Result<(Vec<Entry>, usize)> {
                     kind: FileKind::Folder,
                     hidden: false,
                     is_symlink: false,
+                    content_remote: false,
                     is_share: true,
                     executable: false,
                 })
@@ -571,58 +602,72 @@ pub fn visit_dir_while(
             .file_type()
             .map(|t| t.is_symlink())
             .unwrap_or(false);
-        let (is_dir, size_bytes, mtime_unix, created_unix, executable, is_share) = match md_res {
-            Ok(md) => {
-                // A link describes itself, not what it points at: its own
-                // length is the size of the stored path and its own timestamp
-                // is when the link was made. On Unix its permissions are
-                // usually 0777 as well. Every displayed field therefore reads
-                // the FOLLOWED metadata, so a link to a file reports that
-                // file's size, date and executability rather than the link's.
-                // A broken link has no target to follow and keeps its own.
-                let followed_md = is_symlink
-                    .then(|| std::fs::metadata(&full_path).ok())
-                    .flatten();
-                let effective_md = followed_md.as_ref().unwrap_or(&md);
-                let is_dir = effective_md.is_dir();
-                let size = if is_dir {
-                    None
-                } else {
-                    Some(effective_md.len())
-                };
-                let mtime = effective_md
-                    .modified()
-                    .ok()
-                    .and_then(|st| st.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64);
-                let created = effective_md
-                    .created()
-                    .ok()
-                    .and_then(|st| st.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64);
-                #[cfg(unix)]
-                let executable = {
-                    use std::os::unix::fs::PermissionsExt;
-                    !is_dir
-                        && (!is_symlink || followed_md.is_some())
-                        && effective_md.permissions().mode() & 0o111 != 0
-                };
-                #[cfg(not(unix))]
-                let executable = false;
-                // A link already has its own icon, whatever it points at.
-                let is_share = is_dir
-                    && !is_symlink
-                    && shares
-                        .get_or_insert_with(|| ShareProbe::for_dir(path))
-                        .is_share(&name, &full_path, &md);
-                (is_dir, size, mtime, created, executable, is_share)
-            }
-            Err(err) => {
-                tracing::debug!(error = %err, path = %full_path.display(), "metadata failed");
-                // The entry is kept but without size/mtime, assuming a file.
-                (false, None, None, None, false, false)
-            }
-        };
+        let (is_dir, size_bytes, mtime_unix, created_unix, executable, is_share, content_remote) =
+            match md_res {
+                Ok(md) => {
+                    // A link describes itself, not what it points at: its own
+                    // length is the size of the stored path and its own timestamp
+                    // is when the link was made. On Unix its permissions are
+                    // usually 0777 as well. Every displayed field therefore reads
+                    // the FOLLOWED metadata, so a link to a file reports that
+                    // file's size, date and executability rather than the link's.
+                    // A broken link has no target to follow and keeps its own.
+                    let followed_md = is_symlink
+                        .then(|| std::fs::metadata(&full_path).ok())
+                        .flatten();
+                    let effective_md = followed_md.as_ref().unwrap_or(&md);
+                    let is_dir = effective_md.is_dir();
+                    let size = if is_dir {
+                        None
+                    } else {
+                        Some(effective_md.len())
+                    };
+                    let mtime = effective_md
+                        .modified()
+                        .ok()
+                        .and_then(|st| st.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64);
+                    let created = effective_md
+                        .created()
+                        .ok()
+                        .and_then(|st| st.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64);
+                    #[cfg(unix)]
+                    let executable = {
+                        use std::os::unix::fs::PermissionsExt;
+                        !is_dir
+                            && (!is_symlink || followed_md.is_some())
+                            && effective_md.permissions().mode() & 0o111 != 0
+                    };
+                    #[cfg(not(unix))]
+                    let executable = false;
+                    // A link already has its own icon, whatever it points at.
+                    let is_share = is_dir
+                        && !is_symlink
+                        && shares
+                            .get_or_insert_with(|| ShareProbe::for_dir(path))
+                            .is_share(&name, &full_path, &md);
+                    // A symlink can carry a recall attribute independently of its target.
+                    // Check both objects so the row agrees with the content-read guard.
+                    let content_remote = !is_dir
+                        && (is_remote_content_attr(effective_md)
+                            || (is_symlink && is_remote_content_attr(&md)));
+                    (
+                        is_dir,
+                        size,
+                        mtime,
+                        created,
+                        executable,
+                        is_share,
+                        content_remote,
+                    )
+                }
+                Err(err) => {
+                    tracing::debug!(error = %err, path = %full_path.display(), "metadata failed");
+                    // The entry is kept but without size/mtime, assuming a file.
+                    (false, None, None, None, false, false, false)
+                }
+            };
 
         let ext = full_path
             .extension()
@@ -640,6 +685,7 @@ pub fn visit_dir_while(
             kind,
             hidden,
             is_symlink,
+            content_remote,
             is_share,
             executable,
         });
@@ -2210,6 +2256,7 @@ mod tests {
             },
             hidden: false,
             is_symlink: false,
+            content_remote: false,
             is_share: false,
             executable: false,
         }
@@ -2226,6 +2273,7 @@ mod tests {
             kind: FileKind::File,
             hidden: false,
             is_symlink: false,
+            content_remote: false,
             is_share: false,
             executable: false,
         }

@@ -107,6 +107,15 @@ pub const ACTIONS: &[ActionDef] = &[
         group: ActionGroup::Navigation,
         default: "Ctrl+L",
     },
+    // Opens the search bar with its field already holding the keyboard.
+    // Typing on the list also opens it, but the keystroke that does so is
+    // read as a finished character; an input method that builds one character
+    // from several keystrokes needs the field focused beforehand.
+    ActionDef {
+        id: "focus-search",
+        group: ActionGroup::Navigation,
+        default: "Ctrl+F",
+    },
     // ----- Selection -----
     ActionDef {
         id: "select-all",
@@ -158,6 +167,11 @@ pub const ACTIONS: &[ActionDef] = &[
         id: "tab-prev",
         group: ActionGroup::TabsViews,
         default: "Ctrl+Shift+Tab",
+    },
+    ActionDef {
+        id: "tab-bar-toggle",
+        group: ActionGroup::TabsViews,
+        default: "Ctrl+Shift+B",
     },
     ActionDef {
         id: "view-next",
@@ -766,6 +780,7 @@ mod tests {
             Some("cursor-down")
         );
         for (chord, action) in [
+            ("Ctrl+Shift+B", "tab-bar-toggle"),
             ("Tab", "view-next"),
             ("Shift+Tab", "view-prev"),
             ("ArrowLeft", "cursor-left"),

@@ -28,6 +28,7 @@ struct RecoveredFavorite {
 
 pub(super) fn can_retry(panel: &Panel, now: Instant) -> bool {
     panel.listing_failed
+        && panel.tabs.group_page().is_none()
         && !panel.pending_initial
         && !panel.pending_listing
         && panel.search.is_none()
@@ -145,7 +146,11 @@ fn start_favorites(window: &MainWindow, state: &AppState) {
                     let can_extract = apartment.is_some();
                     #[cfg(not(windows))]
                     let can_extract = true;
-                    let icon = if !is_dir && can_extract {
+                    let icon = if !is_dir
+                        && can_extract
+                        && crate::cloud_content_guard::may_read_automatically(Path::new(
+                            &target.path,
+                        )) {
                         openwith::icon_rgba_for_path(&target.path, false)
                     } else {
                         None

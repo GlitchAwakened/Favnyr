@@ -185,14 +185,11 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_search_reveal(g("search_reveal"));
     strings.set_search_reveal_new_tab(g("search_reveal_new_tab"));
     strings.set_ext_filter_placeholder(g("ext_filter_placeholder"));
-    strings.set_col_resolution(g("col_resolution"));
-    strings.set_col_depth(g("col_depth"));
     strings.set_fav_title(g("fav_title"));
     strings.set_fav_new_container(g("fav_new_container"));
     strings.set_fav_collapse_all(g("fav_collapse_all"));
     strings.set_fav_expand_all(g("fav_expand_all"));
     strings.set_fav_empty(g("fav_empty"));
-    strings.set_fav_container_empty(g("fav_container_empty"));
     strings.set_fav_open(g("fav_open"));
     strings.set_fav_execute(g("fav_execute"));
     strings.set_fav_open_all(g("fav_open_all"));
@@ -209,16 +206,7 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_fav_popup_container(g("fav_popup_container"));
     strings.set_fav_popup_parent(g("fav_popup_parent"));
     strings.set_fav_popup_new(g("fav_popup_new"));
-    strings.set_fav_popup_root(g("fav_popup_root"));
     strings.set_fav_save(g("fav_save"));
-    strings.set_fav_toast_added(g("fav_toast_added"));
-    strings.set_fav_toast_missing(g("fav_toast_missing"));
-    strings.set_fav_toast_exists(g("fav_toast_exists"));
-    strings.set_footer_items_singular(g("footer_items_singular"));
-    strings.set_footer_items_plural(g("footer_items_plural"));
-    strings.set_footer_empty(g("footer_empty"));
-    strings.set_footer_selected_singular(g("footer_selected_singular"));
-    strings.set_footer_selected_plural(g("footer_selected_plural"));
     strings.set_nav_prev(g("nav_prev"));
     strings.set_nav_next(g("nav_next"));
     strings.set_nav_parent(g("nav_parent"));
@@ -227,6 +215,7 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_view_layout_list(g("view_layout_list"));
     strings.set_view_layout_grid(g("view_layout_grid"));
     strings.set_view_sort_tooltip(g("view_sort_tooltip"));
+    strings.set_cloud_content_remote_tip(g("cloud_content_remote_tip"));
     strings.set_sort_primary(g("sort_primary"));
     strings.set_sort_secondary(g("sort_secondary"));
     strings.set_sort_by_day(g("sort_by_day"));
@@ -248,6 +237,7 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_tabbar_top(g("tabbar_top"));
     strings.set_tabbar_left(g("tabbar_left"));
     strings.set_tabbar_right(g("tabbar_right"));
+    strings.set_tabbar_hidden(g("tabbar_hidden"));
     strings.set_settings_tabbar_default(g("settings_tabbar_default"));
     strings.set_settings_default_view_mode_label(g("settings_default_view_mode_label"));
     strings
@@ -277,15 +267,24 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_annotations_cleanup_all(g("annotations_cleanup_all"));
     strings.set_annotations_cleanup_none(g("annotations_cleanup_none"));
     strings.set_annotations_cleanup_empty(g("annotations_cleanup_empty"));
-    strings.set_settings_annotations_cleaned(g("settings_annotations_cleaned"));
     strings.set_tab_unavailable(g("tab_unavailable"));
     strings.set_tab_unavailable_hint(g("tab_unavailable_hint"));
+    strings.set_tab_group_closed_title(g("tab_group_closed_title"));
+    strings.set_tab_group_closed_hint(g("tab_group_closed_hint"));
+    strings.set_tab_group_open_title(g("tab_group_open_title"));
+    strings.set_tab_group_open_hint(g("tab_group_open_hint"));
     strings.set_tab_duplicate(g("tab_duplicate"));
+    strings.set_tab_group_menu(g("tab_group_menu"));
+    strings.set_tab_drag_join(g("tab_drag_join"));
+    strings.set_tab_group_new(g("tab_group_new"));
+    strings.set_tab_group_edit(g("tab_group_edit"));
+    strings.set_tab_group_remove(g("tab_group_remove"));
+    strings.set_tab_group_dissolve(g("tab_group_dissolve"));
+    strings.set_tab_group_delete(g("tab_group_delete"));
+    strings.set_tab_group_delete_confirm(g("tab_group_delete_confirm"));
+    strings.set_tab_group_select(g("tab_group_select"));
+    strings.set_tab_group_color(g("tab_group_color"));
     strings.set_tab_reopen_closed(g("tab_reopen_closed"));
-    strings.set_tab_close_tooltip(g("tab_close_tooltip"));
-    strings.set_panel_prefix(g("panel_prefix"));
-    strings.set_panel_new_tooltip(g("panel_new_tooltip"));
-    strings.set_panel_close_tooltip(g("panel_close_tooltip"));
     strings.set_panel_move_tooltip(g("panel_move_tooltip"));
     strings.set_panel_split_view(g("panel_split_view"));
     strings.set_split_side_by_side(g("split_side_by_side"));
@@ -301,6 +300,7 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_ctx_new(g("ctx_new"));
     strings.set_ctx_new_folder(g("ctx_new_folder"));
     strings.set_ctx_new_file(g("ctx_new_file"));
+    strings.set_ctx_new_registered(g("ctx_new_registered"));
     strings.set_ctx_new_shortcut(g("ctx_new_shortcut"));
     strings.set_create_shortcut_target(g("create_shortcut_target"));
     strings.set_create_browse(g("create_browse"));
@@ -321,6 +321,36 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_ctx_copy_path(g("ctx_copy_path"));
     strings.set_ctx_copy_name(g("ctx_copy_name"));
     strings.set_ctx_rename(g("ctx_rename"));
+    strings.set_bulk_title(g("bulk_title"));
+    strings.set_bulk_options(g("bulk_options"));
+    strings.set_bulk_preview(g("bulk_preview"));
+    strings.set_bulk_hint(g("bulk_hint"));
+    strings.set_bulk_common(g("bulk_common"));
+    strings.set_bulk_replace(g("bulk_replace"));
+    strings.set_bulk_find(g("bulk_find"));
+    strings.set_bulk_with(g("bulk_with"));
+    strings.set_bulk_sensitive(g("bulk_sensitive"));
+    strings.set_bulk_all(g("bulk_all"));
+    strings.set_bulk_affixes(g("bulk_affixes"));
+    strings.set_bulk_prefix(g("bulk_prefix"));
+    strings.set_bulk_suffix(g("bulk_suffix"));
+    strings.set_bulk_numbering(g("bulk_numbering"));
+    strings.set_bulk_start(g("bulk_start"));
+    strings.set_bulk_increment(g("bulk_increment"));
+    strings.set_bulk_digits(g("bulk_digits"));
+    strings.set_bulk_before(g("bulk_before"));
+    strings.set_bulk_after(g("bulk_after"));
+    strings.set_bulk_separator(g("bulk_separator"));
+    strings.set_bulk_case(g("bulk_case"));
+    strings.set_bulk_keep(g("bulk_keep"));
+    strings.set_bulk_lower(g("bulk_lower"));
+    strings.set_bulk_upper(g("bulk_upper"));
+    strings.set_bulk_extension(g("bulk_extension"));
+    strings.set_bulk_extension_hint(g("bulk_extension_hint"));
+    strings.set_bulk_original(g("bulk_original"));
+    strings.set_bulk_current(g("bulk_current"));
+    strings.set_bulk_proposed(g("bulk_proposed"));
+    strings.set_bulk_close(g("bulk_close"));
     strings.set_ctx_delete(g("ctx_delete"));
     strings.set_ctx_properties(g("ctx_properties"));
     strings.set_prop_kind_folder(g("prop_kind_folder"));
@@ -354,8 +384,6 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_prop_expected_label(g("prop_expected_label"));
     strings.set_prop_expected_no_match(g("prop_expected_no_match"));
     strings.set_settings_columns_section(g("settings_columns_section"));
-    strings.set_settings_col_resolution(g("settings_col_resolution"));
-    strings.set_settings_col_depth(g("settings_col_depth"));
     strings.set_settings_rmtime_label(g("settings_rmtime_label"));
     strings.set_settings_rmtime_hint(g("settings_rmtime_hint"));
     strings.set_settings_fsize_label(g("settings_fsize_label"));
@@ -381,7 +409,6 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_shortcut_reset_all_confirm(g("shortcut_reset_all_confirm"));
     strings.set_shortcut_reset_tooltip(g("shortcut_reset_tooltip"));
     strings.set_shortcut_listening(g("shortcut_listening"));
-    strings.set_shortcut_capture_cancel(g("shortcut_capture_cancel"));
     strings.set_shortcut_unassigned(g("shortcut_unassigned"));
     strings.set_shortcut_unassign(g("shortcut_unassign"));
     strings.set_shortcut_no_results(g("shortcut_no_results"));
@@ -403,16 +430,6 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_paste_conflict_replace_all(g("paste_conflict_replace_all"));
     strings.set_paste_conflict_skip_all(g("paste_conflict_skip_all"));
     strings.set_drag_open_with(g("drag_open_with"));
-    strings.set_op_copying(g("op_copying"));
-    strings.set_op_moving(g("op_moving"));
-    strings.set_op_deleting(g("op_deleting"));
-    strings.set_op_deleting_permanently(g("op_deleting_permanently"));
-    strings.set_op_duplicating(g("op_duplicating"));
-    strings.set_op_scanning(g("op_scanning"));
-    strings.set_op_done(g("op_done"));
-    strings.set_op_cancelled(g("op_cancelled"));
-    strings.set_op_errors(g("op_errors"));
-    strings.set_op_items(g("op_items"));
     strings.set_ws_tooltip(g("ws_tooltip"));
     strings.set_ws_title(g("ws_title"));
     strings.set_ws_save_section(g("ws_save_section"));
@@ -492,13 +509,11 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_drop_swap(g("drop_swap"));
     strings.set_drop_detach(g("drop_detach"));
     strings.set_ws_reset(g("ws_reset"));
-    strings.set_ws_new_name(g("ws_new_name"));
-    strings.set_ws_toast_reset(g("ws_toast_reset"));
     strings.set_ws_sort_newest(g("ws_sort_newest"));
     strings.set_ws_sort_oldest(g("ws_sort_oldest"));
-    strings.set_ws_sort_tooltip(g("ws_sort_tooltip"));
     strings.set_ow_choose(g("ow_choose"));
     strings.set_ow_pick_browse(g("ow_pick_browse"));
+    strings.set_ow_run(g("ow_run"));
     strings.set_ow_custom(g("ow_custom"));
     strings.set_ow_use_as_app(g("ow_use_as_app"));
     strings.set_ow_manage(g("ow_manage"));
@@ -518,10 +533,8 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_ow_tag_uri(g("ow_tag_uri"));
     strings.set_ow_tag_files(g("ow_tag_files"));
     strings.set_ow_preview(g("ow_preview"));
-    strings.set_ow_add_suggested(g("ow_add_suggested"));
     strings.set_ow_recipes_label(g("ow_recipes_label"));
     strings.set_ow_recipes_hint(g("ow_recipes_hint"));
-    strings.set_ow_launch(g("ow_launch"));
     strings.set_ow_default_ext(g("ow_default_ext"));
     strings.set_ow_used_ext(g("ow_used_ext"));
     strings.set_ow_default_ext_placeholder(g("ow_default_ext_placeholder"));
@@ -541,6 +554,8 @@ fn apply_catalog(window: &MainWindow, c: &HashMap<String, String>) {
     strings.set_ow_used_ext_hint(g("ow_used_ext_hint"));
     strings.set_settings_shellmenu_label(g("settings_shellmenu_label"));
     strings.set_settings_shellmenu_hint(g("settings_shellmenu_hint"));
+    strings.set_settings_registered_types_label(g("settings_registered_types_label"));
+    strings.set_settings_registered_types_hint(g("settings_registered_types_hint"));
     strings.set_settings_shellext_list_label(g("settings_shellext_list_label"));
     strings.set_settings_shellext_list_hint(g("settings_shellext_list_hint"));
     strings.set_ow_move_up(g("ow_move_up"));
@@ -572,6 +587,7 @@ pub fn tabbar_position_labels(lang: Lang) -> Vec<slint::SharedString> {
         tr(lang, "tabbar_pos_top").into(),
         tr(lang, "tabbar_pos_left").into(),
         tr(lang, "tabbar_pos_right").into(),
+        tr(lang, "tabbar_hidden").into(),
     ]
 }
 
@@ -795,6 +811,7 @@ fn file_error_reason_key(kind: Option<std::io::ErrorKind>) -> &'static str {
         Some(ErrorKind::NotFound) => "op_reason_not_found",
         Some(ErrorKind::AlreadyExists) => "op_reason_already_exists",
         Some(ErrorKind::StorageFull) => "op_reason_storage_full",
+        Some(ErrorKind::ResourceBusy) => "op_reason_in_use",
         _ => "op_reason_system",
     }
 }
@@ -943,6 +960,72 @@ pub fn trash_error_message(lang: Lang, err: &favnyr_core::fs::ops::TrashError) -
 #[cfg(test)]
 mod tests {
     #[test]
+    fn batch_rename_catalogs_are_complete_without_fallback() {
+        for &lang in favnyr_core::Lang::all() {
+            let table: toml::Table = toml::from_str(super::embedded(lang)).unwrap();
+            for key in [
+                "bulk_title",
+                "bulk_options",
+                "bulk_preview",
+                "bulk_not_changed",
+                "bulk_hint",
+                "bulk_common",
+                "bulk_replace",
+                "bulk_find",
+                "bulk_with",
+                "bulk_sensitive",
+                "bulk_all",
+                "bulk_affixes",
+                "bulk_prefix",
+                "bulk_suffix",
+                "bulk_numbering",
+                "bulk_start",
+                "bulk_increment",
+                "bulk_digits",
+                "bulk_before",
+                "bulk_after",
+                "bulk_separator",
+                "bulk_case",
+                "bulk_keep",
+                "bulk_lower",
+                "bulk_upper",
+                "bulk_extension",
+                "bulk_extension_hint",
+                "bulk_original",
+                "bulk_current",
+                "bulk_proposed",
+                "bulk_close",
+                "bulk_summary",
+                "bulk_preparing",
+                "bulk_duplicate",
+                "bulk_nested",
+                "bulk_invalid_encoding",
+                "bulk_invalid_options",
+                "bulk_unavailable",
+                "bulk_changed",
+                "bulk_unchanged",
+                "bulk_restored",
+                "bulk_recovery",
+                "bulk_busy",
+                "bulk_cancelled",
+                "bulk_done",
+            ] {
+                assert!(
+                    table
+                        .get(key)
+                        .and_then(toml::Value::as_str)
+                        .is_some_and(|text| !text.is_empty()),
+                    "{lang:?}: {key}"
+                );
+            }
+            let summary = table["bulk_summary"].as_str().unwrap();
+            for token in ["{changed}", "{unchanged}", "{errors}"] {
+                assert!(summary.contains(token));
+            }
+            assert!(table["bulk_done"].as_str().unwrap().contains("{count}"));
+        }
+    }
+    #[test]
     fn preference_strings_exist_in_each_embedded_language() {
         for &lang in favnyr_core::Lang::all() {
             let table: toml::Table = toml::from_str(super::embedded(lang)).unwrap();
@@ -953,6 +1036,7 @@ mod tests {
                 "settings_grid_name_tooltip_hint",
                 "settings_search_path_tooltip_label",
                 "settings_search_path_tooltip_hint",
+                "cloud_content_remote_tip",
                 "settings_ws_panel_label",
                 "settings_ws_panel_hint",
                 "settings_ws_shortcut_label",
@@ -977,6 +1061,11 @@ mod tests {
                 "settings_keyboard_ukrainian_standard",
                 "settings_keyboard_russian_standard",
                 "thumbnail_zoom_feedback",
+                "settings_registered_types_label",
+                "settings_registered_types_hint",
+                "new_documents_changed",
+                "tab_group_delete",
+                "tab_group_delete_confirm",
             ] {
                 assert!(
                     table
@@ -1032,12 +1121,32 @@ mod tests {
         for &lang in Lang::all() {
             let mut map = HashMap::new();
             overlay(embedded(lang), &mut map);
+            for key in [
+                "archive_item_failed",
+                "drop_input_not_ready",
+                "tabbar_hidden",
+                "shortcut_action.tab-bar-toggle",
+                "tab_drag_join",
+                "tab_drag_groups_renamed",
+                "tab_drag_external_unavailable",
+                "tab_drag_detach_failed",
+                "tab_drag_changed",
+                "tab_transfer_busy",
+                "tab_transfer_failed",
+                "tab_transfer_uncertain",
+            ] {
+                assert!(
+                    map.get(key).is_some_and(|value| !value.is_empty()),
+                    "{lang:?}: {key}"
+                );
+            }
             for kind in [
                 Some(ErrorKind::PermissionDenied),
                 Some(ErrorKind::ReadOnlyFilesystem),
                 Some(ErrorKind::NotFound),
                 Some(ErrorKind::AlreadyExists),
                 Some(ErrorKind::StorageFull),
+                Some(ErrorKind::ResourceBusy),
                 None,
             ] {
                 let reason = &map[file_error_reason_key(kind)];
@@ -1049,6 +1158,7 @@ mod tests {
                     "rename_failed",
                     "op_item_skipped",
                     "move_source_kept",
+                    "archive_item_failed",
                 ] {
                     let text = format_file_failure(&map[key], "my_file.txt", reason);
                     assert!(
@@ -1356,6 +1466,39 @@ mod tests {
         }
         // An ordinary action keeps the per-id lookup.
         assert_eq!(shortcut_action_name(Lang::Fr, "copy"), "Copier");
+    }
+
+    #[test]
+    fn every_declared_shortcut_action_and_group_is_named_in_every_language() {
+        // Derived from the registry, never from a list repeated here: a list
+        // written by hand is what fails to notice a newly added action, which
+        // then reaches the settings panel displaying its own key. Both lookups
+        // fall back to the key, so a label that still starts with its prefix
+        // is a missing translation rather than a wording choice.
+        use favnyr_core::shortcuts::ACTIONS;
+        let groups: std::collections::BTreeSet<&str> =
+            ACTIONS.iter().map(|a| a.group.code()).collect();
+        assert!(
+            ACTIONS.len() > 40 && groups.len() > 4,
+            "the action registry looks truncated"
+        );
+        for &lang in Lang::all() {
+            for action in ACTIONS {
+                let name = shortcut_action_name(lang, action.id);
+                assert!(
+                    !name.trim().is_empty() && !name.starts_with("shortcut_action"),
+                    "{lang:?}: action {} has no label ({name})",
+                    action.id
+                );
+            }
+            for &code in &groups {
+                let name = shortcut_group_name(lang, code);
+                assert!(
+                    !name.trim().is_empty() && !name.starts_with("shortcut_group"),
+                    "{lang:?}: group {code} has no label ({name})"
+                );
+            }
+        }
     }
 
     #[test]

@@ -306,7 +306,9 @@ fn is_launchable_program(path: &Path) -> bool {
     if extension.as_deref() == Some("desktop") {
         return false;
     }
-    if !favnyr_core::fs::classify_kind(extension.as_deref(), false).can_be_program() {
+    if !favnyr_core::fs::classify_kind(extension.as_deref(), false)
+        .can_be_program_with_extension(extension.as_deref())
+    {
         return false;
     }
     has_exec_bit(path)
@@ -545,6 +547,7 @@ pub fn spawn_detached_view(
 ) -> Result<()> {
     let args = crate::detached_view::arguments(view, dirs, at)?;
     let exe = std::env::current_exe().map_err(|e| anyhow!("Favnyr executable not found: {e}"))?;
+    crate::detached_view::validate_command(&exe, &args)?;
     info!(tabs = dirs.len(), at = ?at, "spawn new Favnyr instance (view tear-off)");
     let mut cmd = Command::new(&exe);
     cmd.args(args);

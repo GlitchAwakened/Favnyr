@@ -140,5 +140,17 @@ export global Tokens {
             ? max(40px, min(row-h * 1.5, col-name-w - 40px))
             : Tokens.row-icon-size(preview, row-h) + 4px
     }
+    public pure function cloud-emblem-rect(visual-width: length, visual-height: length,
+            icon-size: length, emblem-size: length, emblem-dx: length,
+            emblem-dy: length, show-thumb: bool) -> ItemRect {
+        return {
+            left: show-thumb ? 0px
+                : (visual-width - icon-size) / 2 - emblem-dx,
+            top: (show-thumb ? visual-height
+                : (visual-height + icon-size) / 2 + emblem-dy) - emblem-size,
+            width: emblem-size,
+            height: emblem-size,
+        };
+    }
 
 }

@@ -30,6 +30,7 @@ mod archives;
 mod background_work;
 mod bridge;
 mod clipboard;
+mod cloud_content_guard;
 mod detached_view;
 mod file_drag;
 mod file_uri;
@@ -38,6 +39,7 @@ mod i18n;
 mod linportable;
 mod openwith;
 mod shellmenu;
+mod tab_transfer;
 #[cfg(test)]
 mod test_support;
 mod theme;
@@ -417,7 +419,7 @@ fn main() -> Result<()> {
     let (startup_dirs, detached_pos, startup_tab_bar, detached_settings) = match startup {
         StartupRequest::Normal => (None, None, 0, None),
         StartupRequest::Folders(dirs) => {
-            (Some(dirs), None, config.default_tab_bar_mode.min(2), None)
+            (Some(dirs), None, config.default_tab_bar_mode.min(3), None)
         }
         StartupRequest::InvalidLocation(location) => {
             warn!(location = %location.to_string_lossy(), "invalid startup location");
@@ -457,6 +459,13 @@ fn main() -> Result<()> {
     });
 
     let window = MainWindow::new().context("Slint MainWindow::new failed")?;
+
+    // The backend must exist, but the window must not be shown yet.
+    // Match the installed desktop entry's filename without its extension.
+    #[cfg(target_os = "linux")]
+    if let Err(error) = slint::set_xdg_app_id("favnyr") {
+        warn!(error = %error, "setting XDG application ID failed");
+    }
 
     // Restores the persisted size without ever letting the outer window
     // exceed the target monitor's work area. Config values are

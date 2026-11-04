@@ -4,6 +4,36 @@
 // Globals are shared by the components of one window, with independent instances
 // for other windows. Rust updates them together when the language changes.
 export global Strings {
+    in-out property <string> bulk-title;
+    in-out property <string> bulk-options;
+    in-out property <string> bulk-preview;
+    in-out property <string> bulk-hint;
+    in-out property <string> bulk-common;
+    in-out property <string> bulk-replace;
+    in-out property <string> bulk-find;
+    in-out property <string> bulk-with;
+    in-out property <string> bulk-sensitive;
+    in-out property <string> bulk-all;
+    in-out property <string> bulk-affixes;
+    in-out property <string> bulk-prefix;
+    in-out property <string> bulk-suffix;
+    in-out property <string> bulk-numbering;
+    in-out property <string> bulk-start;
+    in-out property <string> bulk-increment;
+    in-out property <string> bulk-digits;
+    in-out property <string> bulk-before;
+    in-out property <string> bulk-after;
+    in-out property <string> bulk-separator;
+    in-out property <string> bulk-case;
+    in-out property <string> bulk-keep;
+    in-out property <string> bulk-lower;
+    in-out property <string> bulk-upper;
+    in-out property <string> bulk-extension;
+    in-out property <string> bulk-extension-hint;
+    in-out property <string> bulk-original;
+    in-out property <string> bulk-current;
+    in-out property <string> bulk-proposed;
+    in-out property <string> bulk-close;
     in-out property <string> edit-select-all;
     in-out property <string> edit-clear;
     in-out property <string> edit-show-password;
@@ -72,7 +102,6 @@ export global Strings {
     in-out property <string> annotations-cleanup-all;        // "Select all"
     in-out property <string> annotations-cleanup-none;       // "Deselect all"
     in-out property <string> annotations-cleanup-empty;      // nothing left to sweep
-    in-out property <string> settings-annotations-cleaned;   // toast: how many entries went
 
     in-out property <string> col-name;
     in-out property <string> col-path;
@@ -91,15 +120,12 @@ export global Strings {
     in-out property <string> search-reveal;
     in-out property <string> search-reveal-new-tab;
     in-out property <string> ext-filter-placeholder;   // greyed hint of the extension filter bar
-    in-out property <string> col-resolution;
-    in-out property <string> col-depth;
     // Favorites
     in-out property <string> fav-title;
     in-out property <string> fav-new-container;
     in-out property <string> fav-collapse-all;
     in-out property <string> fav-expand-all;
     in-out property <string> fav-empty;
-    in-out property <string> fav-container-empty;
     in-out property <string> fav-open;
     in-out property <string> fav-execute;
     in-out property <string> fav-open-all;
@@ -116,17 +142,7 @@ export global Strings {
     in-out property <string> fav-popup-container;
     in-out property <string> fav-popup-parent;
     in-out property <string> fav-popup-new;
-    in-out property <string> fav-popup-root;
     in-out property <string> fav-save;
-    in-out property <string> fav-toast-added;
-    in-out property <string> fav-toast-missing;
-    in-out property <string> fav-toast-exists;          // warning: duplicate favorite
-
-    in-out property <string> footer-items-singular;
-    in-out property <string> footer-items-plural;
-    in-out property <string> footer-empty;
-    in-out property <string> footer-selected-singular;
-    in-out property <string> footer-selected-plural;
 
     in-out property <string> nav-prev;
     in-out property <string> nav-next;
@@ -136,6 +152,7 @@ export global Strings {
     in-out property <string> view-layout-list;
     in-out property <string> view-layout-grid;
     in-out property <string> view-sort-tooltip;
+    in-out property <string> cloud-content-remote-tip;
     in-out property <string> show-hidden-tooltip;
     in-out property <string> manual-order-label;
     in-out property <string> manual-order-hint;
@@ -150,18 +167,29 @@ export global Strings {
     in-out property <string> tab-scroll-left;   // left-scroll chevron tooltip
     in-out property <string> tab-scroll-right;
     in-out property <string> tabbar-menu-tooltip;   // "tab bar position" button
+    in-out property <string> tabbar-hidden;
     in-out property <string> tabbar-top;            // … horizontal bar at top option
     in-out property <string> tabbar-left;           // … vertical bar on the left option
     in-out property <string> tabbar-right;          // … vertical bar on the right option
     in-out property <string> tab-unavailable;       // folder-not-found banner
     in-out property <string> tab-unavailable-hint;
+    in-out property <string> tab-group-closed-title;
+    in-out property <string> tab-group-closed-hint;
+    in-out property <string> tab-group-open-title;
+    in-out property <string> tab-group-open-hint;
     in-out property <string> tab-duplicate;         // tab context menu: duplicate
     in-out property <string> tab-reopen-closed;     // dead-zone menu: last closed tab
-    in-out property <string> tab-close-tooltip;
+    in-out property <string> tab-group-menu;
+    in-out property <string> tab-drag-join;
+    in-out property <string> tab-group-new;
+    in-out property <string> tab-group-edit;
+    in-out property <string> tab-group-remove;
+    in-out property <string> tab-group-dissolve;
+    in-out property <string> tab-group-delete;
+    in-out property <string> tab-group-delete-confirm;
+    in-out property <string> tab-group-select;
+    in-out property <string> tab-group-color;
 
-    in-out property <string> panel-prefix;
-    in-out property <string> panel-new-tooltip;
-    in-out property <string> panel-close-tooltip;
     in-out property <string> panel-move-tooltip;     // grip: drag this view onto another
     in-out property <string> panel-split-view;
     in-out property <string> split-side-by-side;
@@ -179,6 +207,7 @@ export global Strings {
     in-out property <string> ctx-new;                  // unified parent entry "New" (flyout)
     in-out property <string> ctx-new-folder;
     in-out property <string> ctx-new-file;
+    in-out property <string> ctx-new-registered;
     in-out property <string> ctx-new-shortcut;         // "New shortcut" (.lnk, Windows)
     in-out property <string> create-shortcut-target;   // label of the "Target" field (shortcut popup)
     in-out property <string> create-browse;            // "Browse…" button for the target
@@ -239,10 +268,6 @@ export global Strings {
     in-out property <string> settings-group-workspaces;
     in-out property <string> settings-folder-depth-hint;    // shared under both depth spin boxes
     in-out property <string> settings-columns-section;   // "Default columns"
-    // MORE EXPLICIT labels in the checkbox for the columns reserved for
-    // images (the column header itself stays short).
-    in-out property <string> settings-col-resolution;
-    in-out property <string> settings-col-depth;
     in-out property <string> settings-rmtime-label;
     in-out property <string> settings-rmtime-hint;
     in-out property <string> settings-fsize-label;      // "Folder size"
@@ -270,7 +295,6 @@ export global Strings {
     in-out property <string> shortcut-reset-all-confirm;
     in-out property <string> shortcut-reset-tooltip;
     in-out property <string> shortcut-listening;
-    in-out property <string> shortcut-capture-cancel;
     in-out property <string> shortcut-unassigned;
     in-out property <string> shortcut-unassign;       // context menu: remove the shortcut
     in-out property <string> shortcut-no-results;
@@ -298,18 +322,6 @@ export global Strings {
 
     // File-drag feedback.
     in-out property <string> drag-open-with;               // "Open with this program"
-
-    // Progress bar for long operations.
-    in-out property <string> op-copying;
-    in-out property <string> op-moving;
-    in-out property <string> op-deleting;
-    in-out property <string> op-deleting-permanently;
-    in-out property <string> op-duplicating;
-    in-out property <string> op-scanning;
-    in-out property <string> op-done;
-    in-out property <string> op-cancelled;
-    in-out property <string> op-errors;           // e.g.: "Finished with errors"
-    in-out property <string> op-items;            // e.g.: "items" (trash counter)
 
     // Named workspaces
     in-out property <string> ws-tooltip;               // top bar button tooltip
@@ -395,14 +407,12 @@ export global Strings {
     in-out property <string> drop-detach;              // "Detach" (a view carried out of the window)
 
     in-out property <string> ws-reset;                 // "Start a new workspace" button
-    in-out property <string> ws-new-name;              // "new workspace" target name in the dialog
-    in-out property <string> ws-toast-reset;           // toast after reset
     in-out property <string> ws-sort-newest;           // "newest first" sort label
     in-out property <string> ws-sort-oldest;           // "oldest first" sort label
-    in-out property <string> ws-sort-tooltip;          // sort-direction toggle button tooltip
     // Open with
     in-out property <string> ow-choose;
     in-out property <string> ow-pick-browse;
+    in-out property <string> ow-run;
     in-out property <string> ow-custom;
     in-out property <string> ow-use-as-app;
     in-out property <string> ow-manage;
@@ -423,10 +433,8 @@ export global Strings {
     in-out property <string> ow-tag-uri;
     in-out property <string> ow-tag-files;
     in-out property <string> ow-preview;
-    in-out property <string> ow-add-suggested;
     in-out property <string> ow-recipes-label;   // section title, also its accessible label
     in-out property <string> ow-recipes-hint;    // what the recipes are and why some are absent
-    in-out property <string> ow-launch;
     in-out property <string> ow-default-ext;
     in-out property <string> ow-set-default;     // "Set as default" checkbox of the app picker
     in-out property <string> ow-display-other-apps; // Linux picker: include launchers without MimeType
@@ -445,6 +453,8 @@ export global Strings {
     in-out property <string> ow-used-ext-hint;   // what the "suggested for" list does
     in-out property <string> settings-shellmenu-label; // settings card: Windows context menu
     in-out property <string> settings-shellmenu-hint;
+    in-out property <string> settings-registered-types-label;
+    in-out property <string> settings-registered-types-hint;
     in-out property <string> settings-shellext-list-label; // sub-tab: detected Windows entries
     in-out property <string> settings-shellext-list-hint;
     in-out property <string> settings-shellext-empty;      // no entry detected

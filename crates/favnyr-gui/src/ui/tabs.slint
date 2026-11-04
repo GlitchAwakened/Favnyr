@@ -50,164 +50,69 @@ export component TabScrollButton inherits Rectangle {
     }
 }
 
-export component TabItem inherits Rectangle {
-    callback clicked();
-    callback close-clicked();
-    callback right-clicked(length, length);   // tab context menu
-    /// Drag in progress: (delta_px, abs_x, abs_y). Lets the parent
-    /// preview the drop AND detect a cross-view target.
-    callback drag-progress(length, length, length);
-    /// Drag completed: (delta_px, abs_x, abs_y).
-    callback drag-completed(length, length, length);
-    in property <string> title;
-    in property <int> folder-slot;
-    property <color> tone: root.folder-slot > 0
-        ? Tokens.folder-color(root.folder-slot) : Theme.accent-background;
-    in property <bool> active: false;
-    /// Full path of the tab — tooltip on hover (empty = no tooltip).
+export component TabGesture inherits Rectangle {
     in property <string> tip-path;
-
-    // Geometry & insertion gap claiming -----
-    // Width IMPOSED by the model (bridge) — no fit-to-text: the layout no
-    // longer depends on the text, and the drop logic uses THE SAME plain value.
-    // Like `ColumnHeader.my-drop-target`, this binding only observes
-    // simple model values: offset, width, and the propagated cursor position. It
-    // never depends on `self.x`, `self.width`, or the layout cache, so as not to
-    // create a reactive cycle.
-    // ORIENTATION: `tab-width`/`tab-offset`/`reorder-cur` live on the
-    // bar's MAIN AXIS (X horizontally, Y vertically) — the gap
-    // claim below is thus SHARED between both bars.
-    // `vertical` only toggles the visual geometry (width ↔ height).
-    in property <bool> vertical: false;
-    in property <length> cross-len: 120px;  // VISUAL width in vertical mode
-    // Active indicator on the inner edge of the vertical bar: on the right
-    // when the bar sits to the left of the content, and vice versa.
-    in property <bool> indicator-right: true;
-    in property <length> tab-width: 120px;  // extent along the main axis
-    in property <length> tab-offset;        // offset (main axis) within the bar (bridge)
-    in property <int> tab-index;
-    in property <int> tab-count;
-    in property <bool> reorder-active;      // drag in progress + cursor within the panel's bar
-    in property <length> reorder-cur;       // drag cursor along the main axis (content-relative)
-    /// Emitted when THIS tab claims the gap: (gap index, gap x).
-    callback claim-drop(int, length);
-    // Claimed zone = tab + its right-hand gap (2px spacing) → continuous
-    // tiling; the first tab extends left, the last extends right (outer gaps).
-    // Left half → insert BEFORE (index); right half → AFTER (index+1).
-    property <int> my-claim:
-        (!root.reorder-active
-            || (root.reorder-cur < root.tab-offset && root.tab-index != 0)
-            || (root.reorder-cur >= root.tab-offset + root.tab-width + 2px
-                && root.tab-index != root.tab-count - 1))
-        ? -1
-        : (root.reorder-cur < root.tab-offset + root.tab-width / 2
-            ? root.tab-index
-            : root.tab-index + 1);
-    changed my-claim => {
-        if (root.my-claim >= 0) {
-            root.claim-drop(root.my-claim,
-                root.my-claim == root.tab-index
-                    ? root.tab-offset
-                    : root.tab-offset + root.tab-width + 2px);
-        }
-    }
-
-    height: root.vertical ? root.tab-width : 26px;
-    width: root.vertical ? root.cross-len : root.tab-width;
-    // 15% of the 26px tab height. At 6px (23%) the corners read as a pill;
-    // this keeps the shape a rectangle that happens to be softened.
-    border-radius: 5px;
-    opacity: dragging ? 0.5 : 1.0;
-    // Marked tabs keep a subtle tint even when inactive. Stronger fill and
-    // outline distinguish the active tab without changing the drag geometry.
-    background: root.active
-        ? root.tone.with-alpha(0.22)
-        : root.folder-slot > 0
-            ? root.tone.with-alpha(touch.has-hover ? 0.14 : 0.07)
-            : (touch.has-hover
-            ? Theme.foreground.with-alpha(0.06)
-            : transparent);
-    border-width: 1px;
-    // Active tab: accent outline. Inactive: faint light outline to
-    // distinguish them from the background (a bit stronger on hover).
-    border-color: root.active
-        ? root.tone.with-alpha(0.55)
-        : root.folder-slot > 0
-            ? root.tone.with-alpha(touch.has-hover ? 0.40 : 0.25)
-            : (touch.has-hover
-            ? Theme.foreground.with-alpha(0.30)
-            : Theme.foreground.with-alpha(0.18));
+    out property <bool> hovered: touch.has-hover;
+    callback clicked(int);
+    callback close-clicked();
+    callback right-clicked(length, length);
+    callback drag-progress(length, length, length);
+    callback drag-completed(length, length, length);
 
     property <length> ds-x;
     property <length> ds-y;
-    property <bool> dragging: false;
-    /// The window's tab drag. Watched rather than merely reflected: when the
-    /// drag is cut from outside — a menu opening mid-gesture — this tab has to
-    /// stop looking carried, or it stays half-faded until the next click.
+    out property <bool> dragging: false;
+    property <bool> gesture-moved: false;
+    property <bool> gesture-cancelled: false;
+    property <int> down-modifiers;
     in property <bool> tab-drag-active: false;
     changed tab-drag-active => {
-        if (!root.tab-drag-active) { root.dragging = false; }
+        if (!root.tab-drag-active && root.dragging) {
+            root.gesture-cancelled = true;
+            root.dragging = false;
+        }
     }
-
-    // IMPORTANT: `touch` (the tab's root TouchArea) MUST be declared BEFORE
-    // the close button, otherwise in Slint it intercepts all clicks (z-order
-    // = declaration order, the LAST one is topmost).
     touch := TouchArea {
-        pointer-event(ev) => {
-            // LEFT click on a tab closes menus; right-click (tab
-            // menu) does not bump → it can teleport the menu.
-            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) { Dismiss.serial += 1; }
-            if (ev.button == PointerEventButton.left
-                    && ev.kind == PointerEventKind.down) {
+        mouse-cursor: pointer;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                Dismiss.serial += 1;
                 root.ds-x = self.absolute-position.x + self.mouse-x;
                 root.ds-y = self.absolute-position.y + self.mouse-y;
                 root.dragging = false;
+                root.gesture-moved = false;
+                root.gesture-cancelled = false;
+                root.down-modifiers = (event.modifiers.control ? 1 : 0) + (event.modifiers.shift ? 2 : 0);
             }
-            if (ev.button == PointerEventButton.left
-                    && ev.kind == PointerEventKind.up) {
+            if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
                 if (root.dragging) {
-                    root.drag-completed(
-                        self.absolute-position.x + self.mouse-x - root.ds-x,
-                        self.absolute-position.x + self.mouse-x,
-                        self.absolute-position.y + self.mouse-y,
-                    );
+                    root.drag-completed(self.absolute-position.x + self.mouse-x - root.ds-x,
+                        self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
                     root.dragging = false;
-                } else {
-                    root.clicked();
+                } else if (!root.gesture-moved && !root.gesture-cancelled) {
+                    root.clicked(root.down-modifiers);
                 }
             }
-            // Middle-click → closes the tab (common browser convention).
-            if (ev.button == PointerEventButton.middle
-                    && ev.kind == PointerEventKind.up) {
+            if (event.kind == PointerEventKind.up && event.button == PointerEventButton.middle) {
                 root.close-clicked();
             }
-            // Right-click → tab context menu (save as favorite…).
-            if (ev.button == PointerEventButton.right
-                    && ev.kind == PointerEventKind.down) {
-                root.right-clicked(
-                    self.absolute-position.x + self.mouse-x,
-                    self.absolute-position.y + self.mouse-y);
+            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
+                root.right-clicked(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
             }
         }
         moved => {
-            // Drag threshold on BOTH axes: a vertical tab drag
-            // starts with a Y movement — an X-only threshold wouldn't catch it.
-            if (self.pressed && !root.dragging) {
-                if (abs(self.absolute-position.x + self.mouse-x - root.ds-x) > 6px
-                        || abs(self.absolute-position.y + self.mouse-y - root.ds-y) > 6px) {
-                    root.dragging = true;
-                }
+            if (self.pressed && !root.dragging && !root.gesture-cancelled
+                && (abs(self.absolute-position.x + self.mouse-x - root.ds-x) > 6px
+                    || abs(self.absolute-position.y + self.mouse-y - root.ds-y) > 6px)) {
+                root.gesture-moved = true;
+                root.dragging = root.down-modifiers == 0;
             }
             if (self.pressed && root.dragging) {
-                root.drag-progress(
-                    self.absolute-position.x + self.mouse-x - root.ds-x,
-                    self.absolute-position.x + self.mouse-x,
-                    self.absolute-position.y + self.mouse-y,
-                );
+                Tip.text = "";
+                root.drag-progress(self.absolute-position.x + self.mouse-x - root.ds-x,
+                    self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
             }
         }
-        // Tooltip below the tab: the full path distinguishes identical
-        // titles. The `Tip` overlay stays bounded to the window dimensions.
         changed has-hover => {
             if (self.has-hover && root.tip-path != "" && !root.dragging) {
                 Tip.text = root.tip-path;
@@ -217,6 +122,47 @@ export component TabItem inherits Rectangle {
                 Tip.text = "";
             }
         }
+    }
+}
+
+export component TabItem inherits Rectangle {
+    callback clicked(int);
+    callback close-clicked();
+    callback right-clicked(length, length);
+    callback drag-progress(length, length, length);
+    callback drag-completed(length, length, length);
+    in property <string> title;
+    in property <int> folder-slot;
+    property <color> tone: root.folder-slot > 0 ? Tokens.folder-color(root.folder-slot) : Theme.accent-background;
+    in property <bool> active: false;
+    in property <bool> selection-marked: false;
+    in property <string> tip-path;
+    in property <bool> vertical: false;
+    in property <length> cross-len: 120px;
+    in property <bool> indicator-right: true;
+    in property <length> tab-width: 120px;
+    in property <bool> tab-drag-active: false;
+    height: root.vertical ? root.tab-width : 26px;
+    width: root.vertical ? root.cross-len : root.tab-width;
+    border-radius: 5px;
+    opacity: gesture.dragging ? 0.5 : 1;
+    background: root.active ? root.tone.with-alpha(0.22)
+        : root.selection-marked ? Theme.accent-background.with-alpha(0.14)
+        : root.folder-slot > 0 ? root.tone.with-alpha(gesture.hovered ? 0.14 : 0.07)
+        : gesture.hovered ? Theme.foreground.with-alpha(0.06) : transparent;
+    border-width: 1px;
+    border-color: root.active ? root.tone.with-alpha(0.55)
+        : root.selection-marked ? Theme.accent-background.with-alpha(0.75)
+        : root.folder-slot > 0 ? root.tone.with-alpha(gesture.hovered ? 0.40 : 0.25)
+        : Theme.foreground.with-alpha(gesture.hovered ? 0.30 : 0.18);
+    gesture := TabGesture {
+        tip-path: root.tip-path;
+        tab-drag-active: root.tab-drag-active;
+        clicked(m) => { root.clicked(m); }
+        close-clicked => { root.close-clicked(); }
+        right-clicked(x, y) => { root.right-clicked(x, y); }
+        drag-progress(d, x, y) => { root.drag-progress(d, x, y); }
+        drag-completed(d, x, y) => { root.drag-completed(d, x, y); }
     }
 
     // In vertical orientation, a 2px accent bar marks the active tab
@@ -230,7 +176,21 @@ export component TabItem inherits Rectangle {
         background: root.tone;
     }
 
-    // Title + "x" zone — visual positioned on top of the root touch area.
+    // The underline distinguishes selection from the active tab's outline.
+    // Ordinary navigation keeps its original appearance. In the horizontal
+    // strip it runs above the title rather than below it: the bottom edge
+    // carries a group's attachment rail there, and two near-parallel lines of
+    // unrelated meaning would be read as one. A vertical bar stacks its
+    // entries, so its rail runs in the side gutter and leaves the edge free.
+    if root.selection-marked : Rectangle {
+        x: 10px;
+        y: root.vertical ? parent.height - 3px : 2px;
+        width: max(0px, parent.width - 36px);
+        height: 1px;
+        background: Theme.accent-background;
+    }
+
+    // Title and close-button zone, above the root touch area.
     HorizontalLayout {
         padding-left: 10px;
         padding-right: 4px;
@@ -271,15 +231,213 @@ export component TabItem inherits Rectangle {
     }
 }
 
-// VTabBar: a panel's VERTICAL tab bar ----------
-// Full-height column stacked to the left or right of the content. Full
-// parity with the horizontal strip: same TabItem (plain geometry on
-// the Y axis — uniform 26+2 px pitch computed by the bridge), same gap
-// claiming, wheel = next/previous tab, double-click on empty area = new tab,
-// non-interactive overflow fades, auto-scroll at the edges during a drag,
-// "+" in a fixed footer.
-// The component is instantiated on BOTH sides (width 0 when inactive): the ids
-// stay referenceable (a conditional `if` element would not be).
+// End cap of a group's attachment rail. It grows out of the rail
+// perpendicularly, so both ends of a group are stated by one geometry whichever
+// axis the bar runs along.
+component GroupRailFoot inherits Rectangle {
+    in property <bool> vertical;
+    in property <length> along;    // position along the bar's axis
+    in property <length> across;   // position across it, at the rail
+    x: root.vertical ? root.across : root.along;
+    y: root.vertical ? root.along : root.across;
+    width: root.vertical ? 6px : 2px;
+    height: root.vertical ? 2px : 6px;
+}
+
+// One visible entry, shared by the horizontal and both vertical bars.
+export component TabBarEntry inherits Rectangle {
+    in property <TabInfo> entry;
+    in property <bool> vertical;
+    in property <length> cross-len: 120px;
+    in property <bool> indicator-right: true;
+    in property <int> active-index;
+    in property <bool> show-tooltip;
+    in property <bool> tab-drag-active;
+    callback clicked(int, int);
+    callback closed(int);
+    callback context(int, length, length);
+    callback drag-progress(int, string, length, length);
+    callback drag-completed(int, length, length);
+    callback group-toggle(string);
+    callback group-clicked(string, int);
+    callback group-context(string, length, length);
+    width: root.vertical ? root.cross-len : root.entry.width;
+    height: root.vertical ? root.entry.width : 26px;
+    property <color> tone: root.entry.group-slot > 0
+        ? Tokens.folder-color(root.entry.group-slot) : Theme.foreground;
+    // Ink for text drawn on an opaque block of `tone`. The palette pairs each
+    // slot with a foreground proven legible on it; an unslotted group falls
+    // back to the theme's own background, the foreground's natural counterpart.
+    property <color> ink: root.entry.group-slot > 0
+        ? Tokens.folder-ink(root.entry.group-slot) : Theme.background;
+    // Boundary gaps are reserved inside the entry's extent, so the content box
+    // is shorter than the slot the bar's layout gives it.
+    property <length> lead: root.entry.pad-lead;
+    property <length> main-len: root.entry.width - root.lead - root.entry.pad-trail;
+    // The rail hugs the bar's outer edge, opposite the active-tab indicator, so
+    // a bar docked on the right mirrors both instead of stacking two saturated
+    // stripes a few pixels apart.
+    property <bool> rail-lead: root.indicator-right;
+    // Cross-axis position of the rail, shared with the feet that cap it.
+    property <length> rail-across: root.vertical
+        ? (root.rail-lead ? 2px : root.width - 8px) : root.height - 6px;
+    // A group is set in from the ungrouped tabs around it, which frees the
+    // gutter the rail runs in. The horizontal strip has no room to indent.
+    property <length> indent: (root.vertical && root.entry.grouped) ? 8px : 0px;
+    // Content box, inside the boundary gaps and the indent. A header and a
+    // member share it, so neither can drift from the other when the bar is
+    // docked on the opposite side.
+    property <length> inset-x: root.vertical ? (root.rail-lead ? root.indent : 0px) : root.lead;
+    property <length> inset-y: root.vertical ? root.lead : 0px;
+    property <length> cross-box: root.width - root.indent;
+    if !root.entry.is-group : TabItem {
+        x: root.inset-x;
+        y: root.inset-y;
+        cross-len: root.cross-box;
+        vertical: root.vertical;
+        indicator-right: root.indicator-right;
+        tab-width: root.main-len;
+        title: root.entry.title;
+        folder-slot: root.entry.folder-slot;
+        tip-path: root.show-tooltip ? root.entry.path : "";
+        active: root.entry.index == root.active-index;
+        selection-marked: root.entry.selection-marked;
+        tab-drag-active: root.tab-drag-active;
+        clicked(m) => { root.clicked(root.entry.index, m); }
+        close-clicked => { root.closed(root.entry.index); }
+        right-clicked(x, y) => { root.context(root.entry.index, x, y); }
+        drag-progress(d, x, y) => { root.drag-progress(root.entry.index, "", x, y); }
+        drag-completed(d, x, y) => { root.drag-completed(root.entry.index, x, y); }
+    }
+    if root.entry.is-group : Rectangle {
+        x: root.inset-x;
+        y: root.inset-y;
+        width: root.vertical ? root.cross-box : root.main-len;
+        height: root.vertical ? root.main-len : root.height;
+        border-radius: 5px;
+        background: root.entry.selection-marked ? Theme.accent-background.with-alpha(0.14)
+            : root.tone.with-alpha(header-touch.hovered ? 0.16 : 0.08);
+        opacity: header-touch.dragging ? 0.5 : 1;
+        // The targeted group is independent of folding and keyboard focus.
+        border-width: root.entry.group-highlighted || root.entry.selection-marked ? 1px : 0px;
+        border-color: Theme.accent-background;
+        if root.entry.selection-marked : Rectangle {
+            x: 26px;
+            y: root.vertical ? parent.height - 3px : 2px;
+            width: max(0px, parent.width - 36px);
+            height: 1px;
+            background: Theme.accent-background;
+        }
+        // Name and tab count. The chip is a freely positioned sibling, as the
+        // close button is on a tab, so the leading padding reserves its room.
+        HorizontalLayout {
+            padding-left: 26px; padding-right: 8px; spacing: 5px;
+            Text { text: root.entry.title; font-size: 11px; color: root.tone;
+                vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+            Text { text: root.entry.count; font-size: 10px; color: root.tone.with-alpha(0.7);
+                vertical-alignment: center; }
+        }
+        // The one opaque fill of the whole bar. Every tab state is a
+        // translucent wash, so a solid block of colour means "group" on its
+        // own, whichever slot the group carries and even when it carries none.
+        Rectangle {
+            x: 4px;
+            y: (parent.height - self.height) / 2;
+            width: 18px;
+            height: 18px;
+            border-radius: 4px;
+            background: root.tone;
+            // Expanded, the chevron points along the bar at the members that
+            // follow the header on that axis; collapsed, it points across the
+            // bar instead. The glyph therefore follows the bar's orientation,
+            // as the members themselves do, which is why the two mappings below
+            // are mirrored rather than shared.
+            Image {
+                source: root.vertical
+                    ? (root.entry.collapsed
+                        ? @image-url("../../assets/icons/chevron-right.svg")
+                        : @image-url("../../assets/icons/chevron-down.svg"))
+                    : (root.entry.collapsed
+                        ? @image-url("../../assets/icons/chevron-down.svg")
+                        : @image-url("../../assets/icons/chevron-right.svg"));
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 11px;
+                height: 11px;
+                colorize: root.ink;
+            }
+        }
+        header-focus := FocusScope {
+            accessible-role: button;
+            accessible-label: root.entry.title;
+            accessible-action-default => { root.group-toggle(root.entry.group-id); }
+            key-pressed(event) => {
+                // A cleared visual target must not keep handling group keys
+                // through a focus scope retained by the stable repeater.
+                if (!root.entry.group-highlighted) { return reject; }
+                if (event.text == " " || event.text == Key.Return) {
+                    root.group-toggle(root.entry.group-id); return accept;
+                }
+                if (event.text == Key.Menu || (event.text == Key.F10 && event.modifiers.shift)) {
+                    root.group-context(root.entry.group-id, root.absolute-position.x,
+                        root.absolute-position.y + root.height); return accept;
+                }
+                return reject;
+            }
+        }
+        header-touch := TabGesture {
+            tip-path: root.show-tooltip ? root.entry.title : "";
+            tab-drag-active: root.tab-drag-active;
+            clicked(m) => {
+                if (m == 0) {
+                    header-focus.focus();
+                    root.group-toggle(root.entry.group-id);
+                } else {
+                    root.group-clicked(root.entry.group-id, m);
+                }
+            }
+            right-clicked(x, y) => { root.group-context(root.entry.group-id, x, y); }
+            drag-progress(d, x, y) => { root.drag-progress(-1, root.entry.group-id, x, y); }
+            drag-completed(d, x, y) => { root.drag-completed(-1, x, y); }
+        }
+    }
+
+    // Attachment rail, declared last so it reads over the outlines it joins.
+    // Each entry of a group draws only its own stretch and overhangs the pitch
+    // that separates it from the next one, so consecutive stretches meet and
+    // the line stays unbroken without any entry knowing the group's extent.
+    // The overhang stops at the group's two ends, where a foot closes the rail.
+    if root.entry.grouped : Rectangle {
+        // Overhang into the pitch, dropped at whichever end a foot closes.
+        property <length> ahead: root.entry.is-group ? 0px : 1px;
+        property <length> behind: root.entry.rail-tail ? 0px : 1px;
+        x: root.vertical
+            ? (root.rail-lead ? 2px : root.width - 4px)
+            : root.lead - self.ahead;
+        y: root.vertical ? root.lead - self.ahead : root.height - 2px;
+        width: root.vertical ? 2px : root.main-len + self.ahead + self.behind;
+        height: root.vertical ? root.main-len + self.ahead + self.behind : 2px;
+        background: root.tone.with-alpha(0.85);
+    }
+    // Feet turn the rail into a bracket: they say where the group starts and
+    // where it ends, which two groups of neighbouring hues cannot otherwise
+    // show. A collapsed group reduced to its header carries both.
+    if root.entry.is-group : GroupRailFoot {
+        vertical: root.vertical;
+        across: root.rail-across;
+        along: root.lead;
+        background: root.tone.with-alpha(0.85);
+    }
+    if root.entry.rail-tail : GroupRailFoot {
+        vertical: root.vertical;
+        across: root.rail-across;
+        along: root.lead + root.main-len - 2px;
+        background: root.tone.with-alpha(0.85);
+    }
+}
+
+// Both vertical bars remain instantiated so their scroll positions can be read
+// without conditional element references. Only the active side has a width.
 export component VTabBar inherits Rectangle {
     in property <[TabInfo]> tabs;
     in property <int> active-tab-idx;
@@ -291,7 +449,6 @@ export component VTabBar inherits Rectangle {
     // Tab drag: cursor presence within this bar and Y coordinate within
     // the content, computed by the PanelComponent without depending on the layout cache.
     in property <bool> reorder-here;
-    in property <length> reorder-cur;
     in property <length> cursor-in-bar-y;  // VISIBLE Y cursor (auto-scroll at edges)
     // Insertion preview (claimed gap, content-relative position).
     in property <int> preview-idx: -1;
@@ -299,11 +456,13 @@ export component VTabBar inherits Rectangle {
     // Current scroll (content-y ≤ 0) — read by the PanelComponent to
     // convert the drag cursor to a content-relative position (PLAIN read).
     out property <length> vp-y: flick.content-y;
-    callback claim-drop(int, length);
-    callback tab-clicked(int);
+    callback group-toggle(string);
+    callback group-clicked(string, int);
+    callback group-context(string, length, length);
+    callback tab-clicked(int, int);
     callback tab-closed(int);
     callback tab-context(int, length, length);
-    callback tab-drag-progress(int, length, length);
+    callback tab-drag-progress(int, string, length, length);
     callback tab-drag-completed(int, length, length);
     callback tab-new();
     callback bar-clicked();                // click on empty area → activate the panel
@@ -400,28 +559,22 @@ export component VTabBar inherits Rectangle {
                 vtabs-col := VerticalLayout {
                     spacing: 2px;               // MUST == VTAB_SPACING (bridge)
                     alignment: start;
-                    for tab[idx] in root.tabs : TabItem {
+                    for tab in root.tabs : TabBarEntry {
+                        entry: tab;
                         vertical: true;
-                        cross-len: flick.width;
+                        cross-len: root.width - 8px;
                         indicator-right: root.on-left;
-                        title: tab.title;
-                        folder-slot: tab.folder-slot;
-                        // Path tooltip: opt-in — empty = disabled.
-                        tip-path: root.show-tooltip ? tab.path : "";
-                        active: idx == root.active-tab-idx;
-                        tab-width: tab.width;   // Y extent (26px, bridge)
-                        tab-offset: tab.offset;
-                        tab-index: idx;
-                        tab-count: root.tabs.length;
-                        reorder-active: root.reorder-here;
-                        reorder-cur: root.reorder-cur;
+                        active-index: root.active-tab-idx;
+                        show-tooltip: root.show-tooltip;
                         tab-drag-active: root.tab-drag-active;
-                        claim-drop(g, gy) => { root.claim-drop(g, gy); }
-                        clicked => { root.tab-clicked(idx); }
-                        close-clicked => { root.tab-closed(idx); }
-                        right-clicked(x, y) => { root.tab-context(idx, x, y); }
-                        drag-progress(d, ax, ay) => { root.tab-drag-progress(idx, ax, ay); }
-                        drag-completed(d, ax, ay) => { root.tab-drag-completed(idx, ax, ay); }
+                        clicked(i, m) => { root.tab-clicked(i, m); }
+                        closed(i) => { root.tab-closed(i); }
+                        context(i, x, y) => { root.tab-context(i, x, y); }
+                        drag-progress(i, group, x, y) => { root.tab-drag-progress(i, group, x, y); }
+                        drag-completed(i, x, y) => { root.tab-drag-completed(i, x, y); }
+                        group-toggle(id) => { root.group-toggle(id); }
+                        group-clicked(id, m) => { root.group-clicked(id, m); }
+                        group-context(id, x, y) => { root.group-context(id, x, y); }
                     }
                     // Bottom clearance: the last tab (and its close button) escapes
                     // the fade (vertical equivalent of the `tab-cluster-w` spacer).
@@ -454,8 +607,7 @@ export component VTabBar inherits Rectangle {
                     Theme.toolbar 0%, Theme.toolbar.with-alpha(0.0) 100%);
             }
             // Auto-scroll during a reorder drag near the
-            // edges: `reorder-cur` follows
-            // `content-y` → the gap recomputes as scrolling progresses.
+            // edges. The panel recomputes its gap from the new content offset.
             Timer {
                 interval: 16ms;
                 running: root.reorder-here

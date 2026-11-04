@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::Result;
 use crate::fs::{GroupMode, SortColumn, SortOrder};
 use crate::layout::LayoutNode;
+use crate::tab_groups::{GroupedTab, TabGroups};
 
 /// Maximum number of closed tabs kept per workspace, oldest to most
 /// recent. The last element is the one "Reopen" will restore.
@@ -59,6 +60,13 @@ impl ItemArrangement {
 /// Serializable state of a tab: current path + sort + display mode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabState {
+    /// Optional membership in a group owned by the containing view.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::tab_groups::deserialize_membership"
+    )]
+    pub tab_group_id: Option<String>,
     pub path: String,
     #[serde(default = "default_sort_column")]
     pub sort_column: SortColumn,
@@ -94,6 +102,15 @@ pub struct TabState {
     pub grid_zoom: Option<i32>,
 }
 
+impl GroupedTab for TabState {
+    fn tab_group_id(&self) -> Option<&str> {
+        self.tab_group_id.as_deref()
+    }
+    fn set_tab_group_id(&mut self, id: Option<String>) {
+        self.tab_group_id = id;
+    }
+}
+
 fn default_group_mode() -> GroupMode {
     GroupMode::FoldersFirst
 }
@@ -108,6 +125,8 @@ fn default_sort_order() -> SortOrder {
 /// Serializable state of a panel: width ratio, active tab, tabs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ViewState {
+    #[serde(default, skip_serializing_if = "TabGroups::is_empty")]
+    pub tab_groups: TabGroups,
     /// Width ratio relative to the other panels (see `panel_stretches`).
     #[serde(default = "default_stretch")]
     pub stretch: f32,
@@ -119,9 +138,12 @@ pub struct ViewState {
     #[serde(default = "crate::columns::default_columns")]
     pub columns: Vec<crate::columns::ColumnSpec>,
     /// Position of the view's tab bar: 0 = horizontal at the top,
-    /// 1 = vertical on the left, 2 = vertical on the right. The default value is 0.
+    /// 1 = vertical on the left, 2 = vertical on the right, 3 = hidden.
     #[serde(default)]
     pub tab_bar_mode: u8,
+    /// Visible position restored by the tab bar visibility shortcut.
+    #[serde(default)]
+    pub tab_bar_restore_mode: u8,
     /// USER width of the vertical tab bar (logical px), set by the
     /// resize handle. `0` = automatic (clamped 40% formula). Persisted per
     /// view.
@@ -137,12 +159,16 @@ impl ViewState {
     /// Normalizes presentation and active-tab bounds without removing tabs.
     /// Workspace loading and detached-window startup share these rules.
     pub fn sanitize(&mut self) {
+        self.tab_groups.normalize(&mut self.tabs);
         self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
         if !(self.stretch.is_finite() && self.stretch > 0.0) {
             self.stretch = 1.0;
         }
-        if self.tab_bar_mode > 2 {
+        if self.tab_bar_mode > 3 {
             self.tab_bar_mode = 0;
+        }
+        if self.tab_bar_restore_mode > 2 {
+            self.tab_bar_restore_mode = 0;
         }
         if !self.vbar_width.is_finite() || self.vbar_width < 0.0 {
             self.vbar_width = 0.0;
@@ -256,6 +282,9 @@ impl WorkspaceState {
     /// removes empty panels, and guarantees a `layout` consistent with the
     /// remaining panels.
     pub fn sanitized(mut self) -> Self {
+        for tab in &mut self.closed_tabs {
+            tab.tab_group_id = None;
+        }
         if self.closed_tabs.len() > MAX_CLOSED_TABS {
             self.closed_tabs
                 .drain(..self.closed_tabs.len() - MAX_CLOSED_TABS);
@@ -265,9 +294,11 @@ impl WorkspaceState {
             // Rebuild a minimal panel — the caller will replace the empty
             // path with $HOME via `effective_*`.
             self.panels.push(ViewState {
+                tab_groups: Default::default(),
                 stretch: 1.0,
                 active_tab: 0,
                 tabs: vec![TabState {
+                    tab_group_id: None,
                     path: String::new(),
                     sort_column: SortColumn::Name,
                     sort_order: SortOrder::Asc,
@@ -281,6 +312,7 @@ impl WorkspaceState {
                 }],
                 columns: crate::columns::default_columns(),
                 tab_bar_mode: 0,
+                tab_bar_restore_mode: 0,
                 vbar_width: 0.0,
             });
         }
@@ -605,9 +637,11 @@ mod tests {
             active_panel: 1,
             panels: vec![
                 ViewState {
+                    tab_groups: Default::default(),
                     stretch: 1.5,
                     active_tab: 0,
                     tabs: vec![TabState {
+                        tab_group_id: None,
                         path: "/home/u/Documents".into(),
                         sort_column: SortColumn::Size,
                         sort_order: SortOrder::Desc,
@@ -621,13 +655,16 @@ mod tests {
                     }],
                     columns: crate::columns::default_columns(),
                     tab_bar_mode: 0,
+                    tab_bar_restore_mode: 0,
                     vbar_width: 0.0,
                 },
                 ViewState {
+                    tab_groups: Default::default(),
                     stretch: 1.0,
                     active_tab: 1,
                     tabs: vec![
                         TabState {
+                            tab_group_id: None,
                             path: "/tmp".into(),
                             sort_column: SortColumn::Name,
                             sort_order: SortOrder::Asc,
@@ -640,6 +677,7 @@ mod tests {
                             grid_zoom: None,
                         },
                         TabState {
+                            tab_group_id: None,
                             path: "/etc".into(),
                             sort_column: SortColumn::Modified,
                             sort_order: SortOrder::Desc,
@@ -654,6 +692,7 @@ mod tests {
                     ],
                     columns: crate::columns::default_columns(),
                     tab_bar_mode: 0,
+                    tab_bar_restore_mode: 0,
                     vbar_width: 0.0,
                 },
             ],
@@ -872,6 +911,7 @@ item_arrangement = "future"
         let mut ws = sample();
         ws.closed_tabs = (0..25)
             .map(|index| TabState {
+                tab_group_id: None,
                 path: format!("/closed/{index}"),
                 sort_column: SortColumn::Name,
                 sort_order: SortOrder::Asc,
@@ -965,9 +1005,11 @@ item_arrangement = "future"
         let ws = WorkspaceState {
             active_panel: 99,
             panels: vec![ViewState {
+                tab_groups: Default::default(),
                 stretch: -3.0,  // invalid
                 active_tab: 42, // out of bounds
                 tabs: vec![TabState {
+                    tab_group_id: None,
                     path: "/x".into(),
                     sort_column: SortColumn::Name,
                     sort_order: SortOrder::Asc,
@@ -981,6 +1023,7 @@ item_arrangement = "future"
                 }],
                 columns: crate::columns::default_columns(),
                 tab_bar_mode: 0,
+                tab_bar_restore_mode: 0,
                 vbar_width: 0.0,
             }],
             layout: None,
@@ -1000,17 +1043,21 @@ item_arrangement = "future"
             active_panel: 0,
             panels: vec![
                 ViewState {
+                    tab_groups: Default::default(),
                     stretch: 1.0,
                     active_tab: 0,
                     tabs: vec![],
                     columns: crate::columns::default_columns(),
                     tab_bar_mode: 0,
+                    tab_bar_restore_mode: 0,
                     vbar_width: 0.0,
                 },
                 ViewState {
+                    tab_groups: Default::default(),
                     stretch: 1.0,
                     active_tab: 0,
                     tabs: vec![TabState {
+                        tab_group_id: None,
                         path: "/y".into(),
                         sort_column: SortColumn::Name,
                         sort_order: SortOrder::Asc,
@@ -1024,6 +1071,7 @@ item_arrangement = "future"
                     }],
                     columns: crate::columns::default_columns(),
                     tab_bar_mode: 0,
+                    tab_bar_restore_mode: 0,
                     vbar_width: 0.0,
                 },
             ],
@@ -1230,9 +1278,11 @@ name =",
         let other = WorkspaceState {
             active_panel: 0,
             panels: vec![ViewState {
+                tab_groups: Default::default(),
                 stretch: 1.0,
                 active_tab: 0,
                 tabs: vec![TabState {
+                    tab_group_id: None,
                     path: "/var".into(),
                     sort_column: SortColumn::Name,
                     sort_order: SortOrder::Asc,
@@ -1246,6 +1296,7 @@ name =",
                 }],
                 columns: crate::columns::default_columns(),
                 tab_bar_mode: 0,
+                tab_bar_restore_mode: 0,
                 vbar_width: 0.0,
             }],
             layout: None,
