@@ -63,6 +63,13 @@ ignore = [
     "RUSTSEC-2026-0370", # zvariant
     "RUSTSEC-2026-0371", # zbus_names
     "RUSTSEC-2026-0372", # zvariant_derive
+    # `pin-utils` is unmaintained, with no patched version. On the shipped
+    # Windows/Linux feature graphs it is used by spin_on through Slint's
+    # build script and procedural macros, not the application at runtime.
+    # Only this maintenance advisory is excepted. Other advisory IDs,
+    # including future vulnerabilities in this crate, remain checked.
+    # Remove once the upstream Slint/spin_on migration drops pin-utils.
+    { id = "RUSTSEC-2026-0441", reason = "Unmaintained build-time transitive of pinned Slint via spin_on 0.1.1; awaiting upstream migration." },
 ]
 
 [licenses]
