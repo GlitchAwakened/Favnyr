@@ -20,7 +20,7 @@ gestures and shortcuts collected under [Pro tips](#pro-tips).)*
 Favnyr came out of a simple frustration: wanting several folders open side by side, being able to come back to the same arrangement tomorrow, and not wondering what the program does when nobody is looking. It is written in Rust with [Slint](https://slint.dev), which is why it starts fast and stays small.
 I am Favnyr's first user, and I use it daily literally every day.
 
-Copy the executable where you want and run it. That is the whole installation.
+[Copy the executable](https://github.com/GlitchAwakened/Favnyr/releases/latest) where you want and run it. That is the whole installation.
 
 **NixOS* : See the [NixOS footnote](#nixos) below.
 
@@ -39,6 +39,10 @@ Favnyr runs with ordinary user permissions. It installs no service and no backgr
 **Views.** Split the window horizontally or vertically, up to 32 views. Each keeps its own tabs, history, sorting and columns.
 
 **Tab groups.** Organize tabs with a name and an optional color. Tab groups can be expanded or collapsed.
+
+https://github.com/user-attachments/assets/933f0e71-474b-4be8-be59-248086202c47
+
+https://github.com/user-attachments/assets/8f466e2b-7c92-453f-9fac-69893a8b3903
 
 **Workspaces.** A workspace is a saved set of views and tabs. Keep one per project and restore the whole arrangement in one click, or assign it a number to load it with a keyboard shortcut. Settings provide separate save policies for the Workspaces panel and numbered shortcuts (CTRL+1, CTRl+2...). A workspace can have its own theme, independently of the global theme.
 
